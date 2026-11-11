@@ -28,3 +28,16 @@ transitive Rust dependency. The native browser and TLS components in the worker
 dependency graph, including V8 and BoringSSL, need separate license and notice
 review before preparing a release. Review dependency metadata and upstream
 notices for the full graph.
+
+## pdf_oxide
+
+The `pdf2md-mcp` package uses [`pdf_oxide` 0.3.78](https://crates.io/crates/pdf_oxide/0.3.78)
+for PDF parsing and Markdown conversion. Its Cargo manifest declares `MIT OR
+Apache-2.0`; the upstream source includes `LICENSE-MIT`, `LICENSE-APACHE`, and
+a `NOTICE` file. The container build resolves the locked crate through Cargo
+metadata and copies those three files from the exact 0.3.78 checkout into
+`/usr/share/licenses/pdf2md-mcp/pdf_oxide/`.
+
+This notice identifies the direct conversion dependency; it is not a complete
+license or attribution inventory for every transitive dependency. Review the
+locked dependency metadata and included notices before distribution.

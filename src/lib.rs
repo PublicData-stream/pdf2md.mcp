@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod browser;
 pub mod config;
+pub mod conversion;
 pub mod direct;
 pub mod error;
 pub mod manual;

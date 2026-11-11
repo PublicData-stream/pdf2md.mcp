@@ -2,9 +2,10 @@
 name = "pdf2md-mcp"
 version = "0.1.0"
 edition = "2024"
+default-run = "pdf2md-mcp"
 rust-version = "1.88"
 license = "AGPL-3.0-only"
-description = "Operator-controlled PDF acquisition for a future PDF-to-Markdown MCP service"
+description = "Operator-controlled PDF acquisition, history, and Markdown conversion"
 
 [workspace]
 members = ["crates/obscura-worker"]
@@ -17,9 +18,11 @@ clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 futures-util = "0.3"
 httpdate = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 libc = "0.2"
 notify = "8"
+pdf_oxide = "=0.3.78"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "gzip", "brotli", "deflate"] }
 serde = { version = "1", features = ["derive"] }

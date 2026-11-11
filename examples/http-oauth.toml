@@ -1,0 +1,17 @@
+[auth]
+mode = "oauth2"
+
+[auth.oidc]
+issuer = "https://auth.example.com"
+audience = "https://pdf.example.com"
+validation = "introspection"
+access_token_prefix = "authelia_at_"
+client_id = "pdf2md-resource"
+client_secret = { env = "PDF2MD_OIDC_CLIENT_SECRET" }
+read_scope = "pdf2md:read"
+write_scope = "pdf2md:write"
+operate_scope = "pdf2md:operate"
+
+[http]
+bind = "127.0.0.1:8080"
+published_sources = []

@@ -248,3 +248,311 @@ async fn real_authelia_tokens_enforce_scopes_isolation_revocation_and_expiry() {
         }
     }
 }
+
+#[path = "common/conversion_pdf.rs"]
+mod conversion_pdf;
+
+struct HttpServer {
+    service: std::sync::Arc<CallerService>,
+    cancel: CancellationToken,
+    server: tokio::task::JoinHandle<()>,
+    base: String,
+    client: reqwest::Client,
+}
+impl HttpServer {
+    async fn start(root: &Path, fixture: &Value, mode: &str) -> Self {
+        let service = std::sync::Arc::new(
+            CallerService::new(root, config(fixture, mode), None)
+                .await
+                .unwrap(),
+        );
+        let cancel = CancellationToken::new();
+        let router = pdf2md_mcp::http::router(service.clone(), cancel.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        Self {
+            service,
+            cancel,
+            server,
+            base,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        }
+    }
+    async fn get(&self, path: &str, bearer: Option<&str>) -> reqwest::Response {
+        let mut request = self.client.get(format!("{}{path}", self.base));
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(bearer);
+        }
+        request.send().await.unwrap()
+    }
+    async fn upload(&self, bearer: &str, pdf: Vec<u8>) -> reqwest::Response {
+        self.client
+            .post(format!("{}/v1/documents", self.base))
+            .bearer_auth(bearer)
+            .header("content-type", "application/pdf")
+            .body(pdf)
+            .send()
+            .await
+            .unwrap()
+    }
+    async fn stop(self) {
+        self.cancel.cancel();
+        self.server.abort();
+        let _ = self.server.await;
+    }
+}
+async fn response_json(response: reqwest::Response) -> Value {
+    serde_json::from_slice(&response.bytes().await.unwrap()).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires disposable real Authelia; run scripts/test-authelia.py"]
+async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
+    use reqwest::StatusCode;
+    let fixture_path =
+        std::path::PathBuf::from(std::env::var("PDF2MD_LIVE_AUTHELIA_FIXTURE").unwrap());
+    let fixture: Value = serde_json::from_slice(&std::fs::read(&fixture_path).unwrap()).unwrap();
+    let root = fixture_path.parent().unwrap().join("http-workspaces");
+    let metadata = fixture_path.parent().unwrap().join("http-test-state.json");
+    let phase = std::env::var("PDF2MD_LIVE_AUTHELIA_PHASE").unwrap_or_default();
+    if phase == "expired" {
+        let server = HttpServer::start(&root, &fixture, "jwt").await;
+        assert_eq!(
+            server
+                .get("/v1/history", Some(token(&fixture, "alice_jwt")))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        server.stop().await;
+        return;
+    }
+    if phase == "revoked" {
+        let state: Value = serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+        let job = state["job"].as_str().unwrap();
+        let server = HttpServer::start(&root, &fixture, "introspection").await;
+        assert_eq!(
+            server
+                .get(
+                    &format!("/v1/jobs/{job}"),
+                    Some(token(&fixture, "alice_opaque"))
+                )
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            server
+                .get("/v1/history", Some(token(&fixture, "bob_opaque")))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let service = server.service.clone();
+        let cancel = server.cancel.clone();
+        let dispatcher = tokio::spawn(async move {
+            service
+                .run(
+                    Path::new("unused-obscura-worker"),
+                    Path::new(env!("CARGO_BIN_EXE_pdf2md-convert-worker")),
+                    &cancel,
+                )
+                .await
+                .unwrap()
+        });
+        // Observe conversion without reauthorizing Alice: accepted work is independent of later token revocation.
+        let alice = identity(&fixture, "jwt", "alice_jwt").await;
+        let registry = WorkspaceRegistry::open(&root).await.unwrap();
+        let workspace = registry
+            .resolve_identity(&alice.0, &alice.1, None)
+            .await
+            .unwrap();
+        let attempt = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let history = Store::read_conversion_history(&workspace, None, None)
+                    .await
+                    .unwrap();
+                if let Some(attempt) = history
+                    .into_iter()
+                    .find(|entry| entry.id == job && entry.status == "succeeded")
+                {
+                    break attempt;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("accepted conversion did not finish");
+        assert_eq!(attempt.status, "succeeded");
+        server.cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatcher)
+            .await
+            .unwrap()
+            .unwrap();
+        server.stop().await;
+        let server = HttpServer::start(&root, &fixture, "jwt").await;
+        let response = server
+            .get(
+                &format!("/v1/jobs/{job}"),
+                Some(token(&fixture, "alice_jwt")),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["status"], "succeeded");
+        server.stop().await;
+        return;
+    }
+    let pdf = conversion_pdf::sample_pdf();
+    let server = HttpServer::start(&root, &fixture, "introspection").await;
+    assert_eq!(
+        server.get("/v1/history", None).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for name in ["id_token", "refresh_token"] {
+        assert_eq!(
+            server
+                .get("/v1/history", fixture["alice_opaque"][name].as_str())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        server
+            .upload(token(&fixture, "read_only"), pdf.clone())
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let limited = server
+        .client
+        .post(format!("{}/v1/sources/absent/fetch", server.base))
+        .bearer_auth(token(&fixture, "read_write"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::FORBIDDEN);
+    let full = server
+        .client
+        .post(format!("{}/v1/sources/absent/fetch", server.base))
+        .bearer_auth(token(&fixture, "alice_opaque"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(full.status(), StatusCode::NOT_FOUND);
+    let response = server
+        .upload(token(&fixture, "alice_opaque"), pdf.clone())
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let result = response_json(response).await;
+    let document = result["observation"]["document_id"].as_str().unwrap();
+    let job = result["conversion_job"]["id"].as_str().unwrap();
+    assert_eq!(result["conversion_job"]["status"], "queued");
+    assert_eq!(
+        server
+            .get(
+                &format!("/v1/documents/{document}/pdf"),
+                Some(token(&fixture, "bob_opaque"))
+            )
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        server
+            .get(
+                &format!("/v1/jobs/{job}"),
+                Some(token(&fixture, "bob_opaque"))
+            )
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let history = server
+        .get("/v1/conversions", Some(token(&fixture, "alice_opaque")))
+        .await;
+    assert_eq!(history.status(), StatusCode::OK);
+    assert!(
+        response_json(history).await["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == job)
+    );
+    let mut bob_pdf = pdf.clone();
+    bob_pdf.extend_from_slice(b"\n% bob synthetic document\n");
+    let bob = server.upload(token(&fixture, "bob_opaque"), bob_pdf).await;
+    assert_eq!(bob.status(), StatusCode::CREATED);
+    let bob = response_json(bob).await;
+    let bob_document = bob["observation"]["document_id"].as_str().unwrap();
+    assert_eq!(
+        server
+            .get(
+                &format!("/v1/documents/{bob_document}/pdf"),
+                Some(token(&fixture, "alice_opaque"))
+            )
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    std::fs::write(
+        &metadata,
+        serde_json::to_vec(&serde_json::json!({"job":job})).unwrap(),
+    )
+    .unwrap();
+    server.stop().await;
+    let server = HttpServer::start(&root, &fixture, "jwt").await;
+    assert_eq!(
+        server
+            .upload(token(&fixture, "alice_jwt"), pdf.clone())
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        server
+            .get(
+                &format!("/v1/documents/{document}/pdf"),
+                Some(token(&fixture, "alice_jwt"))
+            )
+            .await
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        pdf
+    );
+    assert_eq!(
+        server
+            .get(&format!("/v1/jobs/{job}"), Some(token(&fixture, "bob_jwt")))
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        server
+            .get(
+                &format!("/v1/documents/{document}/pdf"),
+                Some(token(&fixture, "bob_jwt"))
+            )
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        server
+            .upload(token(&fixture, "jwt_read_only"), pdf.clone())
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        server
+            .get("/v1/conversions", Some(token(&fixture, "alice_jwt")))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    server.stop().await;
+}

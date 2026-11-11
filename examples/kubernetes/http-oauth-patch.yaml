@@ -1,0 +1,18 @@
+# Apply as a strategic merge patch to the Deployment in http.yaml after
+# replacing the issuer and audience in the ConfigMap. Create the referenced
+# Secret through your deployment's secret management system.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pdf2md-http
+spec:
+  template:
+    spec:
+      containers:
+        - name: pdf2md
+          env:
+            - name: PDF2MD_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pdf2md-oidc
+                  key: client-secret

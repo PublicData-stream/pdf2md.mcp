@@ -1,0 +1,8 @@
+# Anonymous read-only access is the default. Change to none_rw only for a
+# trusted network: every caller then shares one writable workspace.
+[auth]
+mode = "none_ro"
+
+[http]
+bind = "127.0.0.1:8080"
+published_sources = []

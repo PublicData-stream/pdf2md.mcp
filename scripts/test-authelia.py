@@ -177,7 +177,7 @@ def main():
             clients.append({
                 "client_id": "pdf2md-" + name, "client_secret": digest(client_secret), "public": False,
                 "redirect_uris": [CALLBACK], "audience": [AUDIENCE],
-                "scopes": ["openid", "offline_access", "pdf2md:read", "pdf2md:write"],
+                "scopes": ["openid", "offline_access", "pdf2md:read", "pdf2md:write", "pdf2md:operate"],
                 "grant_types": ["authorization_code", "refresh_token"], "response_types": ["code"],
                 "authorization_policy": "one_factor", "consent_mode": "explicit",
                 "require_pkce": True, "pkce_challenge_method": "S256",
@@ -196,7 +196,7 @@ def main():
             "identity_providers": {"oidc": {
                 "hmac_secret": secrets.token_hex(32),
                 "jwks": [{"key_id": "test-rs256", "algorithm": "RS256", "use": "sig", "key": (root / "oidc.key").read_text()}],
-                "scopes": {"pdf2md:read": {"claims": []}, "pdf2md:write": {"claims": []}},
+                "scopes": {"pdf2md:read": {"claims": []}, "pdf2md:write": {"claims": []}, "pdf2md:operate": {"claims": []}},
                 "lifespans": {"custom": {"short": {"access_token": "60 seconds"}}},
                 "clients": clients,
             }},
@@ -225,9 +225,10 @@ def main():
             for user in ["alice", "bob"]:
                 for mode in ["opaque", "jwt"]:
                     client = Client(issuer, root / "ca.crt")
-                    fixture[user + "_" + mode] = client.tokens(user, password, "pdf2md-" + mode, client_secret, "openid offline_access pdf2md:read pdf2md:write")
+                    fixture[user + "_" + mode] = client.tokens(user, password, "pdf2md-" + mode, client_secret, "openid offline_access pdf2md:read pdf2md:write pdf2md:operate")
             fixture["read_only"] = Client(issuer, root / "ca.crt").tokens("alice", password, "pdf2md-opaque", client_secret, "openid pdf2md:read")
             fixture["jwt_read_only"] = Client(issuer, root / "ca.crt").tokens("alice", password, "pdf2md-jwt", client_secret, "openid pdf2md:read")
+            fixture["read_write"] = Client(issuer, root / "ca.crt").tokens("alice", password, "pdf2md-opaque", client_secret, "openid pdf2md:read pdf2md:write")
             jwt_claims = json.loads(base64.urlsafe_b64decode(fixture["alice_jwt"]["access_token"].split(".")[1] + "=="))
             print("JWT fields: " + ",".join(sorted(jwt_claims)) + "; scope=" + str(jwt_claims.get("scope")) + "; scp=" + str(jwt_claims.get("scp")), flush=True)
             path = root / "fixture.json"

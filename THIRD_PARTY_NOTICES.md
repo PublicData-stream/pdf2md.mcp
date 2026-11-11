@@ -41,3 +41,13 @@ metadata and copies those three files from the exact 0.3.78 checkout into
 This notice identifies the direct conversion dependency; it is not a complete
 license or attribution inventory for every transitive dependency. Review the
 locked dependency metadata and included notices before distribution.
+
+## HTTP API dependencies
+
+The HTTP listener uses [Axum](https://github.com/tokio-rs/axum) (MIT),
+[Utoipa](https://github.com/juhaku/utoipa) (MIT OR Apache-2.0) for OpenAPI
+schemas, and [zip](https://github.com/zip-rs/zip2) (MIT) for bundle archives.
+`Cargo.lock` records their exact versions. The container copies the license
+files distributed with these locked crates under
+`/usr/share/licenses/pdf2md-mcp/http/`. The API console is repository-owned
+HTML, CSS and JavaScript and loads no third-party browser assets.

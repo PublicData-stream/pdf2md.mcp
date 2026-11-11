@@ -6,7 +6,10 @@
 intended eventually to provide PDF-to-Markdown conversion through MCP. The
 current Rust workspace includes the `pdf2md-mcp` CLI/library, a separate
 `pdf2md-obscura-worker`, and integration tests. It acquires and stores PDF
-bytes; there is no full PDF parser, Markdown conversion, or MCP transport yet.
+bytes. The library has a caller service with anonymous RO/RW and OAuth2/OIDC
+modes and isolated workspaces. There is no full PDF parser, Markdown conversion,
+or MCP transport yet. See `docs/authentication.md` for caller versus trusted
+operator boundaries and provider verification.
 `README.md` owns user setup and status, `CONTRIBUTING.md` owns contributor
 workflow, and `SECURITY.md` owns vulnerability reporting and disclosure. Keep
 their claims aligned with executable behavior.
@@ -22,6 +25,9 @@ the separate browser worker with
 run integration tests with `cargo test --locked --package pdf2md-mcp`. Worker
 unit tests use `cargo test --locked --package pdf2md-obscura-worker`; the
 browser integration script is `scripts/test-browser.sh` and requires OpenSSL.
+Live OIDC provider checks use `python3 scripts/test-authelia.py`; see
+`examples/authelia/README.md`. Generated certificates, credentials, provider
+storage, and other test state belong under `/tmp`.
 The browser worker build uses the pinned upstream Obscura dependency. These
 local commands do not establish hosted CI, image, MCP client, or deployment
 acceptance.

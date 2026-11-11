@@ -67,6 +67,9 @@ fn read_scope() -> String {
 fn write_scope() -> String {
     "pdf2md:write".into()
 }
+fn jwt_scope_claim() -> String {
+    "scope".into()
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +81,9 @@ pub struct OidcConfig {
     /// Optional issuer-documented access-token discriminator for introspection
     /// providers that omit token_type. This never replaces introspection.
     pub access_token_prefix: Option<String>,
+    /// Explicit JWT scope convention: space-delimited scope or array-valued scp.
+    #[serde(default = "jwt_scope_claim")]
+    pub jwt_scope_claim: String,
     pub client_id: Option<String>,
     pub client_secret: Option<OidcSecret>,
     #[serde(default = "read_scope")]
@@ -181,6 +187,9 @@ impl AuthConfig {
         let oidc = self.oidc.as_ref().ok_or_else(config_error)?;
         https_url(&oidc.issuer)?;
         if oidc.audience.is_empty()
+            || !matches!(oidc.jwt_scope_claim.as_str(), "scope" | "scp")
+            || (oidc.validation == TokenValidation::Introspection
+                && oidc.jwt_scope_claim != "scope")
             || !valid_scope(&oidc.read_scope)
             || !valid_scope(&oidc.write_scope)
             || oidc.read_scope == oidc.write_scope
@@ -342,6 +351,7 @@ struct Claims {
     iat: Option<i64>,
     nbf: Option<i64>,
     scope: Option<String>,
+    scp: Option<serde_json::Value>,
     token_type: Option<String>,
     token_use: Option<String>,
     jti: Option<String>,
@@ -570,7 +580,7 @@ impl Provider {
             "jti",
             "client_id",
         ]);
-        let claims = decode::<Claims>(token, &key, &validation)
+        let mut claims = decode::<Claims>(token, &key, &validation)
             .map_err(|_| invalid())?
             .claims;
         self.validate_claims(&claims, true)?;
@@ -582,6 +592,27 @@ impl Provider {
                 .is_none_or(|value| value.is_empty())
         {
             return Err(invalid());
+        }
+        if self.config.jwt_scope_claim == "scp" {
+            // Only the configured claim grants permissions. Do not merge or
+            // fall back to the space-delimited scope claim.
+            claims.scope = claims
+                .scp
+                .as_ref()
+                .map(|value| {
+                    let values = value.as_array().ok_or_else(invalid)?;
+                    let scopes: Result<Vec<&str>> = values
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .filter(|scope| valid_scope(scope))
+                                .ok_or_else(invalid)
+                        })
+                        .collect();
+                    Ok::<_, LoadError>(scopes?.join(" "))
+                })
+                .transpose()?;
         }
         Ok(claims)
     }

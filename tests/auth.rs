@@ -61,6 +61,7 @@ impl Fixture {
                 audience: "https://pdf2md.example/mcp".into(),
                 validation: method,
                 access_token_prefix: None,
+                jwt_scope_claim: "scope".into(),
                 client_id: Some("pdf2md-test".into()),
                 client_secret: Some(OidcSecret {
                     env: None,
@@ -591,6 +592,111 @@ async fn introspection_requires_a_token_class_and_accepts_explicit_authelia_pref
     let oidc = fixture.config.oidc.as_mut().unwrap();
     oidc.access_token_prefix = Some("authelia_at_".into());
     oidc.validation = TokenValidation::Jwt;
+    assert!(fixture.config.validate().is_err());
+}
+
+#[tokio::test]
+async fn jwt_scp_array_grants_only_explicitly_selected_valid_scopes() {
+    let mut fixture = Fixture::new(TokenValidation::Jwt).await;
+    fixture.config.oidc.as_mut().unwrap().jwt_scope_claim = "scp".into();
+    let selected = Authenticator::new(fixture.config.clone()).await.unwrap();
+    let full = token(&fixture.issuer, "first", |claims| {
+        claims.as_object_mut().unwrap().remove("scope");
+        claims["scp"] = json!(["pdf2md:read", "pdf2md:write"]);
+    });
+    selected.authenticate(Some(&full), true).await.unwrap();
+    // A conflicting unselected scope claim cannot remove or add permissions.
+    let dual = token(&fixture.issuer, "first", |claims| {
+        claims["scope"] = json!("unselected");
+        claims["scp"] = json!(["pdf2md:read", "pdf2md:write"]);
+    });
+    selected.authenticate(Some(&dual), true).await.unwrap();
+    let readonly = token(&fixture.issuer, "first", |claims| {
+        claims["scp"] = json!(["pdf2md:read"])
+    });
+    selected.authenticate(Some(&readonly), false).await.unwrap();
+    assert_eq!(
+        selected
+            .authenticate(Some(&readonly), true)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_forbidden"
+    );
+    let missing = token(&fixture.issuer, "first", |_| {});
+    assert_eq!(
+        selected
+            .authenticate(Some(&missing), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_forbidden"
+    );
+    let empty = token(&fixture.issuer, "first", |claims| claims["scp"] = json!([]));
+    assert_eq!(
+        selected
+            .authenticate(Some(&empty), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_forbidden"
+    );
+    for malformed in [
+        json!("pdf2md:read pdf2md:write"),
+        json!({"pdf2md:read":true}),
+        json!(["pdf2md:read", 123]),
+        json!(["pdf2md:read pdf2md:write"]),
+        json!([""]),
+    ] {
+        let bad = token(&fixture.issuer, "first", |claims| claims["scp"] = malformed);
+        assert_eq!(
+            selected
+                .authenticate(Some(&bad), false)
+                .await
+                .unwrap_err()
+                .code,
+            "auth_invalid"
+        );
+    }
+    fixture.config.oidc.as_mut().unwrap().jwt_scope_claim = "scope".into();
+    let default_claim = Authenticator::new(fixture.config.clone()).await.unwrap();
+    // Unselected scp grants no permission, even if it contains the write scope.
+    let only_scp = token(&fixture.issuer, "first", |claims| {
+        claims.as_object_mut().unwrap().remove("scope");
+        claims["scp"] = json!(["pdf2md:read", "pdf2md:write"]);
+    });
+    assert_eq!(
+        default_claim
+            .authenticate(Some(&only_scp), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_forbidden"
+    );
+    let conflict = token(&fixture.issuer, "first", |claims| {
+        claims["scope"] = json!("pdf2md:read");
+        claims["scp"] = json!(["pdf2md:read", "pdf2md:write"]);
+    });
+    assert_eq!(
+        default_claim
+            .authenticate(Some(&conflict), true)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_forbidden"
+    );
+    let ignored_extension = token(&fixture.issuer, "first", |claims| {
+        claims["scp"] = json!("ignored-extension")
+    });
+    default_claim
+        .authenticate(Some(&ignored_extension), true)
+        .await
+        .unwrap();
+    fixture.config.oidc.as_mut().unwrap().jwt_scope_claim = "unrecognized".into();
+    assert!(fixture.config.validate().is_err());
+    let oidc = fixture.config.oidc.as_mut().unwrap();
+    oidc.validation = TokenValidation::Introspection;
+    oidc.jwt_scope_claim = "scp".into();
     assert!(fixture.config.validate().is_err());
 }
 

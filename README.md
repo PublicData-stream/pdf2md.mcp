@@ -8,8 +8,11 @@ objects.
 
 ## Project Status
 
-The current executable implements acquisition, header-only PDF validation,
-content-addressed storage, and history. It does not parse PDF content, convert
+The executable implements acquisition, header-only PDF validation,
+content-addressed storage, and history. The library also provides authentication
+foundations and isolated caller workspaces with `none_ro`, `none_rw`, and
+OIDC-backed `oauth2` modes; see [Authentication foundations](docs/authentication.md).
+It does not parse PDF content, convert
 PDFs to Markdown, or expose an MCP server yet. The repository has no supported
 release policy.
 
@@ -86,11 +89,20 @@ register copied files automatically. For a one-off HTTPS download, use
 `pdf2md-mcp fetch-url https://www.rfc-editor.org/rfc/rfc9110.pdf`;
 add `--mode obscura` to use the browser-like transport.
 
-Only one process may own writes to a data root at a time. `fetch`, `fetch-url`,
+Only one process may own writes to an individual workspace root at a time.
+The commands above select the operator workspace by default. `fetch`, `fetch-url`,
 `scan`, `watch`, and `run` write history; while `watch` or `run` owns the root,
 use only `status` and `history` from another process.
 
 ## Configuration
+
+Authentication settings apply to the library's caller service boundary. The
+CLI remains a trusted operator interface and defaults to the original private
+operator workspace. Caller mode defaults to `none_ro`; `none_rw` allows shared
+HTTPS acquisition, and OAuth2 uses per-user workspaces and read/write scopes.
+No server listener is introduced by these settings. See the
+[configuration and workspace guide](docs/authentication.md) for Authelia,
+JWT/introspection, operator workspace selection, and coordinated backups.
 
 See [`examples/sources.toml`](examples/sources.toml) for a schema example. Set
 the environment variables referenced by a source before fetching it. The

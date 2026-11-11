@@ -3,7 +3,9 @@
 `pdf2md.mcp` is an operator-controlled PDF acquisition and history service,
 intended eventually to provide PDF-to-Markdown conversion through MCP. The
 workspace is Rust 2024 and contains a CLI/library, a separate browser worker,
-and integration tests. The current implementation does not parse full PDFs,
+and integration tests. A transport-independent caller service supports
+anonymous RO/RW and OAuth2/OIDC authentication with isolated workspaces.
+The current implementation does not parse full PDFs,
 convert them to Markdown, or expose MCP. This document is the source of truth
 for contributor workflow. See
 [Repository Guidelines](AGENTS.md) for agent orientation and the
@@ -75,6 +77,14 @@ git diff
 The diff commands do not inspect new, untracked files. Review those files
 directly before staging. Do not describe local checks as hosted CI, deployment,
 or end-to-end MCP client verification.
+
+Authentication, caller-boundary, and workspace tests are part of the core test
+suite. For real-provider acceptance, run `python3 scripts/test-authelia.py`
+with Docker, OpenSSL, and Python 3 available. See
+[the Authelia harness guide](examples/authelia/README.md). The harness uses
+disposable state under `/tmp`; keep live tokens and provider credentials out
+of logs and version control. Provider acceptance does not establish an HTTP
+or MCP transport.
 
 ## Testing and Fixtures
 

@@ -7,7 +7,10 @@ automation in `PublicData-stream/pdf2md.mcp`, including affected uses of
 third-party dependencies in the current implementation.
 
 The current implementation acquires remote or local PDF bytes and records
-history; it does not fully parse PDFs, convert them to Markdown, or provide an
+history. Its library caller service supports anonymous RO/RW and OAuth2/OIDC
+modes, with separate per-user workspace roots and application authorization.
+The CLI and raw storage/library APIs remain trusted operator interfaces.
+It does not fully parse PDFs, convert them to Markdown, or provide an
 MCP server. No stable-release security support policy, maintenance window, or
 backport commitment is established. Include the affected commit when reporting
 a development issue.
@@ -43,6 +46,14 @@ This policy does not authorize testing systems or accessing documents without
 their owner's permission.
 
 ## Security Considerations for Contributions
+
+See [Authentication foundations](docs/authentication.md) for identity, scope,
+token validation, and workspace boundaries. No-auth RW callers share one
+workspace. OAuth2 identities use exact issuer and subject pairs. Local JWT
+validation does not establish immediate revocation; use introspection when
+that is required. Workspace separation does not provide an operating-system
+sandbox or per-user resource quotas. Provider credentials and the local
+workspace registry are sensitive operator data.
 
 Treat input PDFs and remote responses as untrusted. The current implementation
 checks a PDF signature header only; it does not establish that a document is

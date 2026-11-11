@@ -67,6 +67,9 @@ fn read_scope() -> String {
 fn write_scope() -> String {
     "pdf2md:write".into()
 }
+fn operate_scope() -> String {
+    "pdf2md:operate".into()
+}
 fn jwt_scope_claim() -> String {
     "scope".into()
 }
@@ -90,6 +93,8 @@ pub struct OidcConfig {
     pub read_scope: String,
     #[serde(default = "write_scope")]
     pub write_scope: String,
+    #[serde(default = "operate_scope")]
+    pub operate_scope: String,
     #[serde(default)]
     pub allowed_endpoint_origins: Vec<String>,
     pub ca_file: Option<PathBuf>,
@@ -192,7 +197,10 @@ impl AuthConfig {
                 && oidc.jwt_scope_claim != "scope")
             || !valid_scope(&oidc.read_scope)
             || !valid_scope(&oidc.write_scope)
+            || !valid_scope(&oidc.operate_scope)
             || oidc.read_scope == oidc.write_scope
+            || oidc.operate_scope == oidc.read_scope
+            || oidc.operate_scope == oidc.write_scope
         {
             return Err(config_error());
         }
@@ -302,8 +310,18 @@ impl Authenticator {
 
     /// `token` contains only the access-token value, without a Bearer prefix.
     pub async fn authenticate(&self, token: Option<&str>, write: bool) -> Result<Identity> {
+        self.authorize(token, write, false).await
+    }
+
+    /// Validate current read/write permissions and optional operator-source grant.
+    pub async fn authorize(
+        &self,
+        token: Option<&str>,
+        write: bool,
+        operate: bool,
+    ) -> Result<Identity> {
         match self.mode {
-            AuthMode::NoneRo if write => Err(forbidden()),
+            AuthMode::NoneRo if write || operate => Err(forbidden()),
             AuthMode::NoneRo | AuthMode::NoneRw => Ok(Identity::Shared),
             AuthMode::Oauth2 => {
                 let token = token
@@ -328,6 +346,7 @@ impl Authenticator {
                     .collect();
                 if !scopes.contains(&provider.config.read_scope.as_str())
                     || (write && !scopes.contains(&provider.config.write_scope.as_str()))
+                    || (operate && !scopes.contains(&provider.config.operate_scope.as_str()))
                 {
                     return Err(forbidden());
                 }

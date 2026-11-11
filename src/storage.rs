@@ -182,7 +182,7 @@ impl Store {
             .await
             .map_err(db_error)?;
         } else if versions.len() != 1
-            || ![1, 2].contains(&versions[0].try_get::<i64, _>(0).map_err(db_error)?)
+            || ![1, 2, 3].contains(&versions[0].try_get::<i64, _>(0).map_err(db_error)?)
         {
             return Err(LoadError::new(
                 "storage_database_version",
@@ -195,6 +195,14 @@ impl Store {
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS conversion_attempts_auto ON conversion_attempts(namespace,document_id) WHERE automatic=1").execute(&mut *migration).await.map_err(db_error)?;
         sqlx::query("CREATE INDEX IF NOT EXISTS conversion_attempts_lookup ON conversion_attempts(namespace, document_id, profile_key, status)").execute(&mut *migration).await.map_err(db_error)?;
         sqlx::query("UPDATE schema_version SET version=2 WHERE version=1")
+            .execute(&mut *migration)
+            .await
+            .map_err(db_error)?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS api_jobs (namespace TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, command TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, document_id TEXT, observation_id TEXT, conversion_id TEXT, error_code TEXT, idempotency_key TEXT, PRIMARY KEY(namespace,id), UNIQUE(namespace,idempotency_key))").execute(&mut *migration).await.map_err(db_error)?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS api_idempotency (namespace TEXT NOT NULL, key TEXT NOT NULL, job_id TEXT NOT NULL, command TEXT NOT NULL, PRIMARY KEY(namespace,key))").execute(&mut *migration).await.map_err(db_error)?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS api_job_retries(namespace TEXT NOT NULL,job_id TEXT NOT NULL,parent_id TEXT NOT NULL,PRIMARY KEY(namespace,job_id))").execute(&mut *migration).await.map_err(db_error)?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS api_schedules (namespace TEXT NOT NULL, source_id TEXT NOT NULL, enabled INTEGER NOT NULL, interval_secs BIGINT NOT NULL, next_due BIGINT NOT NULL, status TEXT NOT NULL, error_code TEXT, fingerprint TEXT NOT NULL, PRIMARY KEY(namespace,source_id))").execute(&mut *migration).await.map_err(db_error)?;
+        sqlx::query("UPDATE schema_version SET version=3 WHERE version=2")
             .execute(&mut *migration)
             .await
             .map_err(db_error)?;
@@ -218,9 +226,67 @@ impl Store {
             let id: String = row.try_get(0).map_err(db_error)?;
             store.verify_object(&id)?;
         }
+        // Backfill attempts created by older metadata schemas or trusted CLI paths.
+        let missing = sqlx::query("SELECT id,document_id,options,status,created_at,finished_at,error_code FROM conversion_attempts WHERE namespace=$1 AND NOT EXISTS (SELECT 1 FROM api_jobs WHERE api_jobs.namespace=conversion_attempts.namespace AND api_jobs.id=conversion_attempts.id)").bind(&store.namespace).fetch_all(&store.pool).await.map_err(db_error)?;
+        for entry in missing {
+            let id: String = entry.try_get("id").map_err(db_error)?;
+            let document_id: String = entry.try_get("document_id").map_err(db_error)?;
+            let options: String = entry.try_get("options").map_err(db_error)?;
+            let options = serde_json::from_str(&options).map_err(|_| corrupt())?;
+            let status: String = entry.try_get("status").map_err(db_error)?;
+            let mut tx = store.pool.begin().await.map_err(db_error)?;
+            crate::jobs::insert_job(
+                &mut tx,
+                &store.namespace,
+                &id,
+                &crate::jobs::JobCommand::Convert {
+                    document_id,
+                    options,
+                    force: false,
+                },
+                None,
+            )
+            .await?;
+            sqlx::query("UPDATE api_jobs SET status=$1,created_at=$2,finished_at=$3,error_code=$4 WHERE namespace=$5 AND id=$6").bind(if status == "pending" { "queued" } else { &status }).bind(entry.try_get::<String,_>("created_at").map_err(db_error)?).bind(entry.try_get::<Option<String>,_>("finished_at").map_err(db_error)?).bind(entry.try_get::<Option<String>,_>("error_code").map_err(db_error)?).bind(&store.namespace).bind(&id).execute(&mut *tx).await.map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
+        }
         sqlx::query("UPDATE conversion_attempts SET status='interrupted', finished_at=$1, error_code='interrupted' WHERE namespace=$2 AND status='running'").bind(chrono::Utc::now().to_rfc3339()).bind(&store.namespace).execute(&store.pool).await.map_err(db_error)?;
+        sqlx::query("UPDATE api_jobs SET status='interrupted', finished_at=$1, error_code='interrupted' WHERE namespace=$2 AND status='running'").bind(chrono::Utc::now().to_rfc3339()).bind(&store.namespace).execute(&store.pool).await.map_err(db_error)?;
+        sqlx::query("UPDATE conversion_attempts SET status='interrupted',finished_at=$1,error_code='interrupted' WHERE namespace=$2 AND status='pending' AND id IN (SELECT id FROM api_jobs WHERE namespace=$2 AND status='interrupted')").bind(chrono::Utc::now().to_rfc3339()).bind(&store.namespace).execute(&store.pool).await.map_err(db_error)?;
         store.verify_conversion_bundles().await?;
         Ok(store)
+    }
+    pub async fn history_page(
+        &self,
+        source: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Observation>> {
+        let q = "SELECT source_id,attempt_id,document_id,outcome,mode,bytes,observed_at,url,error_code FROM observations WHERE namespace=$1 AND ($2 IS NULL OR source_id=$2) ORDER BY observed_at,attempt_id LIMIT $3 OFFSET $4";
+        sqlx::query(q)
+            .bind(&self.namespace)
+            .bind(source)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .bind(i64::try_from(offset).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_error)?
+            .into_iter()
+            .map(observation_row)
+            .collect()
+    }
+    pub async fn status_page(&self, limit: usize, offset: usize) -> Result<Vec<Observation>> {
+        let q = "SELECT source_id,attempt_id,document_id,outcome,mode,bytes,observed_at,url,error_code FROM (SELECT source_id,attempt_id,document_id,outcome,mode,bytes,observed_at,url,error_code,ROW_NUMBER() OVER (PARTITION BY source_id ORDER BY observed_at DESC,attempt_id DESC) AS rank FROM observations WHERE namespace=$1) latest WHERE rank=1 ORDER BY source_id LIMIT $2 OFFSET $3";
+        sqlx::query(q)
+            .bind(&self.namespace)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .bind(i64::try_from(offset).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_error)?
+            .into_iter()
+            .map(observation_row)
+            .collect()
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -267,7 +333,7 @@ impl Store {
         url: Option<&str>,
         attempt_id: &str,
     ) -> Result<Observation> {
-        self.accept_inner(staged, source_id, mode, url, attempt_id, None)
+        self.accept_inner(staged, source_id, mode, url, attempt_id, None, None)
             .await
     }
     /// Stop work before committing metadata when the deadline expires or cancellation is requested.
@@ -284,9 +350,42 @@ impl Store {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Observation> {
         let control = PublicationControl { deadline, cancel };
-        self.accept_inner(staged, source_id, mode, url, attempt_id, Some(&control))
-            .await
+        self.accept_inner(
+            staged,
+            source_id,
+            mode,
+            url,
+            attempt_id,
+            Some(&control),
+            None,
+        )
+        .await
     }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn accept_before_job(
+        &self,
+        staged: &Path,
+        source_id: &str,
+        mode: &str,
+        url: Option<&str>,
+        attempt_id: &str,
+        deadline: std::time::Instant,
+        cancel: &tokio_util::sync::CancellationToken,
+        job_id: &str,
+    ) -> Result<Observation> {
+        let control = PublicationControl { deadline, cancel };
+        self.accept_inner(
+            staged,
+            source_id,
+            mode,
+            url,
+            attempt_id,
+            Some(&control),
+            Some(job_id),
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
     async fn accept_inner(
         &self,
         staged: &Path,
@@ -295,6 +394,7 @@ impl Store {
         url: Option<&str>,
         attempt_id: &str,
         control: Option<&PublicationControl<'_>>,
+        job_id: Option<&str>,
     ) -> Result<Observation> {
         check_control(control)?;
         let (id, bytes, valid) = digest_file_controlled(staged, control)?;
@@ -363,7 +463,7 @@ impl Store {
             url: url.and_then(crate::policy::sanitized_url),
             error_code: None,
         };
-        self.insert(&mut obs, control).await?;
+        self.insert(&mut obs, control, job_id).await?;
         Ok(obs)
     }
     pub async fn record_failure(
@@ -385,16 +485,17 @@ impl Store {
             url: url.and_then(crate::policy::sanitized_url),
             error_code: Some(code.into()),
         };
-        self.insert(&mut obs, None).await?;
+        self.insert(&mut obs, None, None).await?;
         Ok(obs)
     }
     async fn insert(
         &self,
         o: &mut Observation,
         control: Option<&PublicationControl<'_>>,
+        job_id: Option<&str>,
     ) -> Result<()> {
         check_control(control)?;
-        let prepare = self.prepare_insert(o);
+        let prepare = self.prepare_insert(o, job_id);
         let tx = if let Some(control) = control {
             tokio::select! {
                 biased;
@@ -412,6 +513,7 @@ impl Store {
     async fn prepare_insert<'a>(
         &'a self,
         o: &mut Observation,
+        job_id: Option<&str>,
     ) -> Result<sqlx::Transaction<'a, sqlx::Any>> {
         let bytes = i64::try_from(o.bytes).map_err(|_| corrupt())?;
         let mut tx = self.pool.begin().await.map_err(db_error)?;
@@ -427,6 +529,18 @@ impl Store {
         if let (Some(id), Some(options)) = (&o.document_id, &self.auto_conversion) {
             crate::conversion::store::enqueue_automatic(&mut tx, &self.namespace, id, options)
                 .await?;
+        }
+        if let Some(job_id) = job_id {
+            let conversion_id: Option<String> = if let Some(document) = &o.document_id {
+                sqlx::query_scalar("SELECT id FROM conversion_attempts WHERE namespace=$1 AND document_id=$2 AND automatic=1").bind(&self.namespace).bind(document).fetch_optional(&mut *tx).await.map_err(db_error)?
+            } else {
+                None
+            };
+            let changed = sqlx::query("UPDATE api_jobs SET status='succeeded',finished_at=$1,document_id=$2,observation_id=$3,conversion_id=$4 WHERE namespace=$5 AND id=$6 AND status='running'").bind(chrono::Utc::now().to_rfc3339()).bind(&o.document_id).bind(&o.attempt_id).bind(conversion_id).bind(&self.namespace).bind(job_id).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+            if changed != 1 {
+                return Err(LoadError::new("job_state", "job is not running"));
+            }
+            crate::jobs::advance_schedule(&mut tx, &self.namespace, job_id).await?;
         }
         Ok(tx)
     }
@@ -500,7 +614,7 @@ impl Store {
             .await
             .map_err(db_error)?;
         if versions.len() != 1
-            || ![1, 2].contains(&versions[0].try_get::<i64, _>(0).map_err(db_error)?)
+            || ![1, 2, 3].contains(&versions[0].try_get::<i64, _>(0).map_err(db_error)?)
         {
             return Err(LoadError::new(
                 "storage_database_version",
@@ -547,6 +661,20 @@ impl Store {
         sqlx::query("INSERT INTO schedule(namespace,source_id,due) VALUES ($1,$2,$3) ON CONFLICT(namespace,source_id) DO UPDATE SET due=excluded.due").bind(&self.namespace).bind(source).bind(due).execute(&self.pool).await.map_err(db_error)?;
         Ok(())
     }
+}
+fn observation_row(r: sqlx::any::AnyRow) -> Result<Observation> {
+    let bytes: i64 = r.try_get(5).map_err(db_error)?;
+    Ok(Observation {
+        source_id: r.try_get(0).map_err(db_error)?,
+        attempt_id: r.try_get(1).map_err(db_error)?,
+        document_id: r.try_get(2).map_err(db_error)?,
+        outcome: r.try_get(3).map_err(db_error)?,
+        mode: r.try_get(4).map_err(db_error)?,
+        bytes: u64::try_from(bytes).map_err(|_| corrupt())?,
+        observed_at: r.try_get(6).map_err(db_error)?,
+        url: r.try_get(7).map_err(db_error)?,
+        error_code: r.try_get(8).map_err(db_error)?,
+    })
 }
 async fn read_history_rows(
     pool: &AnyPool,

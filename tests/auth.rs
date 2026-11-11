@@ -69,6 +69,7 @@ impl Fixture {
                 }),
                 read_scope: "pdf2md:read".into(),
                 write_scope: "pdf2md:write".into(),
+                operate_scope: "pdf2md:operate".into(),
                 allowed_endpoint_origins: vec![],
                 ca_file: Some(ca),
             }),
@@ -741,6 +742,10 @@ async fn active_pdf_streams_pin_all_32_workspaces_and_idle_eviction_recovers_cap
         dir.path(),
         Config {
             auth: fixture.config.clone(),
+            http: pdf2md_mcp::config::HttpConfig {
+                downloads: 64,
+                ..Default::default()
+            },
             ..Config::default()
         },
         None,
@@ -969,3 +974,140 @@ rom0AYO7AXhfR2+90ihrHdD7
 -----END PRIVATE KEY-----
 ";
 const TEST_MODULUS: &str = "kfqAX58zY9qGTqRr7sSfhilbOHoPaSVCvYdAEUz2xynP33YNPQzrJMTh5A4dnPeyH5NENDxTsTm0amkXNt7SoBL4oz70N0Aeb3EEl12LaVV-T6Rsg7gN_daWrUMp5FqKYsX4xPlZcUYfHV0AlVQYY76GBEb4MM_LpkmNwxv9DVUtPxf0WmahmBk4qaksK521F6i7MG4YdjjhngVj0Hhj7M2ZOOtn5cp9dGYUZ0jTIz95Vm-_gztlh0LS0f4I8yKkEBhw4uOF8GQXtPjDdLZBGyi2Dr8-uvCwygfO-3RPxHbUgbD6XDS8YeLq02hr54B-WGSCsTJtC4lxn0sFQygolw";
+
+#[tokio::test]
+async fn operate_scope_is_additional_to_read_and_write_for_introspection_and_jwt() {
+    for validation in [TokenValidation::Introspection, TokenValidation::Jwt] {
+        let fixture = Fixture::new(validation).await;
+        let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
+        let missing = match validation {
+            TokenValidation::Introspection => "synthetic-opaque".to_owned(),
+            TokenValidation::Jwt => token(&fixture.issuer, "first", |_| {}),
+        };
+        assert_eq!(
+            auth.authorize(Some(&missing), true, true)
+                .await
+                .unwrap_err()
+                .code,
+            "auth_forbidden"
+        );
+        assert!(auth.authenticate(Some(&missing), true).await.is_ok());
+        fixture.introspection.lock().unwrap()["scope"] =
+            json!("pdf2md:read pdf2md:write pdf2md:operate");
+        let granted = match validation {
+            TokenValidation::Introspection => "synthetic-opaque".to_owned(),
+            TokenValidation::Jwt => token(&fixture.issuer, "first", |claims| {
+                claims["scope"] = json!("pdf2md:read pdf2md:write pdf2md:operate")
+            }),
+        };
+        assert!(auth.authorize(Some(&granted), true, true).await.is_ok());
+        fixture.introspection.lock().unwrap()["scope"] = json!("pdf2md:read pdf2md:operate");
+        let no_write = match validation {
+            TokenValidation::Introspection => "synthetic-opaque".to_owned(),
+            TokenValidation::Jwt => token(&fixture.issuer, "first", |claims| {
+                claims["scope"] = json!("pdf2md:read pdf2md:operate")
+            }),
+        };
+        assert_eq!(
+            auth.authorize(Some(&no_write), true, true)
+                .await
+                .unwrap_err()
+                .code,
+            "auth_forbidden"
+        );
+    }
+    let fixture = Fixture::new(TokenValidation::Jwt).await;
+    let mut config = fixture.config.clone();
+    config.oidc.as_mut().unwrap().operate_scope = "pdf2md:write".into();
+    assert!(config.validate().is_err());
+}
+
+#[tokio::test]
+async fn durable_jobs_are_private_and_global_capacity_covers_multiple_identities() {
+    use pdf2md_mcp::{
+        config::{Config, Mode, Source},
+        service::CallerService,
+    };
+    let fixture = Fixture::new(TokenValidation::Introspection).await;
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let mut config = Config {
+        auth: fixture.config.clone(),
+        ..Config::default()
+    };
+    config.conversion.enabled = false;
+    config.http.per_workspace_jobs = 2;
+    config.http.total_jobs = 2;
+    let mut source = Source::one_off("https://example.com/operator.pdf".into(), Mode::Https);
+    source.id = "operator".into();
+    source.interval_secs = Some(60);
+    config.sources.push(source);
+    config.http.published_sources.push("operator".into());
+    let service = CallerService::new(dir.path(), config, None).await.unwrap();
+    assert_eq!(
+        service
+            .submit_source(Some("alice"), "operator", None)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_forbidden"
+    );
+    fixture.introspection.lock().unwrap()["scope"] =
+        json!("pdf2md:read pdf2md:write pdf2md:operate");
+    let alice = service
+        .submit_source(Some("alice"), "operator", Some("same-key"))
+        .await
+        .unwrap();
+    assert!(
+        service
+            .set_schedule(Some("alice"), "operator", true)
+            .await
+            .unwrap()
+            .enabled
+    );
+    fixture.introspection.lock().unwrap()["sub"] = json!("bob");
+    assert!(service.jobs(Some("bob")).await.unwrap().is_empty());
+    assert!(service.schedules(Some("bob")).await.unwrap().is_empty());
+    assert_eq!(
+        service
+            .get_job(Some("bob"), &alice.id)
+            .await
+            .unwrap_err()
+            .code,
+        "job_not_found"
+    );
+    assert_eq!(
+        service
+            .cancel_job(Some("bob"), &alice.id)
+            .await
+            .unwrap_err()
+            .code,
+        "job_not_found"
+    );
+    let bob = service
+        .submit_source(Some("bob"), "operator", Some("same-key"))
+        .await
+        .unwrap();
+    assert_ne!(alice.id, bob.id);
+    assert_eq!(
+        service
+            .submit_acquisition(Some("bob"), "https://example.com/third.pdf".into(), None)
+            .await
+            .unwrap_err()
+            .code,
+        "job_capacity"
+    );
+    fixture.introspection.lock().unwrap()["sub"] = json!("alice");
+    assert_eq!(
+        service
+            .submit_source(Some("alice"), "operator", Some("same-key"))
+            .await
+            .unwrap()
+            .id,
+        alice.id
+    );
+    fixture.introspection.lock().unwrap()["active"] = json!(false);
+    assert_eq!(
+        service.jobs(Some("alice")).await.unwrap_err().code,
+        "auth_invalid"
+    );
+}

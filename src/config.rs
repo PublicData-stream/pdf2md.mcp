@@ -13,11 +13,35 @@ pub struct Config {
     pub conversion: crate::conversion::ConversionConfig,
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
+    #[serde(default)]
+    pub http: HttpConfig,
     pub database_url_env: Option<String>,
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
     pub sources: Vec<Source>,
+}
+
+/// Operator settings for the managed HTTP caller service.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpConfig {
+    pub bind: String,
+    pub published_sources: Vec<String>,
+    pub per_workspace_jobs: usize,
+    pub total_jobs: usize,
+    pub downloads: usize,
+}
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:8080".into(),
+            published_sources: Vec::new(),
+            per_workspace_jobs: 100,
+            total_jobs: 1000,
+            downloads: 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,7 +82,7 @@ impl Mode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
     pub id: String,
@@ -106,7 +130,7 @@ impl Source {
 }
 
 /// Secret values are never included in application output or error messages.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Secret {
     pub literal: Option<String>,
@@ -146,14 +170,14 @@ impl Secret {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Header {
     pub name: String,
     pub value: Secret,
     pub origin: String,
 }
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cookie {
     pub name: String,
@@ -161,7 +185,7 @@ pub struct Cookie {
     pub origin: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Step {
     Navigate {
@@ -337,6 +361,29 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         self.conversion.limits.validate()?;
         self.auth.validate()?;
+        if self.http.bind.parse::<std::net::SocketAddr>().is_err()
+            || self.http.per_workspace_jobs == 0
+            || self.http.total_jobs == 0
+            || self.http.per_workspace_jobs > self.http.total_jobs
+            || self.http.downloads == 0
+            || self.http.downloads > 64
+        {
+            return Err(LoadError::new(
+                "config_invalid",
+                "invalid HTTP service limits or bind address",
+            ));
+        }
+        let published: HashSet<_> = self.http.published_sources.iter().collect();
+        if published.len() != self.http.published_sources.len()
+            || published
+                .iter()
+                .any(|id| !self.sources.iter().any(|s| &s.id == *id))
+        {
+            return Err(LoadError::new(
+                "config_invalid",
+                "published sources must be unique configured source IDs",
+            ));
+        }
         if self.limits.concurrency == 0
             || self.limits.concurrency > 64
             || self.limits.max_bytes == 0

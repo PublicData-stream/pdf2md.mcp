@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use fs2::FileExt;
 use futures_util::{StreamExt, stream};
 use pdf2md_mcp::{
     config::{Config, Mode, Source},
@@ -10,7 +11,7 @@ use pdf2md_mcp::{
     storage::Store,
     workspace::WorkspaceRegistry,
 };
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -38,6 +39,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve the workspace-authorized HTTP/OpenAPI API.
+    Serve {
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
+    },
+    /// Inspect or revoke durable polling grants in the selected workspace.
+    Schedules {
+        #[command(subcommand)]
+        action: ScheduleCommand,
+    },
     /// List initialized caller workspaces (trusted operator operation).
     Workspaces,
     /// Load a named TOML source now.
@@ -79,6 +90,102 @@ enum Command {
     Status,
     /// Show all observations, optionally restricted to a source.
     History { source: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum ScheduleCommand {
+    List,
+    Disable { source_id: String },
+}
+
+async fn serve(
+    cli: &Cli,
+    mut config: Config,
+    database_url: Option<String>,
+    listen: Option<std::net::SocketAddr>,
+) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if cli.workspace != "operator" {
+        return Err(LoadError::new(
+            "config_invalid",
+            "serve selects workspaces from caller authentication",
+        ));
+    }
+    if let Some(address) = listen {
+        config.http.bind = address.to_string();
+    }
+    config.validate()?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&cli.data_dir)
+        .map_err(pdf2md_mcp::error::io_error)?;
+    let owner = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(cli.data_dir.join(".serve.lock"))
+        .map_err(pdf2md_mcp::error::io_error)?;
+    if !owner
+        .metadata()
+        .map_err(pdf2md_mcp::error::io_error)?
+        .is_file()
+    {
+        return Err(LoadError::new(
+            "storage_locked",
+            "invalid server ownership file",
+        ));
+    }
+    owner
+        .try_lock_exclusive()
+        .map_err(|_| LoadError::new("storage_locked", "server already owns this data root"))?;
+    let address = config.http.bind.clone();
+    let service = Arc::new(
+        pdf2md_mcp::service::CallerService::new(&cli.data_dir, config, database_url).await?,
+    );
+    let listener = tokio::net::TcpListener::bind(&address)
+        .await
+        .map_err(pdf2md_mcp::error::io_error)?;
+    eprintln!(
+        "HTTP listener {}",
+        listener.local_addr().map_err(pdf2md_mcp::error::io_error)?
+    );
+    let cancel = CancellationToken::new();
+    let signal_cancel = cancel.clone();
+    let signal = tokio::spawn(async move {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _=tokio::signal::ctrl_c()=>{},
+            _=async{match &mut terminate {Some(signal)=>{signal.recv().await;},None=>std::future::pending::<()>().await}}=>{}
+        }
+        signal_cancel.cancel();
+    });
+    let dispatcher_service = service.clone();
+    let dispatcher_cancel = cancel.clone();
+    let worker = cli.worker.clone();
+    let converter = conversion_worker(cli);
+    let dispatch = tokio::spawn(async move {
+        let result = dispatcher_service
+            .run(&worker, &converter, &dispatcher_cancel)
+            .await;
+        dispatcher_cancel.cancel();
+        result
+    });
+    let result = axum::serve(listener, pdf2md_mcp::http::router(service, cancel.clone()))
+        .with_graceful_shutdown(cancel.clone().cancelled_owned())
+        .await
+        .map_err(pdf2md_mcp::error::io_error);
+    cancel.cancel();
+    let dispatched = dispatch
+        .await
+        .map_err(|_| LoadError::new("service_failed", "job dispatcher failed"))?;
+    signal.abort();
+    dispatched?;
+    result
 }
 
 fn emit(obs: &Observation, json: bool) {
@@ -164,6 +271,9 @@ async fn run(cli: &Cli) -> Result<()> {
             })
         })
         .transpose()?;
+    if let Command::Serve { listen } = &cli.command {
+        return serve(cli, config, database_url, *listen).await;
+    }
     if matches!(cli.command, Command::Workspaces) {
         let registry = WorkspaceRegistry::open(&cli.data_dir).await?;
         let entries = registry.list().await?;
@@ -195,6 +305,41 @@ async fn run(cli: &Cli) -> Result<()> {
             registry.resolve_existing(&cli.workspace).await?
         }
     };
+    if let Command::Schedules { action } = &cli.command {
+        let store = Store::open(&data_dir, database_url.as_deref()).await?;
+        match action {
+            ScheduleCommand::List => {
+                for schedule in store.schedules().await? {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&schedule).expect("serializable schedule")
+                    );
+                }
+            }
+            ScheduleCommand::Disable { source_id } => {
+                let schedule = store
+                    .schedules()
+                    .await?
+                    .into_iter()
+                    .find(|s| &s.source_id == source_id)
+                    .ok_or_else(|| LoadError::new("source_not_found", "schedule unavailable"))?;
+                store
+                    .set_schedule(
+                        source_id,
+                        false,
+                        schedule.interval_secs,
+                        &schedule.fingerprint,
+                    )
+                    .await?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&store.schedules().await?)
+                        .expect("serializable schedules")
+                );
+            }
+        }
+        return Ok(());
+    }
     match &cli.command {
         Command::ConversionHistory { document_id } => {
             for attempt in Store::read_conversion_history(
@@ -273,7 +418,11 @@ async fn run(cli: &Cli) -> Result<()> {
     });
     let result = async {
         match &cli.command {
-            Command::Workspaces | Command::ConversionHistory { .. } | Command::Export { .. } => {
+            Command::Serve { .. }
+            | Command::Schedules { .. }
+            | Command::Workspaces
+            | Command::ConversionHistory { .. }
+            | Command::Export { .. } => {
                 unreachable!("handled before opening store")
             }
             Command::Convert {

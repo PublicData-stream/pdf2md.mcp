@@ -38,7 +38,7 @@ fn row(row: sqlx::any::AnyRow) -> Result<ConversionAttempt> {
     })
 }
 const COLS: &str = "id,document_id,profile_key,options,status,automatic,created_at,finished_at,error_code,bundle_id";
-async fn insert(
+pub(crate) async fn insert(
     tx: &mut Transaction<'_, Any>,
     ns: &str,
     id: &str,
@@ -59,17 +59,68 @@ pub(crate) async fn enqueue_automatic(
 ) -> Result<()> {
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversion_attempts WHERE namespace=$1 AND document_id=$2 AND automatic=1").bind(ns).bind(document).fetch_one(&mut **tx).await.map_err(db_error)?;
     if exists == 0 {
-        insert(
+        let id = uuid::Uuid::new_v4().to_string();
+        insert(tx, ns, &id, document, options, true).await?;
+        crate::jobs::insert_job(
             tx,
             ns,
-            &uuid::Uuid::new_v4().to_string(),
-            document,
-            options,
-            true,
+            &id,
+            &crate::jobs::JobCommand::Convert {
+                document_id: document.into(),
+                options: options.clone(),
+                force: false,
+            },
+            None,
         )
         .await?;
     }
     Ok(())
+}
+pub(crate) struct VerifiedBundle {
+    root: PathBuf,
+    id: String,
+    manifest: ConversionManifest,
+}
+impl VerifiedBundle {
+    pub(crate) fn manifest(&self) -> &ConversionManifest {
+        &self.manifest
+    }
+    pub(crate) fn open_artifact(&self, index: usize) -> Result<std::fs::File> {
+        let artifact = self.manifest.artifacts.get(index).ok_or_else(corrupt)?;
+        open_verified_artifact(&self.root, &self.id, artifact)
+    }
+}
+fn open_verified_artifact(
+    root: &Path,
+    bundle: &str,
+    artifact: &crate::conversion::Artifact,
+) -> Result<std::fs::File> {
+    use std::io::{Seek, SeekFrom};
+    if !crate::conversion::valid_artifact_path(&artifact.path) {
+        return Err(corrupt());
+    }
+    let base = root.join("conversions").join(bundle);
+    dir(&base)?;
+    if artifact.path.starts_with("assets/") {
+        dir(&base.join("assets"))?;
+    }
+    let mut file = open_regular(&base.join(&artifact.path))?;
+    let mut hash = Sha256::new();
+    let mut count = 0u64;
+    let mut buffer = [0; 65536];
+    loop {
+        let n = file.read(&mut buffer).map_err(io_error)?;
+        if n == 0 {
+            break;
+        }
+        count = count.checked_add(n as u64).ok_or_else(corrupt)?;
+        hash.update(&buffer[..n]);
+    }
+    if count != artifact.bytes || format!("{:x}", hash.finalize()) != artifact.sha256 {
+        return Err(corrupt());
+    }
+    file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+    Ok(file)
 }
 impl Store {
     async fn conversion_attempt(&self, id: &str) -> Result<ConversionAttempt> {
@@ -107,8 +158,76 @@ impl Store {
         }
         let id = uuid::Uuid::new_v4().to_string();
         insert(&mut tx, &self.namespace, &id, document_id, options, false).await?;
+        crate::jobs::insert_job(
+            &mut tx,
+            &self.namespace,
+            &id,
+            &crate::jobs::JobCommand::Convert {
+                document_id: document_id.into(),
+                options: options.clone(),
+                force,
+            },
+            None,
+        )
+        .await?;
         tx.commit().await.map_err(db_error)?;
         self.conversion_attempt(&id).await
+    }
+    pub(crate) async fn open_verified_bundle(&self, id: &str) -> Result<VerifiedBundle> {
+        let attempt = self.conversion_attempt(id).await?;
+        if attempt.status != "succeeded" {
+            return Err(LoadError::new(
+                "conversion_not_found",
+                "conversion unavailable",
+            ));
+        }
+        let manifest = verify_attempt_contents(&self.root, &attempt, false)?;
+        Ok(VerifiedBundle {
+            root: self.root.clone(),
+            id: attempt.bundle_id.ok_or_else(corrupt)?,
+            manifest,
+        })
+    }
+    pub async fn verified_conversion_manifest(&self, id: &str) -> Result<ConversionManifest> {
+        let attempt = self.conversion_attempt(id).await?;
+        if attempt.status != "succeeded" {
+            return Err(LoadError::new(
+                "conversion_not_found",
+                "conversion unavailable",
+            ));
+        }
+        verify_attempt_contents(&self.root, &attempt, false)
+    }
+    pub async fn open_conversion_artifact(&self, id: &str, path: &str) -> Result<std::fs::File> {
+        let bundle = self.open_verified_bundle(id).await?;
+        let index = bundle
+            .manifest
+            .artifacts
+            .iter()
+            .position(|artifact| artifact.path == path)
+            .ok_or_else(|| LoadError::new("conversion_not_found", "artifact unavailable"))?;
+        bundle.open_artifact(index)
+    }
+    pub async fn conversion_history_page(
+        &self,
+        document: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ConversionAttempt>> {
+        let q = format!(
+            "SELECT {COLS} FROM conversion_attempts WHERE namespace=$1 AND ($2 IS NULL OR document_id=$2) ORDER BY created_at,id LIMIT $3 OFFSET $4"
+        );
+        sqlx::query(&q)
+            .bind(&self.namespace)
+            .bind(document)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .bind(i64::try_from(offset).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_error)?
+            .into_iter()
+            .map(row)
+            .collect()
     }
     pub async fn pending_conversions(&self) -> Result<Vec<ConversionAttempt>> {
         let q = format!(
@@ -204,7 +323,12 @@ impl Store {
         if cancel.is_cancelled() {
             return Err(LoadError::new("cancelled", "conversion cancelled"));
         }
-        let updated = sqlx::query("UPDATE conversion_attempts SET status='running' WHERE namespace=$1 AND id=$2 AND status='pending'").bind(&self.namespace).bind(id).execute(&self.pool).await.map_err(db_error)?.rows_affected();
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let updated = sqlx::query("UPDATE conversion_attempts SET status='running' WHERE namespace=$1 AND id=$2 AND status='pending'").bind(&self.namespace).bind(id).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
+        if updated != 0 {
+            sqlx::query("UPDATE api_jobs SET status='running',started_at=$1 WHERE namespace=$2 AND id=$3 AND status='queued'").bind(now()).bind(&self.namespace).bind(id).execute(&mut *tx).await.map_err(db_error)?;
+        }
+        tx.commit().await.map_err(db_error)?;
         if updated == 0 {
             return self.conversion_attempt(id).await;
         }
@@ -245,7 +369,10 @@ impl Store {
                 }
                 let bundle = format!("{:x}", Sha256::digest(&bytes));
                 publish_bundle(&self.root, tmp.path(), &bundle, &bytes, &manifest)?;
-                sqlx::query("UPDATE conversion_attempts SET status='succeeded',finished_at=$1,bundle_id=$2 WHERE namespace=$3 AND id=$4 AND status='running'").bind(now()).bind(bundle).bind(&self.namespace).bind(id).execute(&self.pool).await.map_err(db_error)?;
+                let mut tx = self.pool.begin().await.map_err(db_error)?;
+                sqlx::query("UPDATE conversion_attempts SET status='succeeded',finished_at=$1,bundle_id=$2 WHERE namespace=$3 AND id=$4 AND status='running'").bind(now()).bind(bundle).bind(&self.namespace).bind(id).execute(&mut *tx).await.map_err(db_error)?;
+                sqlx::query("UPDATE api_jobs SET status='succeeded',finished_at=$1 WHERE namespace=$2 AND id=$3 AND status='running'").bind(now()).bind(&self.namespace).bind(id).execute(&mut *tx).await.map_err(db_error)?;
+                tx.commit().await.map_err(db_error)?;
                 self.conversion_attempt(id).await
             }
             Err(e) => {
@@ -262,7 +389,11 @@ impl Store {
         code: &str,
         cancelled: bool,
     ) -> Result<ConversionAttempt> {
-        sqlx::query("UPDATE conversion_attempts SET status=$1,finished_at=$2,error_code=$3 WHERE namespace=$4 AND id=$5 AND status='running'").bind(if cancelled {"cancelled"} else {"failed"}).bind(now()).bind(code).bind(&self.namespace).bind(id).execute(&self.pool).await.map_err(db_error)?;
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let status = if cancelled { "cancelled" } else { "failed" };
+        sqlx::query("UPDATE conversion_attempts SET status=$1,finished_at=$2,error_code=$3 WHERE namespace=$4 AND id=$5 AND status='running'").bind(status).bind(now()).bind(code).bind(&self.namespace).bind(id).execute(&mut *tx).await.map_err(db_error)?;
+        sqlx::query("UPDATE api_jobs SET status=$1,finished_at=$2,error_code=$3 WHERE namespace=$4 AND id=$5 AND status='running'").bind(status).bind(now()).bind(code).bind(&self.namespace).bind(id).execute(&mut *tx).await.map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         self.conversion_attempt(id).await
     }
 }
@@ -282,6 +413,13 @@ fn dir(path: &Path) -> Result<()> {
     Ok(())
 }
 fn verify_bundle(root: &Path, id: &str) -> Result<ConversionManifest> {
+    verify_bundle_contents(root, id, true)
+}
+fn verify_bundle_contents(
+    root: &Path,
+    id: &str,
+    verify_contents: bool,
+) -> Result<ConversionManifest> {
     if !valid_hash(id) {
         return Err(corrupt());
     }
@@ -316,20 +454,22 @@ fn verify_bundle(root: &Path, id: &str) -> Result<ConversionManifest> {
         if a.path.starts_with("assets/") {
             dir(&base.join("assets"))?;
         }
-        let mut f = open_regular(&base.join(&a.path))?;
-        let mut h = Sha256::new();
-        let mut n = 0u64;
-        let mut b = [0; 65536];
-        loop {
-            let k = f.read(&mut b).map_err(io_error)?;
-            if k == 0 {
-                break;
+        if verify_contents {
+            let mut f = open_regular(&base.join(&a.path))?;
+            let mut h = Sha256::new();
+            let mut n = 0u64;
+            let mut b = [0; 65536];
+            loop {
+                let k = f.read(&mut b).map_err(io_error)?;
+                if k == 0 {
+                    break;
+                }
+                n = n.checked_add(k as u64).ok_or_else(corrupt)?;
+                h.update(&b[..k]);
             }
-            n = n.checked_add(k as u64).ok_or_else(corrupt)?;
-            h.update(&b[..k]);
-        }
-        if n != a.bytes || format!("{:x}", h.finalize()) != a.sha256 {
-            return Err(corrupt());
+            if n != a.bytes || format!("{:x}", h.finalize()) != a.sha256 {
+                return Err(corrupt());
+            }
         }
     }
     if !names.contains("document.md") {
@@ -338,8 +478,15 @@ fn verify_bundle(root: &Path, id: &str) -> Result<ConversionManifest> {
     Ok(manifest)
 }
 fn verify_attempt(root: &Path, attempt: &ConversionAttempt) -> Result<ConversionManifest> {
+    verify_attempt_contents(root, attempt, true)
+}
+fn verify_attempt_contents(
+    root: &Path,
+    attempt: &ConversionAttempt,
+    verify_contents: bool,
+) -> Result<ConversionManifest> {
     let bundle = attempt.bundle_id.as_deref().ok_or_else(corrupt)?;
-    let manifest = verify_bundle(root, bundle)?;
+    let manifest = verify_bundle_contents(root, bundle, verify_contents)?;
     if manifest.document_id != attempt.document_id
         || manifest.options != attempt.options
         || manifest.converter.is_empty()
@@ -519,7 +666,7 @@ async fn readonly(
         .fetch_all(&pool)
         .await
         .map_err(db_error)?;
-    if v.len() != 1 || ![1, 2].contains(&v[0]) {
+    if v.len() != 1 || ![1, 2, 3].contains(&v[0]) {
         return Err(LoadError::new(
             "storage_database_version",
             "unsupported metadata schema version",

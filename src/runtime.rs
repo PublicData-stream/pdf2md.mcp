@@ -27,6 +27,28 @@ pub async fn fetch(
     worker: &Path,
     cancel: &CancellationToken,
 ) -> Result<Observation> {
+    fetch_inner(store, config, source, worker, cancel, None).await
+}
+
+pub async fn fetch_job(
+    store: &Store,
+    config: &Config,
+    source: &Source,
+    worker: &Path,
+    cancel: &CancellationToken,
+    job_id: &str,
+) -> Result<Observation> {
+    fetch_inner(store, config, source, worker, cancel, Some(job_id)).await
+}
+
+async fn fetch_inner(
+    store: &Store,
+    config: &Config,
+    source: &Source,
+    worker: &Path,
+    cancel: &CancellationToken,
+    job_id: Option<&str>,
+) -> Result<Observation> {
     if cancel.is_cancelled() {
         return Err(LoadError::new("cancelled", "loading cancelled"));
     }
@@ -85,17 +107,32 @@ pub async fn fetch(
                 return Err(LoadError::new("run_timeout", "loading deadline exceeded"));
             }
             let url = sanitized_url(&acquired.final_url);
-            store
-                .accept_before(
-                    staged.path(),
-                    &source.id,
-                    source.mode.as_str(),
-                    url.as_deref(),
-                    &attempt,
-                    deadline,
-                    cancel,
-                )
-                .await
+            if let Some(job_id) = job_id {
+                store
+                    .accept_before_job(
+                        staged.path(),
+                        &source.id,
+                        source.mode.as_str(),
+                        url.as_deref(),
+                        &attempt,
+                        deadline,
+                        cancel,
+                        job_id,
+                    )
+                    .await
+            } else {
+                store
+                    .accept_before(
+                        staged.path(),
+                        &source.id,
+                        source.mode.as_str(),
+                        url.as_deref(),
+                        &attempt,
+                        deadline,
+                        cancel,
+                    )
+                    .await
+            }
         };
         // The browser supervisor must finish kill+wait before its proxy and staging file drop.
         let result = result.await;

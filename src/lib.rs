@@ -4,6 +4,8 @@ pub mod config;
 pub mod conversion;
 pub mod direct;
 pub mod error;
+pub mod http;
+pub mod jobs;
 pub mod manual;
 pub mod model;
 pub mod policy;

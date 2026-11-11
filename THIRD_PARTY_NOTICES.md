@@ -9,6 +9,10 @@ and is distributed under the Apache License, Version 2.0. See the upstream
 [`LICENSE`](https://github.com/h4ckf0r0day/obscura/blob/e3007167016b169bb58d8b5124ca9662a0b37f2d/LICENSE)
 file for the terms applicable to that code.
 
+The container build copies the upstream `LICENSE` (and `NOTICE`, when present)
+from the Cargo checkout for this exact revision into
+`/usr/share/licenses/pdf2md-mcp/obscura/`.
+
 The root application and worker package are licensed under
 [`AGPL-3.0-only`](LICENSE). This notice identifies the direct Obscura source
 dependency; it is not a complete license or attribution inventory for every

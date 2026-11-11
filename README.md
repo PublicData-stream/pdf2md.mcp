@@ -15,7 +15,7 @@ release policy.
 
 ## Requirements
 
-- Rust 1.88 or newer (edition 2024); local validation uses Rust 1.99.1.
+- Rust 1.88 or newer (edition 2024); the container build uses Rust 1.99.1.
 - Linux for the Obscura worker and its process memory monitoring. Direct HTTPS
   acquisition and storage also target the supported Linux deployment.
 - The `pdf2md-obscura-worker` binary when a source uses `obscura` or `browser`
@@ -72,6 +72,19 @@ published without replacing an existing object. Metadata and acquisition
 history live in SQLite in the same storage root by default. PostgreSQL stores
 metadata only, while PDF objects remain in the storage root; take a coordinated
 backup of both when using PostgreSQL.
+
+For manual loading, initialize the directories once, copy a PDF, and scan:
+
+```sh
+pdf2md-mcp --data-dir ./pdf2md-mcp-data scan
+cp ./document.pdf ./pdf2md-mcp-data/pdfs/
+pdf2md-mcp --data-dir ./pdf2md-mcp-data scan
+```
+
+Run `pdf2md-mcp --data-dir ./pdf2md-mcp-data watch` in another terminal to
+register copied files automatically. For a one-off HTTPS download, use
+`pdf2md-mcp fetch-url https://www.rfc-editor.org/rfc/rfc9110.pdf`;
+add `--mode obscura` to use the browser-like transport.
 
 Only one process may own writes to a data root at a time. `fetch`, `fetch-url`,
 `scan`, `watch`, and `run` write history; while `watch` or `run` owns the root,
@@ -149,6 +162,51 @@ PostgreSQL integration cases skip their PostgreSQL path when
 external database paths. Other storage tests use SQLite. The
 browser end-to-end cases are ignored in the default test run; the script builds
 the worker and uses local TLS fixtures and OpenSSL to run them.
+## Container
+
+Build an image containing the CLI and browser worker:
+
+```sh
+docker build -t pdf2md-mcp .
+```
+
+The image runs as an unprivileged user, uses `/data` for durable storage, and
+starts the daemon with `run`. Mount a persistent volume at `/data`. The browser
+worker is included and used only for `obscura` or `browser` sources. The image
+does not include or manage PostgreSQL. If a build environment intercepts HTTPS, provide
+its trusted CA to BuildKit without copying it into an image layer:
+
+```sh
+docker build --secret id=proxy_ca,src="$PROXY_CA_FILE" -t pdf2md-mcp .
+```
+
+To run with a local configuration file, mount it read-only and mount a
+persistent data volume. For the sample source, inject its environment values
+through your runtime secret mechanism before requesting those sources:
+
+```sh
+docker run --rm \
+  --mount type=volume,src=pdf2md-data,dst=/data \
+  --mount "type=bind,src=$PWD/sources.toml,dst=/etc/pdf2md/sources.toml,readonly" \
+  --env PDF2MD_NOTICE_TOKEN \
+  --env PDF2MD_BROWSER_SESSION \
+  --env PDF2MD_SEARCH_TERM \
+  pdf2md-mcp --data-dir /data --config /etc/pdf2md/sources.toml run
+```
+
+After building the CLI and image, validate manual loading, revision history,
+watching, concurrent status reads, shutdown, and restart persistence with:
+
+```sh
+cargo build --locked --package pdf2md-mcp
+python3 scripts/test-cli-docker.py pdf2md-mcp
+```
+
+Set `PDF2MD_TEST_POSTGRES_URL` to include local CLI PostgreSQL checks. The harness
+uses disposable bind mounts under `/tmp`, checks the image's default user, and
+adapts the longer bind-mount test to rootless Docker's UID mapping. It does not
+test a production deployment.
+
 ## Security and Limitations
 
 PDF input and remote responses are untrusted. Downloads are subject to byte and
@@ -179,6 +237,7 @@ end-to-end client acceptance is currently provided. See the
 - [Security Policy](SECURITY.md): private vulnerability reporting and disclosure.
 - [Third-party notices](THIRD_PARTY_NOTICES.md): notices for included upstream code.
 - [Example source configuration](examples/sources.toml): source and limit settings.
+- [Dockerfile](Dockerfile): reproducible Linux image build.
 - [Pull request template](.github/pull_request_template.md): change and validation
   information for reviewers.
 - [License](LICENSE): GNU Affero General Public License, version 3.

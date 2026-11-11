@@ -413,6 +413,118 @@ fn configuration_rejects_incomplete_oauth_and_keeps_secrets_redacted() {
 }
 
 #[tokio::test]
+async fn caller_boundary_keeps_user_history_and_known_pdf_hashes_private() {
+    use pdf2md_mcp::{
+        config::Config,
+        service::{CallerService, Operation, Response},
+        storage::Store,
+        workspace::WorkspaceRegistry,
+    };
+    use std::io::Write;
+    use tokio_util::sync::CancellationToken;
+    let fixture = Fixture::new(TokenValidation::Introspection).await;
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let registry = WorkspaceRegistry::open(dir.path()).await.unwrap();
+    let alice = registry
+        .resolve_identity(&fixture.issuer, "alice", None)
+        .await
+        .unwrap();
+    let store = Store::open(&alice, None).await.unwrap();
+    let mut input = store.staging_file().unwrap();
+    input
+        .write_all(b"%PDF-1.7\nsynthetic-private-alice")
+        .unwrap();
+    let observation = store
+        .accept(input.path(), "same-source", "https", None, "same-attempt")
+        .await
+        .unwrap();
+    let document_id = observation.document_id.unwrap();
+    drop(input);
+    drop(store);
+    drop(registry);
+    let service = CallerService::new(
+        dir.path(),
+        Config {
+            auth: fixture.config.clone(),
+            ..Config::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let Response::Observations(history) = service
+        .execute(
+            Some("alice-token"),
+            Operation::History { source: None },
+            &cancel,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("history response")
+    };
+    assert_eq!(history.len(), 1);
+    fixture.introspection.lock().unwrap()["sub"] = json!("bob");
+    let Response::Observations(history) = service
+        .execute(
+            Some("bob-token"),
+            Operation::History { source: None },
+            &cancel,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("history response")
+    };
+    assert!(history.is_empty());
+    let error = service
+        .execute(
+            Some("bob-token"),
+            Operation::ReadPdf {
+                document_id: document_id.clone(),
+            },
+            &cancel,
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "document_not_found");
+    fixture.introspection.lock().unwrap()["sub"] = json!("alice");
+    let Response::Pdf(mut stream) = service
+        .execute(
+            Some("alice-token"),
+            Operation::ReadPdf { document_id },
+            &cancel,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("PDF response")
+    };
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, b"%PDF-1.7\nsynthetic-private-alice");
+    fixture.introspection.lock().unwrap()["sub"] = json!("no-scope-user");
+    fixture.introspection.lock().unwrap()["scope"] = json!("");
+    assert_eq!(
+        service
+            .execute(
+                Some("no-scope-token"),
+                Operation::History { source: None },
+                &cancel
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+        "auth_forbidden"
+    );
+    let registry = WorkspaceRegistry::open(dir.path()).await.unwrap();
+    assert_eq!(registry.list().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn introspection_requires_a_token_class_and_accepts_explicit_authelia_prefix() {
     let mut fixture = Fixture::new(TokenValidation::Introspection).await;
     fixture
@@ -480,6 +592,244 @@ async fn introspection_requires_a_token_class_and_accepts_explicit_authelia_pref
     oidc.access_token_prefix = Some("authelia_at_".into());
     oidc.validation = TokenValidation::Jwt;
     assert!(fixture.config.validate().is_err());
+}
+
+async fn seed_pdf(root: &std::path::Path, label: &str, bytes: &[u8]) -> String {
+    use pdf2md_mcp::storage::Store;
+    use std::io::Write;
+    let store = Store::open(root, None).await.unwrap();
+    let mut input = store.staging_file().unwrap();
+    input.write_all(bytes).unwrap();
+    store
+        .accept(input.path(), label, "manual", None, "attempt")
+        .await
+        .unwrap()
+        .document_id
+        .unwrap()
+}
+
+#[tokio::test]
+async fn active_pdf_streams_pin_all_32_workspaces_and_idle_eviction_recovers_capacity() {
+    use pdf2md_mcp::{
+        config::Config,
+        service::{CallerService, Operation, Response},
+        storage::Store,
+        workspace::WorkspaceRegistry,
+    };
+    use tokio_util::sync::CancellationToken;
+    let fixture = Fixture::new(TokenValidation::Introspection).await;
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let registry = WorkspaceRegistry::open(dir.path()).await.unwrap();
+    let bytes = b"%PDF-1.7\ncache-pressure-synthetic";
+    let mut roots = Vec::new();
+    let mut document_id = String::new();
+    for user in 0..33 {
+        let path = registry
+            .resolve_identity(&fixture.issuer, &format!("user-{user}"), None)
+            .await
+            .unwrap();
+        document_id = seed_pdf(&path, "same-source", bytes).await;
+        roots.push(path);
+    }
+    let service = CallerService::new(
+        dir.path(),
+        Config {
+            auth: fixture.config.clone(),
+            ..Config::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let mut streams = Vec::new();
+    for user in 0..32 {
+        fixture.introspection.lock().unwrap()["sub"] = json!(format!("user-{user}"));
+        let Response::Pdf(stream) = service
+            .execute(
+                Some("synthetic-token"),
+                Operation::ReadPdf {
+                    document_id: document_id.clone(),
+                },
+                &cancel,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("PDF response")
+        };
+        streams.push(stream);
+    }
+    // Existing cached workspaces remain usable concurrently at full capacity.
+    let (first, second) = tokio::join!(
+        service.execute(Some("synthetic-token"), Operation::Status, &cancel),
+        service.execute(
+            Some("synthetic-token"),
+            Operation::History { source: None },
+            &cancel
+        )
+    );
+    assert!(first.is_ok());
+    assert!(second.is_ok());
+    fixture.introspection.lock().unwrap()["sub"] = json!("user-32");
+    assert_eq!(
+        service
+            .execute(
+                Some("synthetic-token"),
+                Operation::ReadPdf {
+                    document_id: document_id.clone()
+                },
+                &cancel
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+        "service_busy"
+    );
+    drop(streams.remove(0));
+    let Response::Pdf(mut newest) = service
+        .execute(
+            Some("synthetic-token"),
+            Operation::ReadPdf { document_id },
+            &cancel,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("PDF response")
+    };
+    // The released stream permits its idle store to be evicted and reopened.
+    let reopened = Store::open(&roots[0], None).await.unwrap();
+    assert_eq!(reopened.history(None).await.unwrap().len(), 1);
+    drop(reopened);
+    let mut output = Vec::new();
+    newest.read_to_end(&mut output).await.unwrap();
+    assert_eq!(output, bytes);
+    output.clear();
+    streams[0].read_to_end(&mut output).await.unwrap();
+    assert_eq!(output, bytes);
+    drop(service);
+    // Streams retain ownership even after their host is dropped.
+    assert_eq!(
+        Store::open(&roots[1], None).await.err().unwrap().code,
+        "storage_locked"
+    );
+    drop(streams);
+    drop(newest);
+    assert!(Store::open(&roots[1], None).await.is_ok());
+}
+
+#[tokio::test]
+async fn oauth_and_both_anonymous_modes_preserve_and_hide_each_others_data() {
+    use pdf2md_mcp::{
+        config::Config,
+        service::{CallerService, Operation, Response},
+        storage::Store,
+        workspace::WorkspaceRegistry,
+    };
+    use tokio_util::sync::CancellationToken;
+    let fixture = Fixture::new(TokenValidation::Introspection).await;
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let operator_id = seed_pdf(dir.path(), "operator-only", b"%PDF-1.7\noperator-private").await;
+    let registry = WorkspaceRegistry::open(dir.path()).await.unwrap();
+    let shared = registry.resolve_shared(None).await.unwrap();
+    let shared_id = seed_pdf(&shared, "shared-only", b"%PDF-1.7\nanonymous-shared").await;
+    let alice = registry
+        .resolve_identity(&fixture.issuer, "alice", None)
+        .await
+        .unwrap();
+    let alice_id = seed_pdf(&alice, "alice-only", b"%PDF-1.7\nalice-private").await;
+    let cancel = CancellationToken::new();
+    for auth in [
+        fixture.config.clone(),
+        AuthConfig {
+            mode: AuthMode::NoneRo,
+            oidc: None,
+        },
+        AuthConfig {
+            mode: AuthMode::NoneRw,
+            oidc: None,
+        },
+        fixture.config.clone(),
+    ] {
+        let private = auth.mode == AuthMode::Oauth2;
+        let service = CallerService::new(
+            dir.path(),
+            Config {
+                auth,
+                ..Config::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let Response::Observations(history) = service
+            .execute(
+                Some("alice-token"),
+                Operation::History { source: None },
+                &cancel,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("history response")
+        };
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].source_id,
+            if private { "alice-only" } else { "shared-only" }
+        );
+        let visible_id = if private { &alice_id } else { &shared_id };
+        let hidden_id = if private { &shared_id } else { &alice_id };
+        let Response::Pdf(mut stream) = service
+            .execute(
+                Some("alice-token"),
+                Operation::ReadPdf {
+                    document_id: visible_id.clone(),
+                },
+                &cancel,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("PDF response")
+        };
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(
+            bytes,
+            if private {
+                b"%PDF-1.7\nalice-private".as_slice()
+            } else {
+                b"%PDF-1.7\nanonymous-shared".as_slice()
+            }
+        );
+        for hidden in [hidden_id, &operator_id] {
+            assert_eq!(
+                service
+                    .execute(
+                        Some("alice-token"),
+                        Operation::ReadPdf {
+                            document_id: hidden.clone()
+                        },
+                        &cancel
+                    )
+                    .await
+                    .err()
+                    .unwrap()
+                    .code,
+                "document_not_found"
+            );
+        }
+        drop(stream);
+        drop(service);
+    }
+    assert_eq!(
+        Store::read_history(dir.path(), None, None).await.unwrap()[0].source_id,
+        "operator-only"
+    );
+    assert_eq!(registry.list().await.unwrap().len(), 2);
 }
 
 // Deliberately public, generated synthetic RSA key, used only for token fixtures.

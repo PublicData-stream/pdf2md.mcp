@@ -7,6 +7,7 @@ use pdf2md_mcp::{
     model::Observation,
     runtime,
     storage::Store,
+    workspace::WorkspaceRegistry,
 };
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
@@ -19,6 +20,9 @@ use tokio_util::sync::CancellationToken;
 struct Cli {
     #[arg(long, global = true, default_value = "pdf2md-mcp-data")]
     data_dir: PathBuf,
+    /// Trusted operator selection; caller identities cannot supply this selector.
+    #[arg(long, global = true, default_value = "operator")]
+    workspace: String,
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// Name of an environment variable containing an external PostgreSQL 18+ URL.
@@ -34,6 +38,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List initialized caller workspaces (trusted operator operation).
+    Workspaces,
     /// Load a named TOML source now.
     Fetch {
         #[arg(required_unless_present="all",conflicts_with="all",num_args=1..)]
@@ -112,13 +118,43 @@ async fn run(cli: &Cli) -> Result<()> {
             })
         })
         .transpose()?;
+    if matches!(cli.command, Command::Workspaces) {
+        let registry = WorkspaceRegistry::open(&cli.data_dir).await?;
+        let entries = registry.list().await?;
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string(&entries).expect("serializable workspaces")
+            );
+        } else {
+            for entry in entries {
+                println!("{} {}", entry.id, entry.kind);
+            }
+        }
+        return Ok(());
+    }
+    let data_dir = if cli.workspace == "operator" {
+        cli.data_dir.clone()
+    } else {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&cli.data_dir)
+            .map_err(pdf2md_mcp::error::io_error)?;
+        let registry = WorkspaceRegistry::open(&cli.data_dir).await?;
+        if cli.workspace == "shared" {
+            registry.resolve_shared(database_url.as_deref()).await?
+        } else {
+            registry.resolve_existing(&cli.workspace).await?
+        }
+    };
     if matches!(cli.command, Command::Status | Command::History { .. }) {
         let source = match &cli.command {
             Command::History { source } => source.as_deref(),
             _ => None,
         };
-        let observations =
-            Store::read_history(&cli.data_dir, database_url.as_deref(), source).await?;
+        let observations = Store::read_history(&data_dir, database_url.as_deref(), source).await?;
         if matches!(cli.command, Command::Status) {
             let mut latest = std::collections::BTreeMap::new();
             for obs in observations {
@@ -134,7 +170,7 @@ async fn run(cli: &Cli) -> Result<()> {
         }
         return Ok(());
     }
-    let store = Store::open(&cli.data_dir, database_url.as_deref()).await?;
+    let store = Store::open(&data_dir, database_url.as_deref()).await?;
     let cancel = CancellationToken::new();
     let shutdown = cancel.clone();
     let signal_task = tokio::spawn(async move {
@@ -156,6 +192,7 @@ async fn run(cli: &Cli) -> Result<()> {
     });
     let result = async {
         match &cli.command {
+            Command::Workspaces => unreachable!("handled before opening store"),
             Command::Fetch { source, all } => {
                 if !all
                     && source

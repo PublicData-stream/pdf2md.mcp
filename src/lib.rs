@@ -7,6 +7,7 @@ pub mod manual;
 pub mod model;
 pub mod policy;
 pub mod runtime;
+pub mod service;
 pub mod storage;
 pub mod workspace;
 

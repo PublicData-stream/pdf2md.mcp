@@ -17,6 +17,7 @@ clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 futures-util = "0.3"
 httpdate = "1"
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 libc = "0.2"
 notify = "8"
 rand = "0.9"

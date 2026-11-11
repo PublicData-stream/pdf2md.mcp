@@ -1,0 +1,515 @@
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use pdf2md_mcp::auth::{
+    AuthConfig, AuthMode, Authenticator, Identity, OidcConfig, OidcSecret, TokenValidation,
+};
+use rcgen::{CertifiedKey, generate_simple_self_signed};
+use serde_json::{Value, json};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+use tempfile::TempDir;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    task::JoinHandle,
+};
+use tokio_rustls::TlsAcceptor;
+
+struct Fixture {
+    config: AuthConfig,
+    issuer: String,
+    introspection: Arc<Mutex<Value>>,
+    jwks: Arc<Mutex<Value>>,
+    intro_count: Arc<AtomicUsize>,
+    key_count: Arc<AtomicUsize>,
+    metadata: Arc<Mutex<Option<Value>>>,
+    task: JoinHandle<()>,
+    _dir: TempDir,
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl Fixture {
+    async fn new(method: TokenValidation) -> Self {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, cert.pem()).unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "test-secret").unwrap();
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into(),
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let config = AuthConfig {
+            mode: AuthMode::Oauth2,
+            oidc: Some(OidcConfig {
+                issuer: issuer.clone(),
+                audience: "https://pdf2md.example/mcp".into(),
+                validation: method,
+                access_token_prefix: None,
+                client_id: Some("pdf2md-test".into()),
+                client_secret: Some(OidcSecret {
+                    env: None,
+                    file: Some(secret),
+                }),
+                read_scope: "pdf2md:read".into(),
+                write_scope: "pdf2md:write".into(),
+                allowed_endpoint_origins: vec![],
+                ca_file: Some(ca),
+            }),
+        };
+        let introspection = Arc::new(Mutex::new(claims(&issuer)));
+        let jwks = Arc::new(Mutex::new(json!({"keys":[jwk("first")]})));
+        let metadata = Arc::new(Mutex::new(None::<Value>));
+        let intro_count = Arc::new(AtomicUsize::new(0));
+        let key_count = Arc::new(AtomicUsize::new(0));
+        let (intro_data, keys_data, meta_data, counter, key_counter, origin) = (
+            introspection.clone(),
+            jwks.clone(),
+            metadata.clone(),
+            intro_count.clone(),
+            key_count.clone(),
+            issuer.clone(),
+        );
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (acceptor, intro_data, keys_data, meta_data, counter, key_counter, origin) = (
+                    acceptor.clone(),
+                    intro_data.clone(),
+                    keys_data.clone(),
+                    meta_data.clone(),
+                    counter.clone(),
+                    key_counter.clone(),
+                    origin.clone(),
+                );
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut bytes = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buf[..n]);
+                        if bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&bytes);
+                    let path = request.split_whitespace().nth(1).unwrap_or_default();
+                    let body = match path {
+                        "/.well-known/openid-configuration" => meta_data.lock().unwrap().clone().unwrap_or_else(|| json!({"issuer":origin,"introspection_endpoint":format!("{origin}/introspect"),"jwks_uri":format!("{origin}/jwks")})),
+                        "/introspect" => {
+                            counter.fetch_add(1,Ordering::SeqCst);
+                            assert!(request.contains("authorization: Basic "));
+                            intro_data.lock().unwrap().clone()
+                        },
+                        "/jwks" => {
+                            key_counter.fetch_add(1,Ordering::SeqCst);
+                            keys_data.lock().unwrap().clone()
+                        },
+                        _ => json!({"unexpected":true}),
+                    }.to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        Self {
+            config,
+            issuer,
+            introspection,
+            jwks,
+            metadata,
+            intro_count,
+            key_count,
+            task,
+            _dir: dir,
+        }
+    }
+}
+fn claims(issuer: &str) -> Value {
+    let now = chrono::Utc::now().timestamp();
+    json!({"active":true,"token_type":"Bearer","iss":issuer,"sub":"alice","aud":"https://pdf2md.example/mcp","exp":now+600,"iat":now-1,"scope":"pdf2md:read pdf2md:write","jti":"synthetic","client_id":"pdf2md-test"})
+}
+fn token(issuer: &str, kid: &str, update: impl FnOnce(&mut Value)) -> String {
+    let mut claims = claims(issuer);
+    update(&mut claims);
+    let mut header = Header::new(Algorithm::RS256);
+    header.typ = Some("at+jwt".into());
+    header.kid = Some(kid.into());
+    encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(TEST_KEY.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
+fn jwk(kid: &str) -> Value {
+    json!({"kty":"RSA","use":"sig","alg":"RS256","kid":kid,"n":TEST_MODULUS,"e":"AQAB"})
+}
+
+#[tokio::test]
+async fn anonymous_modes_enforce_write_policy_and_ignore_untrusted_identity() {
+    let auth = Authenticator::new(AuthConfig::default()).await.unwrap();
+    assert_eq!(
+        auth.authenticate(None, false).await.unwrap(),
+        Identity::Shared
+    );
+    assert_eq!(
+        auth.authenticate(Some("forged-user"), false).await.unwrap(),
+        Identity::Shared
+    );
+    assert_eq!(
+        auth.authenticate(None, true).await.unwrap_err().code,
+        "auth_forbidden"
+    );
+    let rw = Authenticator::new(AuthConfig {
+        mode: AuthMode::NoneRw,
+        oidc: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(rw.authenticate(None, true).await.unwrap(), Identity::Shared);
+}
+
+#[tokio::test]
+async fn introspection_checks_each_operation_scopes_and_revocation() {
+    let fixture = Fixture::new(TokenValidation::Introspection).await;
+    let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
+    assert_eq!(
+        auth.authenticate(None, false).await.unwrap_err().code,
+        "auth_invalid"
+    );
+    assert_eq!(fixture.intro_count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        auth.authenticate(Some("opaque-access-token"), true)
+            .await
+            .unwrap(),
+        Identity::User {
+            issuer: fixture.issuer.clone(),
+            subject: "alice".into()
+        }
+    );
+    fixture.introspection.lock().unwrap()["scope"] = json!("pdf2md:read");
+    auth.authenticate(Some("opaque-access-token"), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        auth.authenticate(Some("opaque-access-token"), true)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_forbidden"
+    );
+    fixture.introspection.lock().unwrap()["active"] = json!(false);
+    assert_eq!(
+        auth.authenticate(Some("opaque-access-token"), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    assert_eq!(fixture.intro_count.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn introspection_rejects_wrong_audience_issuer_expiry_and_non_access_tokens() {
+    let fixture = Fixture::new(TokenValidation::Introspection).await;
+    let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
+    for (field, value) in [
+        ("aud", json!("another-service")),
+        ("iss", json!("https://other.example")),
+        ("exp", json!(0)),
+        ("token_type", json!("")),
+        ("token_use", json!("refresh_token")),
+        ("sub", json!("")),
+        ("nbf", json!(chrono::Utc::now().timestamp() + 100)),
+    ] {
+        let mut response = claims(&fixture.issuer);
+        response[field] = value;
+        *fixture.introspection.lock().unwrap() = response;
+        assert_eq!(
+            auth.authenticate(Some("opaque"), false)
+                .await
+                .unwrap_err()
+                .code,
+            "auth_invalid",
+            "field {field}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_discovery_and_network_failures_fail_closed() {
+    let fixture = Fixture::new(TokenValidation::Introspection).await;
+    *fixture.metadata.lock().unwrap() = Some(
+        json!({"issuer":"https://untrusted.example","introspection_endpoint":format!("{}/introspect",fixture.issuer)}),
+    );
+    let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
+    assert_eq!(
+        auth.authenticate(Some("opaque"), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_unavailable"
+    );
+    assert_eq!(fixture.intro_count.load(Ordering::SeqCst), 0);
+    *fixture.metadata.lock().unwrap() = Some(
+        json!({"issuer":fixture.issuer,"introspection_endpoint":"https://untrusted.example/introspect"}),
+    );
+    assert_eq!(
+        auth.authenticate(Some("opaque"), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_unavailable"
+    );
+    fixture.task.abort();
+    assert_eq!(
+        auth.authenticate(Some("opaque"), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn jwt_verifies_signature_claims_scopes_and_key_rotation() {
+    let fixture = Fixture::new(TokenValidation::Jwt).await;
+    let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
+    let signed = token(&fixture.issuer, "first", |_| {});
+    auth.authenticate(Some(&signed), true).await.unwrap();
+    assert_eq!(fixture.key_count.load(Ordering::SeqCst), 1);
+    for (field, value) in [
+        ("aud", json!("another-service")),
+        ("iss", json!("https://other.example")),
+        ("exp", json!(0)),
+        ("sub", json!("")),
+        ("iat", json!(chrono::Utc::now().timestamp() + 100)),
+        ("jti", Value::Null),
+        ("client_id", Value::Null),
+    ] {
+        let bad = token(&fixture.issuer, "first", |claims| claims[field] = value);
+        assert_eq!(
+            auth.authenticate(Some(&bad), false).await.unwrap_err().code,
+            "auth_invalid",
+            "field {field}"
+        );
+    }
+    let readonly = token(&fixture.issuer, "first", |claims| {
+        claims["scope"] = json!("pdf2md:read")
+    });
+    assert_eq!(
+        auth.authenticate(Some(&readonly), true)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_forbidden"
+    );
+    *fixture.jwks.lock().unwrap() = json!({"keys":[jwk("rotated")]});
+    let rotated = token(&fixture.issuer, "rotated", |_| {});
+    auth.authenticate(Some(&rotated), false).await.unwrap();
+    assert_eq!(fixture.key_count.load(Ordering::SeqCst), 2);
+    let unknown = token(&fixture.issuer, "unknown", |_| {});
+    assert_eq!(
+        auth.authenticate(Some(&unknown), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    assert_eq!(fixture.key_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn jwt_rejects_id_tokens_wrong_algorithms_token_keys_and_bad_signatures() {
+    let fixture = Fixture::new(TokenValidation::Jwt).await;
+    let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
+    let key = EncodingKey::from_rsa_pem(TEST_KEY.as_bytes()).unwrap();
+    for update in [0, 1, 2] {
+        let mut header = Header::new(Algorithm::RS256);
+        header.typ = Some("at+jwt".into());
+        header.kid = Some("first".into());
+        match update {
+            0 => header.typ = Some("JWT".into()),
+            1 => header.jku = Some("https://untrusted.example/keys".into()),
+            _ => header.crit = Some(vec!["unsupported".into()]),
+        };
+        let signed = encode(&header, &claims(&fixture.issuer), &key).unwrap();
+        assert_eq!(
+            auth.authenticate(Some(&signed), false)
+                .await
+                .unwrap_err()
+                .code,
+            "auth_invalid"
+        );
+    }
+    let mut header = Header::new(Algorithm::HS256);
+    header.typ = Some("at+jwt".into());
+    header.kid = Some("first".into());
+    let bad = encode(
+        &header,
+        &claims(&fixture.issuer),
+        &EncodingKey::from_secret(b"synthetic"),
+    )
+    .unwrap();
+    assert_eq!(
+        auth.authenticate(Some(&bad), false).await.unwrap_err().code,
+        "auth_invalid"
+    );
+    let signed = token(&fixture.issuer, "first", |_| {});
+    let mut parts: Vec<String> = signed.split('.').map(str::to_owned).collect();
+    let replacement = if parts[2].starts_with('a') { "b" } else { "a" };
+    parts[2].replace_range(0..1, replacement);
+    assert_eq!(
+        auth.authenticate(Some(&parts.join(".")), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+}
+
+#[test]
+fn configuration_rejects_incomplete_oauth_and_keeps_secrets_redacted() {
+    assert!(
+        AuthConfig {
+            mode: AuthMode::Oauth2,
+            oidc: None
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(toml::from_str::<AuthConfig>("mode='oauth2'\nunknown='field'").is_err());
+    assert!(toml::from_str::<OidcSecret>("literal='private'").is_err());
+    let secret = OidcSecret {
+        env: Some("PRIVATE_REFERENCE".into()),
+        file: None,
+    };
+    assert_eq!(format!("{secret:?}"), "OidcSecret([redacted])");
+}
+
+#[tokio::test]
+async fn introspection_requires_a_token_class_and_accepts_explicit_authelia_prefix() {
+    let mut fixture = Fixture::new(TokenValidation::Introspection).await;
+    fixture
+        .introspection
+        .lock()
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("token_type");
+    let strict = Authenticator::new(fixture.config.clone()).await.unwrap();
+    assert_eq!(
+        strict
+            .authenticate(Some("authelia_at_synthetic"), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    fixture.config.oidc.as_mut().unwrap().access_token_prefix = Some("authelia_at_".into());
+    let prefixed = Authenticator::new(fixture.config.clone()).await.unwrap();
+    prefixed
+        .authenticate(Some("authelia_at_synthetic"), true)
+        .await
+        .unwrap();
+    let requests = fixture.intro_count.load(Ordering::SeqCst);
+    for token in [
+        "authelia_rt_synthetic",
+        "authelia_ac_synthetic",
+        "unprefixed",
+    ] {
+        assert_eq!(
+            prefixed
+                .authenticate(Some(token), false)
+                .await
+                .unwrap_err()
+                .code,
+            "auth_invalid"
+        );
+    }
+    assert_eq!(fixture.intro_count.load(Ordering::SeqCst), requests);
+    for (field, value) in [
+        ("token_type", json!("refresh_token")),
+        ("token_use", json!("refresh_token")),
+        ("active", json!(false)),
+        ("aud", json!("other-service")),
+    ] {
+        let mut response = claims(&fixture.issuer);
+        response.as_object_mut().unwrap().remove("token_type");
+        response[field] = value;
+        *fixture.introspection.lock().unwrap() = response;
+        assert_eq!(
+            prefixed
+                .authenticate(Some("authelia_at_synthetic"), false)
+                .await
+                .unwrap_err()
+                .code,
+            "auth_invalid"
+        );
+    }
+    for prefix in ["", "has whitespace", "not.a.prefix", &"a".repeat(129)] {
+        fixture.config.oidc.as_mut().unwrap().access_token_prefix = Some(prefix.into());
+        assert!(fixture.config.validate().is_err());
+    }
+    let oidc = fixture.config.oidc.as_mut().unwrap();
+    oidc.access_token_prefix = Some("authelia_at_".into());
+    oidc.validation = TokenValidation::Jwt;
+    assert!(fixture.config.validate().is_err());
+}
+
+// Deliberately public, generated synthetic RSA key, used only for token fixtures.
+const TEST_KEY: &str = r"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCR+oBfnzNj2oZO
+pGvuxJ+GKVs4eg9pJUK9h0ARTPbHKc/fdg09DOskxOHkDh2c97Ifk0Q0PFOxObRq
+aRc23tKgEvijPvQ3QB5vcQSXXYtpVX5PpGyDuA391patQynkWopixfjE+VlxRh8d
+XQCVVBhjvoYERvgwz8umSY3DG/0NVS0/F/RaZqGYGTipqSwrnbUXqLswbhh2OOGe
+BWPQeGPszZk462flyn10ZhRnSNMjP3lWb7+DO2WHQtLR/gjzIqQQGHDi44XwZBe0
++MN0tkEbKLYOvz668LDKB877dE/EdtSBsPpcNLxh4urTaGvngH5YZIKxMm0LiXGf
+SwVDKCiXAgMBAAECggEARIY+tKRaz0jJOylbsR2DdMr9EynZChZ/mdBfdr+WKC+s
+cM1NsZba2svA7fjiVcjASKosngijkNHxqvHh/9PhM1s0dA0dPsJOhymaaiNzSeLk
+BCa++aXwi3OsD3EzvQnzZCJigLQ8FDxCZto9Z9uuB0RsTJ2z69XfVxO4BBqjUxov
+FG0FRMwwjxhrZQyG6arRGvnG+5mHocL3J+7LRpH/38tFoVEJmIzpenDRigPGvBCc
+cvpOScFN1gxlcREgECu7VkenDusW3jk8gCYkbSqpvdxtwSF46Xu+J3xRHHv+JqCD
+qPuPXIsKCwUDDj3tEiuoeX6e7aZwh0FwtUJepNuMgQKBgQDJ/i4LNU+0kD5TQjfw
+NqFfb36ZbTuqWFBCt9SqlpI6ih3MAxII0KpNPDL4mVqrvEdyPx5fCVbPFWcbekUk
+Y2m1iehqkHjAM8thdlraBpTPh0ZuoO/u3yXJtra0AbvpuUlSho74c4aKp6nvw6Q4
+bkDqNzfpQI5FK7+lbzv8FfcAkQKBgQC5Ak10OwM+J15SCUcgz5dsNavUba6PCtB7
+IFL7J1ktMsu3Z0GQiCPdvjjM9dy0vATnrD+O+ceh7wbs2pSAj324fBxGcSe4YNO8
+7GmdguiRS2col+wv2LEK7jdN1ExMU0kdpUMoOEeenvgwhknZRMi6EM4hk3rdCK4S
+Kj3NkX8qpwKBgAwIWDXStyzKauwKxcpJdtN4kNIS77r2B9HxoXmH/q3+DEha5ngf
+9gUj0OV+PSh9zsO/fs+qfsFXRQ0d+4Bva5yk2nN+p7LLYxIrOr5CJhs2s7tjWuef
+42BgwgF3GPqTTwrbeSjTuPAJjNX7kYzLBJLvNyVt8wurz37LYYdix5QBAoGBALUB
+irP39KE/tSlACIYSdEybaiTotosegoCkTGuKwNXWx7cFYAE/IRAWxs3IkgmFlqrv
+PDPvLyDAkh7zb60kNlVjn+pPVRQwL5i8GEzRwiY9Bo2RrbPWJsjR7evIlGlsZrGJ
+ed4EyhVn5Nzc1a2rfVOFk5cICoHstxnwmAzil+8rAoGBAKo2yueiGRlCWFvia0Ut
+5MBcj0/d1dfPxte/YEnhE0nn+DjnLht+wRKUM/5Mb2lqJnfLid91Xv1/tes+M+Ub
+DVepBUkjbzT6wZT3N6HFYuA1vBw8FvsefEI3hJzKx705zeNXOYgdKOSgHc+CMHI+
+rom0AYO7AXhfR2+90ihrHdD7
+-----END PRIVATE KEY-----
+";
+const TEST_MODULUS: &str = "kfqAX58zY9qGTqRr7sSfhilbOHoPaSVCvYdAEUz2xynP33YNPQzrJMTh5A4dnPeyH5NENDxTsTm0amkXNt7SoBL4oz70N0Aeb3EEl12LaVV-T6Rsg7gN_daWrUMp5FqKYsX4xPlZcUYfHV0AlVQYY76GBEb4MM_LpkmNwxv9DVUtPxf0WmahmBk4qaksK521F6i7MG4YdjjhngVj0Hhj7M2ZOOtn5cp9dGYUZ0jTIz95Vm-_gztlh0LS0f4I8yKkEBhw4uOF8GQXtPjDdLZBGyi2Dr8-uvCwygfO-3RPxHbUgbD6XDS8YeLq02hr54B-WGSCsTJtC4lxn0sFQygolw";

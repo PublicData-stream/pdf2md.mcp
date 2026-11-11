@@ -1,5 +1,13 @@
 # Third-party notices
 
+## jsonwebtoken
+
+The core library uses [`jsonwebtoken` 10.4.0](https://crates.io/crates/jsonwebtoken/10.4.0)
+for OAuth access-token signature verification. It is distributed under the
+[MIT License](https://github.com/Keats/jsonwebtoken/blob/v10.4.0/LICENSE).
+Cargo.lock records its RustCrypto dependency graph. This note does not replace
+the complete dependency license review needed before distribution.
+
 ## Obscura
 
 The separate `pdf2md-obscura-worker` package depends on the upstream Obscura

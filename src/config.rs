@@ -9,6 +9,8 @@ use std::{
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub auth: crate::auth::AuthConfig,
     pub database_url_env: Option<String>,
     #[serde(default)]
     pub limits: Limits,
@@ -298,6 +300,19 @@ impl Config {
         };
         // Referenced files are relative to the TOML file, not the caller's cwd.
         if let Some(base) = path.and_then(Path::parent) {
+            if let Some(oidc) = &mut cfg.auth.oidc {
+                if let Some(secret) = &mut oidc.client_secret
+                    && let Some(file) = &mut secret.file
+                    && file.is_relative()
+                {
+                    *file = base.join(&*file);
+                }
+                if let Some(file) = &mut oidc.ca_file
+                    && file.is_relative()
+                {
+                    *file = base.join(&*file);
+                }
+            }
             for source in &mut cfg.sources {
                 for header in &mut source.headers {
                     relative_secret(&mut header.value, base);
@@ -318,6 +333,7 @@ impl Config {
         Ok(cfg)
     }
     pub fn validate(&self) -> Result<()> {
+        self.auth.validate()?;
         if self.limits.concurrency == 0
             || self.limits.concurrency > 64
             || self.limits.max_bytes == 0

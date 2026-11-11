@@ -480,6 +480,29 @@ impl Store {
     pub async fn history(&self, source: Option<&str>) -> Result<Vec<Observation>> {
         read_history_rows(&self.pool, &self.namespace, source).await
     }
+    /// Trusted store operation: a digest is readable only when this store owns it.
+    pub async fn open_document(&self, id: &str) -> Result<File> {
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(LoadError::new("document_not_found", "document unavailable"));
+        }
+        let found: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM observations WHERE namespace=$1 AND document_id=$2",
+        )
+        .bind(&self.namespace)
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_error)?;
+        if found == 0 {
+            return Err(LoadError::new("document_not_found", "document unavailable"));
+        }
+        self.verify_object(id)?;
+        open_regular(&self.root.join("objects").join(id))
+    }
     pub async fn next_due(&self, source: &str) -> Result<Option<i64>> {
         sqlx::query_scalar("SELECT due FROM schedule WHERE namespace=$1 AND source_id=$2")
             .bind(&self.namespace)

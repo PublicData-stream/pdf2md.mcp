@@ -7,6 +7,7 @@ pub mod model;
 pub mod policy;
 pub mod runtime;
 pub mod storage;
+pub mod workspace;
 
 #[cfg(test)]
 mod browser_tests;

@@ -56,3 +56,9 @@ References:
 
 Passing this harness establishes local provider and library-boundary evidence.
 It does not establish hosted CI, Kubernetes deployment, or MCP-client acceptance.
+
+The same harness exercises the HTTP listener with both opaque and JWT tokens,
+including upload/conversion permissions, job/PDF isolation, revocation, expiry,
+and recovery of previously accepted queued work. For image-level Kubernetes
+acceptance, use `python3 scripts/test-http-oidc.py IMAGE`; see
+[HTTP API validation](../../docs/http-api.md#validation).

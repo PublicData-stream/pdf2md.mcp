@@ -9,11 +9,10 @@ third-party dependencies in the current implementation.
 The current implementation acquires remote or local PDF bytes, converts
 accepted PDFs to Markdown through `pdf_oxide`, and records acquisition and
 conversion history. Conversion runs in a separate worker process through the
-trusted CLI or daemon; it is not a caller-service operation. The library caller
-service supports anonymous RO/RW and OAuth2/OIDC modes, with separate per-user
-workspace roots and application authorization. The CLI and raw storage/library
-APIs remain trusted operator interfaces. The project does not provide OCR or
-an MCP server. No stable-release security support policy, maintenance window,
+trusted CLI, daemon, or HTTP service. The caller service supports anonymous
+RO/RW and OAuth2/OIDC modes, with separate per-user workspace roots and
+application authorization. The CLI and raw storage/library APIs remain trusted
+operator interfaces. The project does not provide OCR or an MCP server. No stable-release security support policy, maintenance window,
 or backport commitment is established. Include the affected commit when
 reporting a development issue.
 

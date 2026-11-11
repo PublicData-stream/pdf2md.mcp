@@ -7,12 +7,10 @@ description: Route and supervise bounded subagent work for pdf2md.mcp, including
 
 ## Repository Goal and Current State
 
-The project aims to provide PDF-to-Markdown conversion through MCP. The current
-Rust 2024 workspace provides an operator-controlled acquisition CLI/library, a
-separate Obscura browser worker, content-addressed PDF storage, and attempt
-history. It does not yet fully parse PDFs, convert them to Markdown, or expose
-MCP. Recheck the repository before assigning work; this description must not
-override later implementation changes.
+The Rust 2024 workspace provides PDF acquisition and conversion, a separate
+Obscura browser worker, content-addressed storage, and attempt history. It
+provides an HTTP service and does not expose MCP. Recheck the repository before
+assigning work; this description must not override later implementation changes.
 
 Read applicable [AGENTS.md](../../../AGENTS.md) instructions and the relevant
 source of truth: [README.md](../../../README.md) for project status and setup,

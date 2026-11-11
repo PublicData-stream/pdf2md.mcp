@@ -1,19 +1,17 @@
 # Authentication foundations
 
-The library exposes `service::CallerService` for a future transport. It does
-not start an HTTP or MCP listener, implement browser login, or issue tokens.
-The local CLI and low-level storage APIs remain trusted operator interfaces.
-PDF conversion is available through the trusted CLI and background daemon only;
-caller operations do not expose conversion requests, output bundles, worker
-paths, or conversion configuration.
+The HTTP service uses the caller authorization boundary and accepts bearer
+access tokens in OAuth2 mode. It does not implement browser login or issue
+tokens. The local CLI and low-level storage APIs remain trusted operator
+interfaces. See [the HTTP API](http-api.md) for routes and job behavior.
 
 ## Modes and permissions
 
 | `auth.mode` | Caller workspace | Caller operations |
 | --- | --- | --- |
-| `none_ro` (default) | Shared anonymous workspace | Status, history, PDF reads |
-| `none_rw` | Same shared workspace | Reads and public HTTPS acquisition |
-| `oauth2` | Private workspace for the exact issuer and subject | Scope-authorized reads and public HTTPS acquisition |
+| `none_ro` (default) | Shared anonymous workspace | Status, history, PDF and conversion reads |
+| `none_rw` | Same shared workspace | Reads, uploads, public HTTPS acquisition and conversion |
+| `oauth2` | Private workspace for the exact issuer and subject | Scope-authorized reads, writes and conversion |
 
 No-auth callers share data and do not have individual identities. A bearer
 value supplied in either no-auth mode does not select a private workspace.
@@ -24,7 +22,8 @@ provider settings in those modes rather than silently ignoring them.
 
 The caller boundary checks permissions on each operation, before acquisition
 effects. It does not accept source definitions, file paths, browser scripts,
-cookies, operator credentials, polling schedules, or workspace selectors.
+cookies, operator credentials, or workspace selectors. Published source execution
+and schedule changes have an operator-controlled allowlist and operate scope.
 Read operations require the configured read scope. Acquisition requires both
 the read and write scopes. Valid users with the required scopes are provisioned
 automatically; email addresses, display names, and group membership are not
@@ -54,6 +53,7 @@ client_id = "pdf2md-resource"
 client_secret = { env = "PDF2MD_OIDC_CLIENT_SECRET" }
 read_scope = "pdf2md:read"
 write_scope = "pdf2md:write"
+operate_scope = "pdf2md:operate"
 ```
 
 Register the introspection client in the provider with `client_secret_basic`.
@@ -103,6 +103,11 @@ Construct one `CallerService` per host with a data root, `Config`, and the
 resolved optional PostgreSQL URL. `execute` takes the raw access-token value
 (without `Bearer `), a typed `Operation`, and a cancellation token.
 
+`execute` remains the synchronous compatibility API. Typed methods add streaming
+upload sessions, durable job submissions, job/schedule controls, conversion
+queries, and verified artifact/bundle readers. Run `CallerService::run` alongside
+the listener to dispatch durable work; it does not start an HTTP listener itself.
+
 `Operation` supports `Status`, `History`, `ReadPdf`, and `AcquireHttps`.
 Responses contain observations, an acquisition observation, or an `AsyncRead`
 PDF stream. Streams retain their workspace handle until dropped. Documents
@@ -116,15 +121,17 @@ handles. Acquisition admission uses the existing aggregate concurrency setting.
 The store cache holds at most 32 workspaces, evicting idle handles only. This is
 application authorization and storage separation, not an operating-system
 sandbox, per-user disk quota, or hard CPU/memory isolation.
-PDF reads verify the complete object's digest before streaming; this work is
-separate from acquisition admission and should be considered when adding a
-public transport.
+PDF and artifact reads verify their content before streaming. Download admission
+is bounded separately from acquisition admission; streams retain the workspace
+and download lease until dropped.
 
 ## Operator storage and backups
 
 Existing data at the data root remains operator-private. Conversion history
-upgrades metadata schema version 1 to version 2 when the store opens; the
-version 1 acquisition data and PDF objects are preserved. New caller workspaces
+upgrades metadata schemas 1 and 2 to version 3 when the store opens;
+acquisition/conversion history, PDF objects, and bundles are preserved. Version 3
+adds durable API jobs, idempotency records, retry links, and polling grants.
+New caller workspaces
 live under `workspaces/<UUID>/`, each with separate PDF objects, conversion
 bundles, staging, inbox, and store identity. Identical PDFs are
 deduplicated only within one workspace. SQLite metadata lives in each root;
@@ -150,16 +157,17 @@ pdf2md-mcp --data-dir ./pdf2md-mcp-data --workspace shared history
 
 `scan` creates/selects the workspace inbox; place PDFs in that workspace's
 `pdfs/` directory before scanning again. Operator-configured sources and
-credentials are used only when an operator explicitly runs those commands.
+credentials are used by trusted CLI commands and explicitly published caller
+operations and durable schedule grants.
 Only one writer can own an individual workspace at a time; stop the caller
 host before using CLI writes to one of its cached workspaces.
 
 Keep the metadata backend fixed for a data root. Back up the registry,
 operator root, all workspace roots, and external PostgreSQL metadata together
-while writers are stopped. Restore them together. The schema 1-to-2 migration
-is forward-only; an older binary cannot open schema 2 metadata. Before
-upgrading, take a coordinated backup so a downgrade can restore the schema 1
-database and matching filesystem data together. Downgrading does not expose
+while writers are stopped. Restore them together. The schema migration
+is forward-only; older binaries cannot open schema 3 metadata. Before
+upgrading, take a coordinated backup so a downgrade can restore the previous
+metadata schema and matching filesystem data together. Downgrading does not expose
 caller workspaces through the original operator CLI.
 
 ## Verification
@@ -171,8 +179,8 @@ and disposable TLS providers. PostgreSQL tests additionally require
 
 Live Authelia checks use a disposable provider with two synthetic users and
 registered test clients. They exercise real opaque/JWT access tokens,
-permissions, isolation, revocation, and expiry against the library boundary.
-Provider compatibility does not establish HTTP/MCP client or deployment
-acceptance. Run `python3 scripts/test-authelia.py`; see
+permissions, isolation, revocation, expiry, and durable job recovery against
+the library and HTTP boundaries. These checks alone do not establish MCP client
+or Kubernetes deployment acceptance. Run `python3 scripts/test-authelia.py`; see
 [the live harness guide](../examples/authelia/README.md) for requirements and
 provider configuration.

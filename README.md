@@ -14,11 +14,11 @@ bundles, and acquisition/conversion history. Automatic conversion is enabled
 by default: foreground acquisition commands process accepted documents, and
 the background `watch`/`run` daemon processes pending conversions. The trusted CLI can
 also request conversions, retry them, select pages, inspect history, and export
-verified bundles. The library provides authentication foundations
-and isolated caller workspaces with `none_ro`, `none_rw`, and OIDC-backed
-`oauth2` modes; see [Authentication foundations](docs/authentication.md).
-Conversion is not exposed through caller operations. There is no MCP transport
-or OCR. The repository has no supported release policy.
+verified bundles. The HTTP service provides isolated caller workspaces with
+`none_ro`, `none_rw`,
+and OIDC-backed `oauth2` modes; see [authentication](docs/authentication.md)
+and the [HTTP API](docs/http-api.md). There is no MCP transport or OCR. The
+repository has no supported release policy.
 
 ## Requirements
 
@@ -127,13 +127,19 @@ explicit conversion. While it owns the root, `status`, `history`,
 
 ## Configuration
 
-Authentication settings apply to the library's caller service boundary. The
-CLI remains a trusted operator interface and defaults to the original private
-operator workspace. Caller mode defaults to `none_ro`; `none_rw` allows shared
-HTTPS acquisition, and OAuth2 uses per-user workspaces and read/write scopes.
-No server listener is introduced by these settings. See the
-[configuration and workspace guide](docs/authentication.md) for Authelia,
-JWT/introspection, operator workspace selection, and coordinated backups.
+The CLI remains a trusted operator interface and defaults to the original private
+operator workspace. Start the HTTP service explicitly:
+
+```sh
+pdf2md-mcp --data-dir ./pdf2md-mcp-data --config ./examples/http.toml serve
+curl http://127.0.0.1:8080/healthz
+```
+
+It binds to `127.0.0.1:8080` by default. `--listen` overrides the bind address.
+Caller mode defaults to `none_ro`; `none_rw` permits shared writes, and OAuth2
+uses per-user workspaces and scopes. See the [HTTP API guide](docs/http-api.md),
+[authentication guide](docs/authentication.md), and
+[Kubernetes example](examples/kubernetes/README.md).
 
 See [`examples/sources.toml`](examples/sources.toml) for a schema example. Set
 the environment variables referenced by a source before fetching it. The

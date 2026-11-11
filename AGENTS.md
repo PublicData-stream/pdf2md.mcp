@@ -8,8 +8,8 @@ service. The Rust workspace includes the `pdf2md-mcp` CLI/library, its isolated
 integration tests. It acquires and stores PDF bytes, then converts accepted
 documents to immutable Markdown bundles with `pdf_oxide`. The library has a
 caller service with anonymous RO/RW and OAuth2/OIDC modes and isolated
-workspaces; conversion remains a trusted CLI/daemon operation and is not exposed
-to callers. There is no MCP transport or OCR. See `docs/authentication.md` for
+workspaces; the HTTP service supports acquisition and conversion jobs. There is
+no MCP transport or OCR. See `docs/authentication.md` for
 caller versus trusted operator boundaries and provider verification.
 `README.md` owns user setup and status, `CONTRIBUTING.md` owns contributor
 workflow, and `SECURITY.md` owns vulnerability reporting and disclosure. Keep
@@ -26,7 +26,10 @@ build the separate browser worker with
 run integration tests with `cargo test --locked --package pdf2md-mcp`. Worker
 unit tests use `cargo test --locked --package pdf2md-obscura-worker`; the
 browser integration script is `scripts/test-browser.sh` and requires OpenSSL.
-Live OIDC provider checks use `python3 scripts/test-authelia.py`; see
+The HTTP container smoke harness is `python3 scripts/test-http.py IMAGE`, with
+optional `--minikube`. Live OIDC provider checks use
+`python3 scripts/test-authelia.py`; real OIDC Kubernetes checks use
+`python3 scripts/test-http-oidc.py IMAGE`. See
 `examples/authelia/README.md`. Generated certificates, credentials, provider
 storage, and other test state belong under `/tmp`.
 The browser worker build uses the pinned upstream Obscura dependency. These

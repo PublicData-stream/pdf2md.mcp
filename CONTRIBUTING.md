@@ -5,7 +5,7 @@ service. The Rust 2024 workspace contains a CLI/library, a separate browser
 worker, a conversion worker binary, and integration tests. `pdf_oxide` converts
 accepted PDFs into immutable Markdown bundles. A transport-independent caller
 service supports anonymous RO/RW and OAuth2/OIDC authentication with isolated
-workspaces, but caller operations do not initiate conversion. The project has
+workspaces and supports HTTP acquisition and conversion jobs. The project has
 no MCP transport or OCR. This document is the source of truth for contributor
 workflow. See
 [Repository Guidelines](AGENTS.md) for agent orientation and the
@@ -87,8 +87,23 @@ suite. For real-provider acceptance, run `python3 scripts/test-authelia.py`
 with Docker, OpenSSL, and Python 3 available. See
 [the Authelia harness guide](examples/authelia/README.md). The harness uses
 disposable state under `/tmp`; keep live tokens and provider credentials out
-of logs and version control. Provider acceptance does not establish an HTTP
-or MCP transport.
+of logs and version control. This harness covers the library and HTTP boundaries;
+it does not establish MCP client or Kubernetes deployment acceptance.
+The container HTTP smoke test is `python3 scripts/test-http.py IMAGE`; add
+`--minikube` for its disposable Kubernetes path. The real-provider Kubernetes
+harness is `python3 scripts/test-http-oidc.py IMAGE`. See the script prerequisites.
+
+The bundled API console uses browser JavaScript, HTML, and CSS with two-space
+indentation and LF endings (`.editorconfig`). Its JavaScript lint rules are in
+`eslint.config.mjs`. Run the pinned development lint without installing runtime
+Node dependencies into the repository:
+
+```sh
+npm_config_cache=/tmp/pdf2md-http-npm-cache npx --yes --package eslint@10.14.0 eslint src/http/docs.js eslint.config.mjs
+```
+
+The Rust service embeds the console assets; Node is required only for this
+optional contributor lint command.
 
 ## Testing and Fixtures
 

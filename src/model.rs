@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const DEFAULT_MAX_BYTES: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 20 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

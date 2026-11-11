@@ -394,8 +394,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "writes a 512 MiB synthetic PDF under /tmp; run explicitly"]
-    async fn direct_default_512_mib_boundary() {
+    #[ignore = "writes a 1024 MiB synthetic PDF under /tmp; run explicitly"]
+    async fn direct_default_1024_mib_boundary() {
         use crate::model::DEFAULT_MAX_BYTES;
         let mut response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {DEFAULT_MAX_BYTES}\r\nConnection: close\r\n\r\n"

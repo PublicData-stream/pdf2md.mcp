@@ -10,10 +10,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn db_error<E>(_: E) -> LoadError {
+pub(crate) fn db_error<E>(_: E) -> LoadError {
     LoadError::new("storage_database", "metadata database operation failed")
 }
-fn corrupt() -> LoadError {
+pub(crate) fn corrupt() -> LoadError {
     LoadError::new(
         "storage_corrupt",
         "stored document failed integrity verification",
@@ -21,21 +21,34 @@ fn corrupt() -> LoadError {
 }
 
 pub struct Store {
-    root: PathBuf,
-    namespace: String,
-    pool: AnyPool,
+    pub(crate) root: PathBuf,
+    pub(crate) namespace: String,
+    pub(crate) pool: AnyPool,
+    auto_conversion: Option<crate::conversion::ConversionOptions>,
+    pub(crate) conversion_slots: std::sync::OnceLock<(usize, tokio::sync::Semaphore)>,
     _lock: File,
 }
 
 impl Store {
     pub async fn open(root: &Path, database_url: Option<&str>) -> Result<Self> {
+        Self::open_with_conversion(root, database_url, None).await
+    }
+
+    pub async fn open_with_conversion(
+        root: &Path,
+        database_url: Option<&str>,
+        auto_conversion: Option<crate::conversion::ConversionOptions>,
+    ) -> Result<Self> {
+        if let Some(options) = &auto_conversion {
+            options.validate()?;
+        }
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(root)
             .map_err(io_error)?;
         let root = fs::canonicalize(root).map_err(io_error)?;
-        for name in ["objects", ".staging", "pdfs"] {
+        for name in ["objects", ".staging", "pdfs", "conversions"] {
             let path = root.join(name);
             match fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => sync_dir(&root)?,
@@ -168,7 +181,9 @@ impl Store {
             .execute(&mut *migration)
             .await
             .map_err(db_error)?;
-        } else if versions.len() != 1 || versions[0].try_get::<i64, _>(0).map_err(db_error)? != 1 {
+        } else if versions.len() != 1
+            || ![1, 2].contains(&versions[0].try_get::<i64, _>(0).map_err(db_error)?)
+        {
             return Err(LoadError::new(
                 "storage_database_version",
                 "unsupported metadata schema version",
@@ -176,11 +191,20 @@ impl Store {
         }
         sqlx::query("CREATE TABLE IF NOT EXISTS observations (namespace TEXT NOT NULL, source_id TEXT NOT NULL, attempt_id TEXT NOT NULL, document_id TEXT, outcome TEXT NOT NULL, mode TEXT NOT NULL, bytes BIGINT NOT NULL, observed_at TEXT NOT NULL, url TEXT, error_code TEXT, PRIMARY KEY(namespace, attempt_id))").execute(&mut *migration).await.map_err(db_error)?;
         sqlx::query("CREATE TABLE IF NOT EXISTS schedule (namespace TEXT NOT NULL, source_id TEXT NOT NULL, due BIGINT NOT NULL, PRIMARY KEY(namespace, source_id))").execute(&mut *migration).await.map_err(db_error)?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS conversion_attempts (namespace TEXT NOT NULL, id TEXT NOT NULL, document_id TEXT NOT NULL, profile_key TEXT NOT NULL, options TEXT NOT NULL, status TEXT NOT NULL, automatic INTEGER NOT NULL, created_at TEXT NOT NULL, finished_at TEXT, error_code TEXT, bundle_id TEXT, PRIMARY KEY(namespace,id))").execute(&mut *migration).await.map_err(db_error)?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS conversion_attempts_auto ON conversion_attempts(namespace,document_id) WHERE automatic=1").execute(&mut *migration).await.map_err(db_error)?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS conversion_attempts_lookup ON conversion_attempts(namespace, document_id, profile_key, status)").execute(&mut *migration).await.map_err(db_error)?;
+        sqlx::query("UPDATE schema_version SET version=2 WHERE version=1")
+            .execute(&mut *migration)
+            .await
+            .map_err(db_error)?;
         migration.commit().await.map_err(db_error)?;
         let store = Self {
             root,
             namespace,
             pool,
+            auto_conversion,
+            conversion_slots: std::sync::OnceLock::new(),
             _lock: lock,
         };
         for entry in fs::read_dir(store.root.join(".staging")).map_err(io_error)? {
@@ -194,6 +218,8 @@ impl Store {
             let id: String = row.try_get(0).map_err(db_error)?;
             store.verify_object(&id)?;
         }
+        sqlx::query("UPDATE conversion_attempts SET status='interrupted', finished_at=$1, error_code='interrupted' WHERE namespace=$2 AND status='running'").bind(chrono::Utc::now().to_rfc3339()).bind(&store.namespace).execute(&store.pool).await.map_err(db_error)?;
+        store.verify_conversion_bundles().await?;
         Ok(store)
     }
     pub fn root(&self) -> &Path {
@@ -398,6 +424,10 @@ impl Store {
             }
         }
         sqlx::query("INSERT INTO observations (namespace, source_id, attempt_id, document_id, outcome, mode, bytes, observed_at, url, error_code) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)").bind(&self.namespace).bind(&o.source_id).bind(&o.attempt_id).bind(&o.document_id).bind(&o.outcome).bind(&o.mode).bind(bytes).bind(&o.observed_at).bind(&o.url).bind(&o.error_code).execute(&mut *tx).await.map_err(db_error)?;
+        if let (Some(id), Some(options)) = (&o.document_id, &self.auto_conversion) {
+            crate::conversion::store::enqueue_automatic(&mut tx, &self.namespace, id, options)
+                .await?;
+        }
         Ok(tx)
     }
     /// Read existing metadata without taking writer ownership or performing recovery.
@@ -469,7 +499,9 @@ impl Store {
             .fetch_all(&pool)
             .await
             .map_err(db_error)?;
-        if versions.len() != 1 || versions[0].try_get::<i64, _>(0).map_err(db_error)? != 1 {
+        if versions.len() != 1
+            || ![1, 2].contains(&versions[0].try_get::<i64, _>(0).map_err(db_error)?)
+        {
             return Err(LoadError::new(
                 "storage_database_version",
                 "unsupported metadata schema version",
@@ -539,13 +571,13 @@ async fn read_history_rows(
         })
         .collect()
 }
-fn sync_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)
         .map_err(io_error)?
         .sync_all()
         .map_err(io_error)
 }
-fn open_regular(path: &Path) -> Result<File> {
+pub(crate) fn open_regular(path: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)

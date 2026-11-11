@@ -10,6 +10,8 @@ use std::{
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub conversion: crate::conversion::ConversionConfig,
+    #[serde(default)]
     pub auth: crate::auth::AuthConfig,
     pub database_url_env: Option<String>,
     #[serde(default)]
@@ -333,6 +335,7 @@ impl Config {
         Ok(cfg)
     }
     pub fn validate(&self) -> Result<()> {
+        self.conversion.limits.validate()?;
         self.auth.validate()?;
         if self.limits.concurrency == 0
             || self.limits.concurrency > 64
@@ -413,7 +416,9 @@ mod tests {
     #[test]
     fn defaults_match_operator_limits() {
         let c = Config::default();
-        assert_eq!(c.limits.max_bytes, 536870912);
+        assert_eq!(c.limits.max_bytes, 1073741824);
+        assert!(c.conversion.enabled);
+        assert_eq!(c.conversion.limits.max_pages, 25_000);
         assert_eq!(c.limits.timeout_secs, 1200);
         assert_eq!(c.limits.concurrency, 1);
     }

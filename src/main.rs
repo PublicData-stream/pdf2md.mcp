@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use futures_util::{StreamExt, stream};
 use pdf2md_mcp::{
     config::{Config, Mode, Source},
+    conversion::{self, ConversionAttempt, ConversionOptions},
     error::{LoadError, Result},
     manual,
     model::Observation,
@@ -13,10 +14,7 @@ use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
-#[command(
-    version,
-    about = "Acquire and archive PDFs; conversion and MCP transport are not implemented"
-)]
+#[command(version, about = "Acquire, archive, and convert PDFs to Markdown")]
 struct Cli {
     #[arg(long, global = true, default_value = "pdf2md-mcp-data")]
     data_dir: PathBuf,
@@ -30,6 +28,8 @@ struct Cli {
     database_url_env: Option<String>,
     #[arg(long, global = true, default_value = "pdf2md-obscura-worker")]
     worker: PathBuf,
+    #[arg(long, global = true)]
+    conversion_worker: Option<PathBuf>,
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -59,6 +59,22 @@ enum Command {
     Watch,
     /// Watch manual files and poll sources with configured intervals.
     Run,
+    /// Convert a stored PDF; page numbers are one-based and inclusive.
+    Convert {
+        document_id: String,
+        #[arg(long)]
+        pages: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show conversion attempts independently from acquisition history.
+    ConversionHistory { document_id: Option<String> },
+    /// Export a successful conversion into a new directory.
+    Export {
+        conversion_id: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Show the latest observation for each source.
     Status,
     /// Show all observations, optionally restricted to a source.
@@ -81,6 +97,36 @@ fn emit(obs: &Observation, json: bool) {
             obs.error_code.as_deref().unwrap_or("")
         );
     }
+}
+
+fn emit_conversion(attempt: &ConversionAttempt, json: bool, stderr: bool) {
+    let value = if json {
+        serde_json::to_string(attempt).expect("serializable conversion")
+    } else {
+        format!(
+            "conversion {} {} {} {}",
+            attempt.id,
+            attempt.document_id,
+            attempt.status,
+            attempt.error_code.as_deref().unwrap_or("")
+        )
+    };
+    if stderr {
+        eprintln!("{value}");
+    } else {
+        println!("{value}");
+    }
+}
+
+fn conversion_worker(cli: &Cli) -> PathBuf {
+    cli.conversion_worker.clone().unwrap_or_else(|| {
+        // Core builds install both binaries together; PATH remains a portable fallback.
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.join("pdf2md-convert-worker")))
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| PathBuf::from("pdf2md-convert-worker"))
+    })
 }
 
 #[tokio::main]
@@ -149,6 +195,38 @@ async fn run(cli: &Cli) -> Result<()> {
             registry.resolve_existing(&cli.workspace).await?
         }
     };
+    match &cli.command {
+        Command::ConversionHistory { document_id } => {
+            for attempt in Store::read_conversion_history(
+                &data_dir,
+                database_url.as_deref(),
+                document_id.as_deref(),
+            )
+            .await?
+            {
+                emit_conversion(&attempt, cli.json, false);
+            }
+            return Ok(());
+        }
+        Command::Export {
+            conversion_id,
+            output,
+        } => {
+            let manifest =
+                Store::export_conversion(&data_dir, database_url.as_deref(), conversion_id, output)
+                    .await?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&manifest).expect("serializable manifest")
+                );
+            } else {
+                println!("exported {}", conversion_id);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
     if matches!(cli.command, Command::Status | Command::History { .. }) {
         let source = match &cli.command {
             Command::History { source } => source.as_deref(),
@@ -170,7 +248,10 @@ async fn run(cli: &Cli) -> Result<()> {
         }
         return Ok(());
     }
-    let store = Store::open(&data_dir, database_url.as_deref()).await?;
+    let automatic = config.conversion.enabled.then(ConversionOptions::default);
+    let store = Store::open_with_conversion(&data_dir, database_url.as_deref(), automatic).await?;
+    let conversion_worker = conversion_worker(cli);
+    let mut acquired = Vec::new();
     let cancel = CancellationToken::new();
     let shutdown = cancel.clone();
     let signal_task = tokio::spawn(async move {
@@ -192,7 +273,42 @@ async fn run(cli: &Cli) -> Result<()> {
     });
     let result = async {
         match &cli.command {
-            Command::Workspaces => unreachable!("handled before opening store"),
+            Command::Workspaces | Command::ConversionHistory { .. } | Command::Export { .. } => {
+                unreachable!("handled before opening store")
+            }
+            Command::Convert {
+                document_id,
+                pages,
+                force,
+            } => {
+                let options = pages
+                    .as_deref()
+                    .map(ConversionOptions::parse_pages)
+                    .transpose()?
+                    .unwrap_or_default();
+                let request = store
+                    .request_conversion(document_id, &options, *force)
+                    .await?;
+                let attempt = if request.status == "pending" {
+                    store
+                        .process_conversion(
+                            &request.id,
+                            &config.conversion.limits,
+                            &conversion_worker,
+                            &cancel,
+                        )
+                        .await?
+                } else {
+                    request
+                };
+                emit_conversion(&attempt, cli.json, false);
+                if attempt.status != "succeeded" {
+                    return Err(LoadError::new(
+                        attempt.error_code.as_deref().unwrap_or("conversion_failed"),
+                        "PDF conversion failed",
+                    ));
+                }
+            }
             Command::Fetch { source, all } => {
                 if !all
                     && source
@@ -221,7 +337,10 @@ async fn run(cli: &Cli) -> Result<()> {
                 let mut failure = None;
                 while let Some(result) = jobs.next().await {
                     match result {
-                        Ok(obs) => emit(&obs, cli.json),
+                        Ok(obs) => {
+                            emit(&obs, cli.json);
+                            acquired.push(obs);
+                        }
                         Err(e) => {
                             if e.code.starts_with("storage_") {
                                 cancel.cancel();
@@ -242,16 +361,16 @@ async fn run(cli: &Cli) -> Result<()> {
                     ));
                 }
                 let source = Source::one_off(url.clone(), *mode);
-                emit(
-                    &runtime::fetch(&store, &config, &source, &cli.worker, &cancel).await?,
-                    cli.json,
-                );
+                let obs = runtime::fetch(&store, &config, &source, &cli.worker, &cancel).await?;
+                emit(&obs, cli.json);
+                acquired.push(obs);
             }
             Command::Scan => {
                 let mut failed = false;
                 for obs in manual::scan(&store, config.limits.max_bytes, &cancel).await? {
                     failed |= obs.outcome == "failed";
                     emit(&obs, cli.json);
+                    acquired.push(obs);
                 }
                 if failed {
                     return Err(LoadError::new(
@@ -261,15 +380,39 @@ async fn run(cli: &Cli) -> Result<()> {
                 }
             }
             Command::Watch | Command::Run => {
-                runtime::daemon(
-                    &store,
-                    &config,
-                    &cli.worker,
-                    matches!(cli.command, Command::Run),
-                    &cancel,
-                    |o| emit(o, cli.json),
-                )
-                .await?
+                let daemon = async {
+                    let result = runtime::daemon(
+                        &store,
+                        &config,
+                        &cli.worker,
+                        matches!(cli.command, Command::Run),
+                        &cancel,
+                        |o| emit(o, cli.json),
+                    )
+                    .await;
+                    cancel.cancel();
+                    result
+                };
+                let conversions = async {
+                    if config.conversion.enabled {
+                        let result = conversion::orchestration::dispatch(
+                            &store,
+                            &config.conversion.limits,
+                            &conversion_worker,
+                            &cancel,
+                            |a| emit_conversion(a, cli.json, true),
+                        )
+                        .await;
+                        cancel.cancel();
+                        result
+                    } else {
+                        cancel.cancelled().await;
+                        Ok(())
+                    }
+                };
+                let (acquisition, conversion) = tokio::join!(daemon, conversions);
+                conversion?;
+                acquisition?;
             }
             Command::History { source } => {
                 for obs in store.history(source.as_deref()).await? {
@@ -289,7 +432,35 @@ async fn run(cli: &Cli) -> Result<()> {
         Ok(())
     }
     .await;
+    let conversion_result = async {
+        if config.conversion.enabled {
+            let mut seen = std::collections::BTreeSet::new();
+            for observation in acquired {
+                if let Some(request) = store
+                    .conversion_for_observation(&observation.attempt_id)
+                    .await?
+                    && seen.insert(request.id.clone())
+                {
+                    let attempt = if request.status == "pending" && !cancel.is_cancelled() {
+                        store
+                            .process_conversion(
+                                &request.id,
+                                &config.conversion.limits,
+                                &conversion_worker,
+                                &cancel,
+                            )
+                            .await?
+                    } else {
+                        request
+                    };
+                    emit_conversion(&attempt, cli.json, true);
+                }
+            }
+        }
+        Ok::<_, LoadError>(())
+    }
+    .await;
     cancel.cancel();
     signal_task.abort();
-    result
+    result.and(conversion_result)
 }

@@ -1,0 +1,30 @@
+name: Rust checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TARGET_DIR: /tmp/rust/target
+  TMPDIR: /tmp
+
+jobs:
+  core:
+    name: Format, lint, and core tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+          components: clippy, rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint core package
+        run: cargo clippy --locked --package pdf2md-mcp --all-targets -- -D warnings
+      - name: Test core package
+        run: cargo test --locked --package pdf2md-mcp

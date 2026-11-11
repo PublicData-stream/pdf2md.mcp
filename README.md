@@ -15,7 +15,7 @@ release policy.
 
 ## Requirements
 
-- Rust 1.88 or newer (edition 2024); the container build uses Rust 1.99.1.
+- Rust 1.88 or newer (edition 2024); CI and the container build use Rust 1.99.1.
 - Linux for the Obscura worker and its process memory monitoring. Direct HTTPS
   acquisition and storage also target the supported Linux deployment.
 - The `pdf2md-obscura-worker` binary when a source uses `obscura` or `browser`
@@ -161,7 +161,9 @@ PostgreSQL integration cases skip their PostgreSQL path when
 `PDF2MD_TEST_POSTGRES_URL` is unset; set it to a PostgreSQL 18+ URL to exercise
 external database paths. Other storage tests use SQLite. The
 browser end-to-end cases are ignored in the default test run; the script builds
-the worker and uses local TLS fixtures and OpenSSL to run them.
+the worker and uses local TLS fixtures and OpenSSL to run them. The CI workflow
+runs formatting, core lint, and core tests;
+it does not build the browser worker or Docker image.
 ## Container
 
 Build an image containing the CLI and browser worker:

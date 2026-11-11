@@ -3,6 +3,9 @@
 The library exposes `service::CallerService` for a future transport. It does
 not start an HTTP or MCP listener, implement browser login, or issue tokens.
 The local CLI and low-level storage APIs remain trusted operator interfaces.
+PDF conversion is available through the trusted CLI and background daemon only;
+caller operations do not expose conversion requests, output bundles, worker
+paths, or conversion configuration.
 
 ## Modes and permissions
 
@@ -119,9 +122,11 @@ public transport.
 
 ## Operator storage and backups
 
-Existing data at the data root remains operator-private and keeps metadata
-schema version 1. New caller workspaces live under `workspaces/<UUID>/`, each
-with separate objects, staging, inbox, and store identity. Identical PDFs are
+Existing data at the data root remains operator-private. Conversion history
+upgrades metadata schema version 1 to version 2 when the store opens; the
+version 1 acquisition data and PDF objects are preserved. New caller workspaces
+live under `workspaces/<UUID>/`, each with separate PDF objects, conversion
+bundles, staging, inbox, and store identity. Identical PDFs are
 deduplicated only within one workspace. SQLite metadata lives in each root;
 PostgreSQL uses the existing store-specific namespaces.
 
@@ -151,9 +156,11 @@ host before using CLI writes to one of its cached workspaces.
 
 Keep the metadata backend fixed for a data root. Back up the registry,
 operator root, all workspace roots, and external PostgreSQL metadata together
-while writers are stopped. Restore them together. No data move or relabeling is
-needed to adopt these foundations. Downgrading does not expose caller
-workspaces through the original operator CLI.
+while writers are stopped. Restore them together. The schema 1-to-2 migration
+is forward-only; an older binary cannot open schema 2 metadata. Before
+upgrading, take a coordinated backup so a downgrade can restore the schema 1
+database and matching filesystem data together. Downgrading does not expose
+caller workspaces through the original operator CLI.
 
 ## Verification
 

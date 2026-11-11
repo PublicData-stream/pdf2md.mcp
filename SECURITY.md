@@ -6,14 +6,16 @@ This policy covers the source, configuration, documentation, and project-owned
 automation in `PublicData-stream/pdf2md.mcp`, including affected uses of
 third-party dependencies in the current implementation.
 
-The current implementation acquires remote or local PDF bytes and records
-history. Its library caller service supports anonymous RO/RW and OAuth2/OIDC
-modes, with separate per-user workspace roots and application authorization.
-The CLI and raw storage/library APIs remain trusted operator interfaces.
-It does not fully parse PDFs, convert them to Markdown, or provide an
-MCP server. No stable-release security support policy, maintenance window, or
-backport commitment is established. Include the affected commit when reporting
-a development issue.
+The current implementation acquires remote or local PDF bytes, converts
+accepted PDFs to Markdown through `pdf_oxide`, and records acquisition and
+conversion history. Conversion runs in a separate worker process through the
+trusted CLI or daemon; it is not a caller-service operation. The library caller
+service supports anonymous RO/RW and OAuth2/OIDC modes, with separate per-user
+workspace roots and application authorization. The CLI and raw storage/library
+APIs remain trusted operator interfaces. The project does not provide OCR or
+an MCP server. No stable-release security support policy, maintenance window,
+or backport commitment is established. Include the affected commit when
+reporting a development issue.
 
 ## Reporting a Vulnerability
 
@@ -55,12 +57,14 @@ that is required. Workspace separation does not provide an operating-system
 sandbox or per-user resource quotas. Provider credentials and the local
 workspace registry are sensitive operator data.
 
-Treat input PDFs and remote responses as untrusted. The current implementation
-checks a PDF signature header only; it does not establish that a document is
-well formed or safe to parse. Consider resource exhaustion, filesystem
-boundaries, external-resource access, secret handling, browser process
-isolation, and unsafe handling of generated Markdown as those features evolve.
-The Obscura worker's resident memory is sampled against a configurable
-threshold, but this is not a hard memory limit and there is no operating-system
-sandbox. Assess dependency issues against actual usage and report relevant
-vulnerabilities through the private channel above.
+Treat input PDFs and remote responses as untrusted. Acquisition checks a PDF
+signature header only; conversion parses the document in a separate worker
+process. Conversion has configurable input, page, timeout, address-space, image,
+output, and concurrency limits, plus an asset-count cap. These controls do not
+provide an operating-system sandbox. Review worker process supervision,
+resource-limit enforcement, output-path validation, immutable bundle
+publication, filesystem boundaries, external-resource access, secret handling,
+browser process isolation, and unsafe handling of generated Markdown. The
+Obscura worker's resident memory is sampled against a configurable threshold,
+but this is not a hard memory limit. Assess dependency issues against actual
+usage and report relevant vulnerabilities through the private channel above.

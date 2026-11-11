@@ -2,14 +2,15 @@
 
 ## Project Structure & Module Organization
 
-`pdf2md.mcp` is an operator-controlled PDF acquisition and history service,
-intended eventually to provide PDF-to-Markdown conversion through MCP. The
-current Rust workspace includes the `pdf2md-mcp` CLI/library, a separate
-`pdf2md-obscura-worker`, and integration tests. It acquires and stores PDF
-bytes. The library has a caller service with anonymous RO/RW and OAuth2/OIDC
-modes and isolated workspaces. There is no full PDF parser, Markdown conversion,
-or MCP transport yet. See `docs/authentication.md` for caller versus trusted
-operator boundaries and provider verification.
+`pdf2md.mcp` is an operator-controlled PDF acquisition, conversion, and history
+service. The Rust workspace includes the `pdf2md-mcp` CLI/library, its isolated
+`pdf2md-convert-worker` binary, a separate `pdf2md-obscura-worker`, and
+integration tests. It acquires and stores PDF bytes, then converts accepted
+documents to immutable Markdown bundles with `pdf_oxide`. The library has a
+caller service with anonymous RO/RW and OAuth2/OIDC modes and isolated
+workspaces; conversion remains a trusted CLI/daemon operation and is not exposed
+to callers. There is no MCP transport or OCR. See `docs/authentication.md` for
+caller versus trusted operator boundaries and provider verification.
 `README.md` owns user setup and status, `CONTRIBUTING.md` owns contributor
 workflow, and `SECURITY.md` owns vulnerability reporting and disclosure. Keep
 their claims aligned with executable behavior.
@@ -17,8 +18,8 @@ their claims aligned with executable behavior.
 ## Build, Test, and Development Commands
 
 Use `CARGO_TARGET_DIR=/tmp/rust/target` and `TMPDIR=/tmp` for builds and tests.
-Build the default CLI with `cargo build --locked --package pdf2md-mcp`; build
-the separate browser worker with
+Build the CLI and conversion worker with `cargo build --locked --package pdf2md-mcp`;
+build the separate browser worker with
 `cargo build --locked --package pdf2md-obscura-worker`. Format and lint with
 `cargo fmt --all -- --check` and
 `cargo clippy --locked --package pdf2md-mcp --all-targets -- -D warnings`;
@@ -38,7 +39,8 @@ ordinary `git diff` does not include them.
 
 ## Coding Style & Naming Conventions
 
-`src/` contains the CLI/library, acquisition, policy, and storage code;
+`src/` contains the CLI/library, acquisition, conversion engine and worker,
+policy, and storage code;
 `crates/obscura-worker/` contains the separate browser worker; `tests/` contains
 integration tests; `examples/` contains sample configuration. Keep conversion
 rules separate from filesystem access, network access, and MCP transport.

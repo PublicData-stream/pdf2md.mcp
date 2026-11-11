@@ -9,12 +9,16 @@ objects.
 ## Project Status
 
 The executable implements acquisition, header-only PDF validation,
-content-addressed storage, and history. The library also provides authentication
-foundations and isolated caller workspaces with `none_ro`, `none_rw`, and
-OIDC-backed `oauth2` modes; see [Authentication foundations](docs/authentication.md).
-It does not parse PDF content, convert
-PDFs to Markdown, or expose an MCP server yet. The repository has no supported
-release policy.
+content-addressed storage, conversion through `pdf_oxide`, immutable conversion
+bundles, and acquisition/conversion history. Automatic conversion is enabled
+by default: foreground acquisition commands process accepted documents, and
+the background `watch`/`run` daemon processes pending conversions. The trusted CLI can
+also request conversions, retry them, select pages, inspect history, and export
+verified bundles. The library provides authentication foundations
+and isolated caller workspaces with `none_ro`, `none_rw`, and OIDC-backed
+`oauth2` modes; see [Authentication foundations](docs/authentication.md).
+Conversion is not exposed through caller operations. There is no MCP transport
+or OCR. The repository has no supported release policy.
 
 ## Requirements
 
@@ -55,6 +59,29 @@ cargo run -- --data-dir ./pdf2md-mcp-data --config ./examples/sources.toml histo
 cargo run -- --data-dir ./pdf2md-mcp-data --config ./examples/sources.toml run
 ```
 
+`run` also processes accepted documents' pending automatic conversions. To
+request or inspect conversions directly, use the trusted CLI:
+
+```sh
+pdf2md-mcp --data-dir ./pdf2md-mcp-data convert DOCUMENT_ID
+pdf2md-mcp --data-dir ./pdf2md-mcp-data convert DOCUMENT_ID --pages 1-3,7
+pdf2md-mcp --data-dir ./pdf2md-mcp-data convert DOCUMENT_ID --force
+pdf2md-mcp --data-dir ./pdf2md-mcp-data conversion-history
+pdf2md-mcp --data-dir ./pdf2md-mcp-data conversion-history DOCUMENT_ID
+pdf2md-mcp --data-dir ./pdf2md-mcp-data export CONVERSION_ID --output ./bundle
+```
+
+Page numbers are 1-based; page ranges are normalized to ascending unique page
+numbers. A matching successful conversion is reused unless `--force` requests
+a new attempt. Conversion output is published as an immutable bundle containing
+`document.md`, any extracted page images, and a manifest. Export verifies the
+stored bundle and writes to a new directory without replacing existing files.
+The core package build produces both the CLI and `pdf2md-convert-worker`.
+The default worker executable is `pdf2md-convert-worker`; use
+`--conversion-worker` to select another executable path. The `run` daemon sends
+automatic conversion progress and errors to stderr, keeping acquisition stdout
+machine-readable; explicit conversion commands print their result to stdout.
+
 `fetch SOURCE [SOURCE ...]` performs a fetch operation for the selected
 configured sources; `fetch --all` selects every source in the config.
 `fetch-url URL` performs a fetch operation for a URL, with `--mode https` or
@@ -73,8 +100,11 @@ not follow symbolic links. Accepted bytes are stored under
 `<data-dir>/objects/` using their SHA-256 digest as the filename and are
 published without replacing an existing object. Metadata and acquisition
 history live in SQLite in the same storage root by default. PostgreSQL stores
-metadata only, while PDF objects remain in the storage root; take a coordinated
-backup of both when using PostgreSQL.
+metadata only, while PDF objects and conversion bundles remain in the storage
+root; take a coordinated backup of both when using PostgreSQL. Bundles live
+under `conversions/`, addressed by their manifest digest. Successful bundles and
+attempt history are retained across retries; recovery removes unpublished
+staging and orphan bundles.
 
 For manual loading, initialize the directories once, copy a PDF, and scan:
 
@@ -91,8 +121,9 @@ add `--mode obscura` to use the browser-like transport.
 
 Only one process may own writes to an individual workspace root at a time.
 The commands above select the operator workspace by default. `fetch`, `fetch-url`,
-`scan`, `watch`, and `run` write history; while `watch` or `run` owns the root,
-use only `status` and `history` from another process.
+`scan`, `watch`, `run`, and `convert` write history. Stop the daemon before
+explicit conversion. While it owns the root, `status`, `history`,
+`conversion-history`, and `export` remain available from another process.
 
 ## Configuration
 
@@ -121,13 +152,35 @@ automatically; list any additional public HTTPS origins in `allowed_origins`.
 Browser sources require a response URL glob that matches the intended PDF
 response.
 
+Automatic conversion is enabled by default. The defaults are one concurrent
+conversion per workspace, a 1 GiB input and output budget per conversion,
+25,000 pages, a one-hour timeout, an 8 GiB address-space limit, and a 32-million
+pixel image limit. The worker also caps assets at 100,000. These are conversion
+limits; acquisition has its own byte and time limits. The Obscura browser path
+has upstream response limits (including a 64 MiB navigation cap), so a 1 GiB
+conversion input limit does not mean every acquisition mode can retrieve a
+document that large. The converter does not perform OCR, and it does not
+provide an operating-system sandbox. For example, disable conversion in config
+with:
+
+```toml
+[conversion]
+enabled = false
+```
+
+Automatic requests are committed with acquisition and deduplicated per PDF in
+each workspace. Pending requests resume when `watch` or `run` restarts; failed,
+cancelled, or interrupted attempts require explicit `convert`. There is no
+automatic backfill of existing history. An automatic parsing failure preserves
+the PDF and successful acquisition exit status, with a separate stderr summary.
+
 The database setting names an environment variable; it does not read
 `DATABASE_URL` implicitly. Set `database_url_env` in the TOML file or pass
 `--database-url-env NAME` (which overrides the configured variable name). If
 neither is set, the service uses its local SQLite metadata database. External
 metadata storage supports PostgreSQL 18 or newer.
 
-Default limits are 512 MiB per document, 20 minutes per operation, and one
+Default limits are 1 GiB per document, 20 minutes per operation, and one
 concurrent acquisition. Source limits may override the byte and time values;
 `[limits]` controls the shared defaults, concurrency, and worker RSS threshold.
 The service makes up to three tries per operation in the same acquisition
@@ -140,13 +193,14 @@ process memory. Worker RSS is sampled every 250 ms against a configurable
 threshold (4 GiB by default); this is monitoring and termination, not a hard
 operating-system memory limit.
 
-For the default resource settings, allow at least 6 GiB of memory for the
-container. The per-source deadline is checked during staging and before the
-metadata commit. A database commit already in progress can finish, and a
-running filesystem call cannot be preempted. With the default concurrency of
-one, manual inbox work can
-wait behind a running remote acquisition; `run` scans the inbox before its
-next remote admission window and again at least every 30 seconds while idle.
+The browser worker's default RSS threshold is 4 GiB; PDF conversion separately
+has an 8 GiB address-space ceiling. These are configured limits, not measured
+peak memory or a container sizing benchmark. The per-source deadline is checked
+during staging and before the metadata commit. A database commit already in
+progress can finish, and a running filesystem call cannot be preempted. With
+the default acquisition concurrency of one, manual inbox work can wait behind a
+running remote acquisition; `run` scans the inbox before its next remote
+admission window and again at least every 30 seconds while idle.
 
 Run the core formatter, linter, and tests from the repository root:
 
@@ -166,8 +220,8 @@ For complete native lint coverage, run
 For larger or slower browser cases, set `RUN_LARGE_PDF_TESTS=1` for the 512 MiB
 boundary fixture or `RUN_SLOW_BROWSER_TESTS=1` for the upstream 30-second
 timeout fixture when invoking `scripts/test-browser.sh`.
-The direct HTTPS 512 MiB boundary check runs with
-`cargo test --locked --package pdf2md-mcp --lib direct_default_512_mib_boundary -- --ignored`.
+The direct HTTPS 1 GiB boundary check runs with
+`cargo test --locked --package pdf2md-mcp --lib direct_default_1024_mib_boundary -- --ignored`.
 
 PostgreSQL integration cases skip their PostgreSQL path when
 `PDF2MD_TEST_POSTGRES_URL` is unset; set it to a PostgreSQL 18+ URL to exercise
@@ -178,14 +232,15 @@ runs formatting, core lint, and core tests;
 it does not build the browser worker or Docker image.
 ## Container
 
-Build an image containing the CLI and browser worker:
+Build an image containing the CLI, conversion worker, and browser worker:
 
 ```sh
 docker build -t pdf2md-mcp .
 ```
 
 The image runs as an unprivileged user, uses `/data` for durable storage, and
-starts the daemon with `run`. Mount a persistent volume at `/data`. The browser
+starts the daemon with `run`. Mount a persistent volume at `/data`. The
+conversion worker is used by the CLI and daemon for PDF parsing. The browser
 worker is included and used only for `obscura` or `browser` sources. The image
 does not include or manage PostgreSQL. If a build environment intercepts HTTPS, provide
 its trusted CA to BuildKit without copying it into an image layer:
@@ -216,6 +271,16 @@ cargo build --locked --package pdf2md-mcp
 python3 scripts/test-cli-docker.py pdf2md-mcp
 ```
 
+After building the image, the conversion harness can exercise conversion in
+the image:
+
+```sh
+python3 scripts/test-conversion.py pdf2md-mcp --minikube
+```
+
+The harness requires the Docker daemon's data root to be under `/tmp` and checks
+that prerequisite before creating disposable state.
+
 Set `PDF2MD_TEST_POSTGRES_URL` to include local CLI PostgreSQL checks. The harness
 uses disposable bind mounts under `/tmp`, checks the image's default user, and
 adapts the longer bind-mount test to rootless Docker's UID mapping. It does not
@@ -240,8 +305,24 @@ downloads, popups, CAPTCHA, and interactive MFA are unsupported. If Obscura
 rejects a fetch/XHR body before its response callback, `pdf_not_found` may also
 mean an upstream size rejection; raw downloads expose a distinct size error.
 
-No MCP transport, PDF-to-Markdown conversion engine, release support window, or
-end-to-end client acceptance is currently provided. See the
+Conversion parses untrusted PDF content in a separate worker process with
+configured resource limits. Process limits and supervision reduce exposure but
+are not an operating-system sandbox. Markdown includes embedded text, inferred
+headings/lists/links and best-effort tables; PNG references follow each page's
+text rather than reproducing visual placement. Surfaced page or image errors
+fail the whole attempt, but upstream parsing can silently omit content, so
+success does not guarantee complete extraction. Image-only pages yield images
+and a no-text warning. Password-required PDFs fail distinctly; no password
+input is supported. Chained JPEG filters and JPEG 2000 images are unsupported
+in this profile; an unreadable image fails the attempt. Generated Markdown
+remains untrusted content.
+
+Library callers must cancel through the cancellation token and await conversion
+to guarantee worker reaping. Dropping a worker future kills its process group,
+with reaping delegated to Tokio. Output quotas bound staged bytes; transient
+parser/encoder allocations are governed separately by the address-space limit.
+No MCP transport, OCR, release support
+window, or end-to-end client acceptance is currently provided. See the
 [Security Policy](SECURITY.md) for vulnerability reporting.
 
 ## Repository Contents

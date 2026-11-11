@@ -1,13 +1,13 @@
 # Contributing to pdf2md.mcp
 
-`pdf2md.mcp` is an operator-controlled PDF acquisition and history service,
-intended eventually to provide PDF-to-Markdown conversion through MCP. The
-workspace is Rust 2024 and contains a CLI/library, a separate browser worker,
-and integration tests. A transport-independent caller service supports
-anonymous RO/RW and OAuth2/OIDC authentication with isolated workspaces.
-The current implementation does not parse full PDFs,
-convert them to Markdown, or expose MCP. This document is the source of truth
-for contributor workflow. See
+`pdf2md.mcp` is an operator-controlled PDF acquisition, conversion, and history
+service. The Rust 2024 workspace contains a CLI/library, a separate browser
+worker, a conversion worker binary, and integration tests. `pdf_oxide` converts
+accepted PDFs into immutable Markdown bundles. A transport-independent caller
+service supports anonymous RO/RW and OAuth2/OIDC authentication with isolated
+workspaces, but caller operations do not initiate conversion. The project has
+no MCP transport or OCR. This document is the source of truth for contributor
+workflow. See
 [Repository Guidelines](AGENTS.md) for agent orientation and the
 [Security Policy](SECURITY.md) for vulnerability reporting.
 
@@ -44,8 +44,8 @@ code for filenames, commands, and identifiers.
 
 ## Development and Validation
 
-Use Rust 1.88 or newer. From the repository root, the CLI and worker can be
-built separately:
+Use Rust 1.88 or newer. From the repository root, build the CLI and its
+conversion worker together, and build the separate browser worker with:
 
 ```sh
 export CARGO_TARGET_DIR=/tmp/rust/target
@@ -61,7 +61,11 @@ tests with `cargo test --locked --package pdf2md-obscura-worker`; run local
 browser integration checks with `scripts/test-browser.sh` (requires OpenSSL).
 The worker build fetches the exact upstream Obscura revision pinned in its
 manifest. PostgreSQL integration cases use `PDF2MD_TEST_POSTGRES_URL` when set
-and otherwise skip their PostgreSQL path. Report network or toolchain blockers
+and otherwise skip their PostgreSQL path. The destructive conversion migration
+test uses a separate `PDF2MD_TEST_CONVERSION_POSTGRES_URL` pointed at a disposable
+database; never set it to an existing application database. Run it with
+`cargo test --locked --package pdf2md-mcp --test conversion_storage postgres_migration_bundle_export_and_namespace_isolation -- --test-threads=1`.
+Report network or toolchain blockers
 as such; do not imply checks passed when they were not run. These commands do
 not establish hosted CI, container, MCP-client, or deployment acceptance.
 
@@ -88,17 +92,19 @@ or MCP transport.
 
 ## Testing and Fixtures
 
-Rust unit and integration tests cover observable acquisition, policy, and
-storage behavior; no coverage threshold is set. Keep test names specific to
-the behavior verified and add cases alongside executable changes. The current
-project does not yet convert PDFs, so do not describe acquisition checks as
-conversion coverage.
+Rust unit and integration tests are the project's executable verification
+layer; no coverage threshold is set. Keep test names specific to the behavior
+verified and add cases alongside executable changes. Report the checks actually
+run; an acquisition check does not establish conversion behavior.
 
 Prefer small synthetic PDFs with deterministic expected Markdown. Include
-fixture provenance or generation instructions when needed. Use documents that
-can be redistributed, and never commit private documents, credentials, logs,
-or incidental generated output. Generate disposable test data in temporary
-directories and clean up after failures where practical.
+fixture provenance or generation instructions when needed. Conversion runs in
+the `pdf2md-convert-worker` process; keep parsing separate from filesystem and
+network access. Test page selection, explicit retries, worker limits, immutable
+bundle publication and history migration with disposable fixtures. Use
+documents that can be redistributed, and never commit private documents,
+credentials, logs, or incidental generated output. Generate disposable test
+data in temporary directories and clean up after failures where practical.
 
 ## Commit Messages
 

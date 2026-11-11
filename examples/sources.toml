@@ -6,10 +6,25 @@
 # database_url_env = "PDF2MD_DATABASE_URL"
 
 [limits]
-max_bytes = 536870912
+max_bytes = 1073741824
 timeout_secs = 1200
 concurrency = 1
 worker_max_rss_mib = 4096
+
+# Conversion runs automatically for newly accepted PDFs by default. Set
+# enabled = false to disable automatic conversion; trusted CLI conversion commands
+# remain available.
+[conversion]
+enabled = true
+
+[conversion.limits]
+max_bytes = 1073741824
+max_pages = 25000
+timeout_secs = 3600
+max_address_space_mib = 8192
+max_image_pixels = 32000000
+max_output_bytes = 1073741824
+concurrency = 1
 
 [[sources]]
 id = "public-notice"

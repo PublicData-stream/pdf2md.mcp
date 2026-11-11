@@ -1,0 +1,54 @@
+# Copy this file and replace example.org with an HTTPS origin you are authorized
+# to access. Polling remains disabled unless interval_secs is set.
+
+# To use PostgreSQL metadata instead of local SQLite, set an environment
+# variable and uncomment this setting (or pass --database-url-env NAME):
+# database_url_env = "PDF2MD_DATABASE_URL"
+
+[limits]
+max_bytes = 536870912
+timeout_secs = 1200
+concurrency = 1
+worker_max_rss_mib = 4096
+
+[[sources]]
+id = "public-notice"
+mode = "https"
+url = "https://example.org/pdfs/current-notice.pdf"
+allowed_origins = ["https://example.org"]
+# Omit this value to keep remote polling disabled.
+# interval_secs = 3600
+
+# Direct HTTPS headers are scoped to an allowed origin. Keep secrets out of
+# TOML by resolving them from the service environment or a file reference.
+[[sources.headers]]
+name = "Authorization"
+origin = "https://example.org"
+value = { env = "PDF2MD_NOTICE_TOKEN" }
+
+[[sources]]
+id = "browser-notice"
+mode = "browser"
+url = "https://example.org/notices"
+allowed_origins = ["https://example.org"]
+response_url_glob = "https://example.org/pdfs/*.pdf"
+
+[[sources.cookies]]
+name = "session"
+origin = "https://example.org"
+value = { env = "PDF2MD_BROWSER_SESSION" }
+
+[[sources.steps]]
+action = "fill"
+selector = "#search"
+value = { env = "PDF2MD_SEARCH_TERM" }
+origin = "https://example.org"
+
+[[sources.steps]]
+action = "click"
+# Replace this selector with the PDF download control on the chosen source.
+selector = "#download-pdf"
+
+[[sources.steps]]
+action = "wait_pdf"
+timeout_secs = 30

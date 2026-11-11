@@ -7,11 +7,12 @@ description: Route and supervise bounded subagent work for pdf2md.mcp, including
 
 ## Repository Goal and Current State
 
-The project aims to provide PDF-to-Markdown conversion through MCP. It is
-currently in its initial documentation stage: no implementation language,
-conversion engine, runtime architecture, source layout, build system, or test
-framework has been established. Recheck the repository before assigning work;
-this description must not override a later implementation.
+The project aims to provide PDF-to-Markdown conversion through MCP. The current
+Rust 2024 workspace provides an operator-controlled acquisition CLI/library, a
+separate Obscura browser worker, content-addressed PDF storage, and attempt
+history. It does not yet fully parse PDFs, convert them to Markdown, or expose
+MCP. Recheck the repository before assigning work; this description must not
+override later implementation changes.
 
 Read applicable [AGENTS.md](../../../AGENTS.md) instructions and the relevant
 source of truth: [README.md](../../../README.md) for project status and setup,
@@ -30,9 +31,10 @@ Handle a short documentation edit, a single known correction, or one simple
 check directly. Delegate when a bounded task provides useful parallelism,
 reduces bulky evidence processing, or adds independent judgment.
 
-Useful assignments at the current stage include checking consistency among
-project documents or reviewing an already-decided documentation change.
-Multiple agents are unnecessary for routine edits to a few short documents.
+Useful assignments include checking consistency among project documents,
+reviewing an already-decided documentation change, and independently reviewing
+acquisition, persistence, or browser-worker boundaries. Multiple agents are
+unnecessary for routine edits to a few short documents.
 
 As executable behavior is introduced, useful independent assignments include:
 

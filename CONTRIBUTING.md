@@ -1,9 +1,11 @@
 # Contributing to pdf2md.mcp
 
-`pdf2md.mcp` is intended to provide PDF-to-Markdown conversion through MCP.
-The repository currently contains documentation and a license; no implementation
-language, runtime architecture, build system, or test framework has been chosen.
-This document is the source of truth for contributor workflow. See
+`pdf2md.mcp` is an operator-controlled PDF acquisition and history service,
+intended eventually to provide PDF-to-Markdown conversion through MCP. The
+workspace is Rust 2024 and contains a CLI/library, a separate browser worker,
+and integration tests. The current implementation does not parse full PDFs,
+convert them to Markdown, or expose MCP. This document is the source of truth
+for contributor workflow. See
 [Repository Guidelines](AGENTS.md) for agent orientation and the
 [Security Policy](SECURITY.md) for vulnerability reporting.
 
@@ -24,9 +26,10 @@ Run commands from the repository root unless an example states otherwise.
 
 ## Project Structure and Coding Style
 
-The source, tests, and fixture directories are not established yet. Document
-their locations in `README.md` when introducing them, and keep generated output
-separate from source contributions.
+The main CLI and library are under `src/`, the browser worker is under
+`crates/obscura-worker/`, integration tests are under `tests/`, and example
+configuration is under `examples/`. Keep generated output separate from source
+contributions.
 
 Organize modules around clear responsibilities. Keep conversion rules separate
 from filesystem, network, and MCP transport operations. Use descriptive names
@@ -39,10 +42,26 @@ code for filenames, commands, and identifiers.
 
 ## Development and Validation
 
-There are currently no build, run, lint, or test commands. Add reproducible
-setup instructions, prerequisites, and validation commands alongside the first
-executable implementation. Do not copy commands from another project without
-verifying that they apply here.
+Use Rust 1.88 or newer. From the repository root, the CLI and worker can be
+built separately:
+
+```sh
+export CARGO_TARGET_DIR=/tmp/rust/target
+export TMPDIR=/tmp
+cargo build --locked --package pdf2md-mcp
+cargo build --locked --package pdf2md-obscura-worker
+```
+
+Run `cargo fmt --all -- --check`,
+`cargo clippy --locked --package pdf2md-mcp --all-targets -- -D warnings`, and
+`cargo test --locked --package pdf2md-mcp` for the core checks. Run worker unit
+tests with `cargo test --locked --package pdf2md-obscura-worker`; run local
+browser integration checks with `scripts/test-browser.sh` (requires OpenSSL).
+The worker build fetches the exact upstream Obscura revision pinned in its
+manifest. PostgreSQL integration cases use `PDF2MD_TEST_POSTGRES_URL` when set
+and otherwise skip their PostgreSQL path. Report network or toolchain blockers
+as such; do not imply checks passed when they were not run. These commands do
+not establish hosted CI, container, MCP-client, or deployment acceptance.
 
 For documentation changes, inspect the complete changed text and check links
 and anchors. These Git commands help review the working tree:
@@ -59,10 +78,11 @@ or end-to-end MCP client verification.
 
 ## Testing and Fixtures
 
-No test framework or coverage threshold is established. Test names should
-describe observable behavior. Cover successful conversion and relevant failure
-cases when executable behavior is added; avoid tests that merely mirror
-implementation details.
+Rust unit and integration tests cover observable acquisition, policy, and
+storage behavior; no coverage threshold is set. Keep test names specific to
+the behavior verified and add cases alongside executable changes. The current
+project does not yet convert PDFs, so do not describe acquisition checks as
+conversion coverage.
 
 Prefer small synthetic PDFs with deterministic expected Markdown. Include
 fixture provenance or generation instructions when needed. Use documents that

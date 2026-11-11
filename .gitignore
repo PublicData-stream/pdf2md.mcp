@@ -1,0 +1,4 @@
+/target/
+/pdf2md-mcp-data/
+/.env
+*.log

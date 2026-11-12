@@ -184,3 +184,10 @@ the library and HTTP boundaries. These checks alone do not establish MCP client
 or Kubernetes deployment acceptance. Run `python3 scripts/test-authelia.py`; see
 [the live harness guide](../examples/authelia/README.md) for requirements and
 provider configuration.
+
+## MCP authorization
+
+The opt-in MCP endpoint uses these same modes, scopes, token validators, and
+issuer/subject workspace boundaries. It requires explicit public-resource
+configuration in OAuth mode and advertises protected-resource metadata. See
+[MCP tools](mcp.md#authentication). All seven tools require only read access.

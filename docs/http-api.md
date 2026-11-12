@@ -121,3 +121,8 @@ scope, isolation, revocation, expiry, and accepted-job recovery checks.
 Minikube deployment. Browser-source upstream acceptance is reported separately
 from authentication and conversion assertions. These harnesses keep generated
 credentials and configuration under `/tmp` and remove their own resources.
+
+## MCP endpoint
+
+The same listener can optionally expose `/mcp`. See [MCP tools](mcp.md) for
+enablement, OAuth discovery, seven tool contracts, and retained bundle support.

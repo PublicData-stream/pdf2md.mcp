@@ -8,9 +8,11 @@ service. The Rust workspace includes the `pdf2md-mcp` CLI/library, its isolated
 integration tests. It acquires and stores PDF bytes, then converts accepted
 documents to immutable Markdown bundles with `pdf_oxide`. The library has a
 caller service with anonymous RO/RW and OAuth2/OIDC modes and isolated
-workspaces; the HTTP service supports acquisition and conversion jobs. There is
-no MCP transport or OCR. See `docs/authentication.md` for
-caller versus trusted operator boundaries and provider verification.
+workspaces; the HTTP service supports acquisition and conversion jobs. An
+opt-in Streamable HTTP MCP endpoint exposes seven read-only tools. There is no
+OCR. See `docs/mcp.md` for tool contracts and metadata compatibility and
+`docs/authentication.md` for caller versus trusted operator boundaries and
+provider verification.
 `README.md` owns user setup and status, `CONTRIBUTING.md` owns contributor
 workflow, and `SECURITY.md` owns vulnerability reporting and disclosure. Keep
 their claims aligned with executable behavior.

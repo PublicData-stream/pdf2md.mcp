@@ -9,7 +9,7 @@ description: Route and supervise bounded subagent work for pdf2md.mcp, including
 
 The Rust 2024 workspace provides PDF acquisition and conversion, a separate
 Obscura browser worker, content-addressed storage, and attempt history. It
-provides an HTTP service and does not expose MCP. Recheck the repository before
+provides an HTTP service with an opt-in read-only Streamable HTTP MCP endpoint. Recheck the repository before
 assigning work; this description must not override later implementation changes.
 
 Read applicable [AGENTS.md](../../../AGENTS.md) instructions and the relevant

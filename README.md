@@ -17,7 +17,8 @@ also request conversions, retry them, select pages, inspect history, and export
 verified bundles. The HTTP service provides isolated caller workspaces with
 `none_ro`, `none_rw`,
 and OIDC-backed `oauth2` modes; see [authentication](docs/authentication.md)
-and the [HTTP API](docs/http-api.md). There is no MCP transport or OCR. The
+and the [HTTP API](docs/http-api.md). An opt-in MCP endpoint exposes seven read-only retrieval and search tools;
+see [MCP tools](docs/mcp.md). There is no OCR. The
 repository has no supported release policy.
 
 ## Requirements
@@ -327,8 +328,8 @@ Library callers must cancel through the cancellation token and await conversion
 to guarantee worker reaping. Dropping a worker future kills its process group,
 with reaping delegated to Tokio. Output quotas bound staged bytes; transient
 parser/encoder allocations are governed separately by the address-space limit.
-No MCP transport, OCR, release support
-window, or end-to-end client acceptance is currently provided. See the
+The project has no OCR or supported-release window. External client UI
+acceptance remains unverified. See the
 [Security Policy](SECURITY.md) for vulnerability reporting.
 
 ## Repository Contents

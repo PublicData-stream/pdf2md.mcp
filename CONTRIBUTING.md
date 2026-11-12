@@ -273,6 +273,10 @@ automatic merging. Coordinate Rust image/toolchain changes with documented
 versions. Installer versions/checksums in `scripts/ci/install-tools.sh` receive
 manual review. Native jobs and image builds limit Cargo/CMake parallelism to
 two; the Dockerfile exposes these as build arguments for local overrides.
+The container build locks its shared target cache and removes cached artifacts
+for the two application packages before compilation. Copied source timestamps
+can predate cached builds; dependency artifacts remain reusable, while the
+application binaries must reflect the current copied source.
 Artifacts expire after seven days; rerun the complete workflow
 when a downstream rerun's build artifacts have expired. Diagnostics contain
 allowlisted status information, never credentials or raw provider configuration.

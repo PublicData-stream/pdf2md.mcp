@@ -29,27 +29,30 @@ COPY src ./src
 COPY crates/obscura-worker/Cargo.toml crates/obscura-worker/Cargo.toml
 COPY crates/obscura-worker/src crates/obscura-worker/src
 
+# COPY mtimes can predate cached artifacts; rebuild both application packages.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git/db \
-    --mount=type=cache,target=/tmp/rust/target \
+    --mount=type=cache,target=/tmp/rust/target,sharing=locked \
     --mount=type=secret,id=proxy_ca,required=false \
     if [ -s /run/secrets/proxy_ca ]; then \
-        CARGO_HTTP_CAINFO=/run/secrets/proxy_ca \
-        SSL_CERT_FILE=/run/secrets/proxy_ca \
-        REQUESTS_CA_BUNDLE=/run/secrets/proxy_ca \
-        CURL_CA_BUNDLE=/run/secrets/proxy_ca \
-        GIT_SSL_CAINFO=/run/secrets/proxy_ca cargo build --locked --release \
-            --package pdf2md-mcp --package pdf2md-obscura-worker; \
-    else \
-        cargo build --locked --release \
-            --package pdf2md-mcp --package pdf2md-obscura-worker; \
+        export CARGO_HTTP_CAINFO=/run/secrets/proxy_ca \
+            SSL_CERT_FILE=/run/secrets/proxy_ca \
+            REQUESTS_CA_BUNDLE=/run/secrets/proxy_ca \
+            CURL_CA_BUNDLE=/run/secrets/proxy_ca \
+            GIT_SSL_CAINFO=/run/secrets/proxy_ca; \
     fi \
+    && cargo clean --release \
+        --package pdf2md-mcp --package pdf2md-obscura-worker \
+    && cargo build --locked --release \
+        --package pdf2md-mcp --package pdf2md-obscura-worker \
     && install -D /tmp/rust/target/release/pdf2md-mcp /out/pdf2md-mcp \
     && install -D /tmp/rust/target/release/pdf2md-convert-worker /out/pdf2md-convert-worker \
     && install -D /tmp/rust/target/release/pdf2md-obscura-worker /out/pdf2md-obscura-worker \
     && python3 -c 'import json,pathlib,shutil,subprocess; m=json.loads(subprocess.check_output(["cargo","metadata","--locked","--format-version=1"])); p=next(p for p in m["packages"] if p["name"]=="obscura-browser" and (p.get("source") or "").endswith("#e3007167016b169bb58d8b5124ca9662a0b37f2d")); d=pathlib.Path(p["manifest_path"]).parent; parents=[d,*list(d.parents)[:4]]; license_path=next(x/"LICENSE" for x in parents if (x/"LICENSE").is_file()); o=pathlib.Path("/out/obscura"); o.mkdir(parents=True,exist_ok=True); shutil.copy2(license_path,o/"LICENSE"); n=license_path.parent/"NOTICE"; n.exists() and shutil.copy2(n,o/"NOTICE"); q=next(p for p in m["packages"] if p["name"]=="pdf_oxide" and p["version"]=="0.3.78"); d=pathlib.Path(q["manifest_path"]).parent; o=pathlib.Path("/out/pdf_oxide"); o.mkdir(parents=True,exist_ok=True); [shutil.copy2(d/n,o/n) for n in ("LICENSE-MIT","LICENSE-APACHE","NOTICE")]'
 
-RUN python3 -c 'import json,pathlib,shutil,subprocess; m=json.loads(subprocess.check_output(["cargo","metadata","--locked","--format-version=1"])); [(lambda p: [(lambda f: (pathlib.Path("/out/http",p["name"]).mkdir(parents=True,exist_ok=True),shutil.copy2(f,pathlib.Path("/out/http",p["name"],f.name))))(f) for f in pathlib.Path(p["manifest_path"]).parent.glob("LICENSE*") if f.is_file()])(p) for p in m["packages"] if p["name"] in ("axum","utoipa","zip","rmcp","rmcp-macros","pulldown-cmark","hex")]'
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    python3 -c 'import json,pathlib,shutil,subprocess; m=json.loads(subprocess.check_output(["cargo","metadata","--locked","--offline","--format-version=1"])); [(lambda p: [(lambda f: (pathlib.Path("/out/http",p["name"]).mkdir(parents=True,exist_ok=True),shutil.copy2(f,pathlib.Path("/out/http",p["name"],f.name))))(f) for f in pathlib.Path(p["manifest_path"]).parent.glob("LICENSE*") if f.is_file()])(p) for p in m["packages"] if p["name"] in ("axum","utoipa","zip","rmcp","rmcp-macros","pulldown-cmark","hex")]'
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
 

@@ -61,7 +61,7 @@ struct UploadResult {
     info(
         title = "pdf2md HTTP API",
         version = "1.0.0",
-        description = "Workspace-scoped PDF acquisition, conversion, history and polling. Access tokens are obtained from an external OAuth2/OIDC client."
+        description = "Workspace-scoped PDF acquisition, conversion, history and polling. Access tokens are obtained from an OAuth2/OIDC client, such as the optional registered client under /oauth/."
     ),
     components(schemas(
         AcquisitionInput,

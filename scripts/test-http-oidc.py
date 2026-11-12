@@ -36,11 +36,12 @@ def load(name, path):
     spec.loader.exec_module(module)
     return module
 
-provider = load("authelia_harness", "test-authelia.py")
+provider = load("casdoor_harness", "test-casdoor.py")
 conversion = load("conversion_harness", "test-conversion.py")
 mcp = load("mcp_smoke", "mcp-smoke.py")
 ISSUER = "https://127.0.0.1:9091"
-SCOPE = "openid offline_access pdf2md:read pdf2md:write pdf2md:operate"
+SCOPE = provider.SCOPE
+PROVIDER_FILES = ("tls.crt", "tls.key", "ca.crt", "app.conf", "init_data.json", "client-secret")
 
 
 def invoke(args, *, env=None, timeout=120):
@@ -69,10 +70,11 @@ mode = "oauth2"
 issuer = "{ISSUER}"
 audience = "{provider.AUDIENCE}"
 validation = "{mode}"
-client_id = "pdf2md-opaque"
+token_profile = "casdoor"
+client_id = "{provider.WEB_CLIENT}"
 client_secret = {{ file = "/config/client-secret" }}
 ca_file = "/config/ca.crt"
-''' + ('access_token_prefix = "authelia_at_"\n' if mode == "introspection" else 'jwt_scope_claim = "scp"\n') + f'''[http]
+[http]
 published_sources = ["fixture"]
 [[sources]]
 id = "fixture"
@@ -85,36 +87,27 @@ max_bytes = 10485760
 
 
 def generate(root, source_mode="live"):
-    provider.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=pdf2md-test-ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-addext", "subjectKeyIdentifier=hash", "-keyout", str(root / "ca.key"), "-out", str(root / "ca.crt")])
-    provider.run(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=127.0.0.1", "-keyout", str(root / "tls.key"), "-out", str(root / "tls.csr")])
-    (root / "tls.ext").write_text("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\nauthorityKeyIdentifier=keyid,issuer\nsubjectKeyIdentifier=hash\n")
-    provider.run(["openssl", "x509", "-req", "-in", str(root / "tls.csr"), "-CA", str(root / "ca.crt"), "-CAkey", str(root / "ca.key"), "-CAcreateserial", "-days", "1", "-extfile", str(root / "tls.ext"), "-out", str(root / "tls.crt")])
-    provider.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(root / "oidc.key")])
-    password, secret = secrets.token_urlsafe(24), secrets.token_urlsafe(32)
-    users = {name: {"displayname": name, "password": provider.digest(password), "email": name + "@example.test", "groups": ["test"]} for name in ("alice", "bob")}
-    clients = []
-    for name, algorithm in (("opaque", "none"), ("jwt", "RS256")):
-        clients.append({"client_id": "pdf2md-" + name, "client_secret": provider.digest(secret), "public": False, "redirect_uris": [provider.CALLBACK], "audience": [provider.AUDIENCE], "scopes": ["openid", "offline_access", "pdf2md:read", "pdf2md:write", "pdf2md:operate"], "grant_types": ["authorization_code", "refresh_token"], "response_types": ["code"], "authorization_policy": "one_factor", "consent_mode": "explicit", "require_pkce": True, "pkce_challenge_method": "S256", "access_token_signed_response_alg": algorithm, "lifespan": "short" if name == "jwt" else ""})
-    settings = {"server": {"address": "tcp://0.0.0.0:9091", "tls": {"certificate": "/config/tls.crt", "key": "/config/tls.key"}}, "log": {"level": "warn"}, "identity_validation": {"reset_password": {"jwt_secret": secrets.token_hex(32)}}, "authentication_backend": {"file": {"path": "/config/users.yml"}}, "access_control": {"default_policy": "one_factor"}, "session": {"secret": secrets.token_hex(32), "cookies": [{"domain": "127.0.0.1", "authelia_url": ISSUER}]}, "storage": {"encryption_key": secrets.token_hex(32), "local": {"path": "/state/db.sqlite3"}}, "notifier": {"filesystem": {"filename": "/state/notifications.txt"}}, "identity_providers": {"oidc": {"hmac_secret": secrets.token_hex(32), "jwks": [{"key_id": "test-rs256", "algorithm": "RS256", "use": "sig", "key": (root / "oidc.key").read_text()}], "scopes": {s: {"claims": []} for s in ("pdf2md:read", "pdf2md:write", "pdf2md:operate")}, "lifespans": {"custom": {"short": {"access_token": "60 seconds"}}}, "clients": clients}}}
-    (root / "users.yml").write_text(json.dumps({"users": users}))
-    (root / "configuration.yml").write_text(json.dumps(settings))
+    provider.certificates(root)
+    passwords = {name: secrets.token_urlsafe(24) for name in ("alice", "bob")}
+    secret = secrets.token_urlsafe(32)
+    # Casdoor reads /conf/app.conf; its SQLite state lives on the provider PVC.
+    provider.write_provider_files(root, ISSUER, 9091, "/state", secret, passwords)
     (root / "client-secret").write_text(secret)
     if source_mode == "fixture":
         provider.run(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=fixture.example", "-keyout", str(root / "fixture.key"), "-out", str(root / "fixture.csr")])
         (root / "fixture.ext").write_text("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:fixture.example\n")
         provider.run(["openssl", "x509", "-req", "-in", str(root / "fixture.csr"), "-CA", str(root / "ca.crt"), "-CAkey", str(root / "ca.key"), "-CAcreateserial", "-days", "1", "-extfile", str(root / "fixture.ext"), "-out", str(root / "fixture.crt")])
         (root / "sample.pdf").write_bytes(conversion.fixture())
-    return password, secret
+    return passwords, secret
 
 
 def resources(root, image, source_mode="live"):
-    secret_names = ("tls.crt", "tls.key", "ca.crt", "users.yml", "configuration.yml", "client-secret")
-    secret = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "provider-config"}, "type": "Opaque", "data": {name: base64.b64encode((root / name).read_bytes()).decode() for name in secret_names}}
+    secret = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "provider-config"}, "type": "Opaque", "data": {name: base64.b64encode((root / name).read_bytes()).decode() for name in PROVIDER_FILES}}
     cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-config"}, "data": {"config.toml": config("introspection", source_mode)}}
     def pvc(name):
         return {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": name}, "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}}
     deployment = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "oidc-api"}, "spec": {"replicas": 1, "strategy": {"type": "Recreate"}, "selector": {"matchLabels": {"app": "oidc-api"}}, "template": {"metadata": {"labels": {"app": "oidc-api"}, "annotations": {"test-mode": "introspection"}}, "spec": {"securityContext": {"runAsNonRoot": True, "runAsUser": 10001, "runAsGroup": 10001, "fsGroup": 10001}, "containers": [
-        {"name": "provider", "image": provider.IMAGE, "ports": [{"containerPort": 9091}], "readinessProbe": {"httpGet": {"scheme": "HTTPS", "path": "/api/health", "port": 9091}, "periodSeconds": 5, "timeoutSeconds": 3}, "volumeMounts": [{"name": "provider-config", "mountPath": "/config", "readOnly": True}, {"name": "provider-state", "mountPath": "/state"}]},
+        {"name": "provider", "image": provider.IMAGE, "ports": [{"containerPort": 9091}], "readinessProbe": {"httpGet": {"scheme": "HTTPS", "path": "/api/health", "port": 9091}, "periodSeconds": 5, "timeoutSeconds": 3}, "volumeMounts": [{"name": "provider-config", "mountPath": "/conf", "readOnly": True}, {"name": "provider-state", "mountPath": "/state"}]},
         {"name": "api", "image": image, "imagePullPolicy": "Never", "args": ["--data-dir", "/data", "--config", "/etc/pdf2md/config.toml", "serve", "--listen", "0.0.0.0:8080"], "ports": [{"containerPort": 8080}], "readinessProbe": {"httpGet": {"path": "/readyz", "port": 8080}}, "volumeMounts": [{"name": "data", "mountPath": "/data"}, {"name": "api-config", "mountPath": "/etc/pdf2md", "readOnly": True}, {"name": "provider-config", "mountPath": "/config", "readOnly": True}]}
     ], "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "data"}}, {"name": "provider-state", "persistentVolumeClaim": {"claimName": "provider-state"}}, {"name": "provider-config", "secret": {"secretName": "provider-config"}}, {"name": "api-config", "configMap": {"name": "api-config"}}]}}}}
     # ConfigMap and Secret projections are symlinks; API configuration readers
@@ -280,13 +273,13 @@ def ready(base, control, forward, startup, *, timeout=150):
     raise RuntimeError(f"OIDC readiness timeout (provider={startup.provider}, api={startup.api})")
 
 
-def run_test(base, control, password, secret, source_mode="live"):
-    def tokens(user, client, scopes):
-        return provider.Client(ISSUER, control.cert).tokens(user, password, "pdf2md-" + client, secret, scopes)
-    alice = tokens("alice", "opaque", SCOPE)
-    bob = tokens("bob", "opaque", SCOPE)
-    readonly = tokens("alice", "opaque", "openid pdf2md:read")
-    limited = tokens("alice", "opaque", "openid pdf2md:read pdf2md:write")
+def run_test(base, control, passwords, secret, source_mode="live"):
+    def tokens(user, scopes):
+        return provider.Client(ISSUER, control.cert).tokens(user, passwords[user], provider.WEB_CLIENT, secret, scopes)
+    alice = tokens("alice", SCOPE)
+    bob = tokens("bob", SCOPE)
+    readonly = tokens("alice", "pdf2md:read")
+    limited = tokens("alice", "pdf2md:read pdf2md:write")
     a, b = alice["access_token"], bob["access_token"]
     expect(base, "GET", "/v1/history", 401)
     for kind in ("id_token", "refresh_token"):
@@ -312,7 +305,7 @@ def run_test(base, control, password, secret, source_mode="live"):
     mcp.exercise(base, job["conversion_id"], markdown, readonly["access_token"], b)
     if mcp.request(base, "tools/list")[0] != 401:
         raise RuntimeError("MCP accepted missing bearer token")
-    print("PASS opaque OIDC HTTP upload, conversion, bundle, scopes and workspace isolation", flush=True)
+    print("PASS introspected OIDC HTTP upload, conversion, bundle, scopes and workspace isolation", flush=True)
     # Report the scheduled acquisition and the explicit source request separately.
     before = {j["id"] for j in json.loads(expect(base, "GET", "/v1/jobs", 200, a))["items"]}
     scheduled_job = None
@@ -347,13 +340,12 @@ def run_test(base, control, password, secret, source_mode="live"):
         direct = json.loads(expect(base, "POST", "/v1/acquisitions", 202, a, json.dumps({"url": source_url(source_mode)}).encode(), "application/json"))
         direct_result = poll(base, a, direct["id"], timeout=120)
         print("Direct HTTPS comparison: " + direct_result["status"] + "; sanitized error code=" + str(direct_result.get("error_code")), flush=True)
-    status, _, _ = control.request("/api/oidc/revocation", {"token": a, "token_type_hint": "access_token"}, form=True, auth=("pdf2md-opaque", secret))
-    if status != 200: raise RuntimeError("opaque token revocation failed")
+    control.revoke(a, provider.WEB_CLIENT, secret)
     expect(base, "GET", "/v1/history", 401, a)
     if mcp.request(base, "tools/list", token=a)[0] != 401:
-        raise RuntimeError("MCP accepted revoked opaque token")
+        raise RuntimeError("MCP accepted revoked introspected token")
     expect(base, "GET", "/v1/history", 200, b)
-    print("PASS opaque revocation and unaffected second user", flush=True)
+    print("PASS introspection revocation and unaffected second user", flush=True)
     return document, job_id, all(result["status"] == "succeeded" for result in (scheduled_result, source_result))
 
 
@@ -403,7 +395,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="pdf2md-http-oidc-", dir="/tmp") as tmp:
         root = Path(tmp)
         root.chmod(0o700)
-        password, secret = generate(root, args.source_mode)
+        passwords, secret = generate(root, args.source_mode)
         env = os.environ.copy()
         env.update(MINIKUBE_HOME=str(root / "minikube"), KUBECONFIG=str(root / "kubeconfig"), TMPDIR="/tmp")
         for name in ("NO_PROXY", "no_proxy"):
@@ -452,10 +444,9 @@ def main():
             startup.stage = "forward"
             forward = start_forward()
             control = provider.Client(ISSUER, root / "ca.crt")
-            control.cert = root / "ca.crt"
             ready(base, control, forward, startup)
             startup.stage = "acceptance"
-            document, job, browser_passed = run_test(base, control, password, secret, args.source_mode)
+            document, job, browser_passed = run_test(base, control, passwords, secret, args.source_mode)
             stop_forward()
             startup = Startup("jwt")
             startup.stage = "rollout"
@@ -468,8 +459,9 @@ def main():
             forward = start_forward()
             ready(base, control, forward, startup)
             startup.stage = "acceptance"
-            alice = provider.Client(ISSUER, root / "ca.crt").tokens("alice", password, "pdf2md-jwt", secret, SCOPE)
-            bob = provider.Client(ISSUER, root / "ca.crt").tokens("bob", password, "pdf2md-jwt", secret, SCOPE)
+            # The short-lived client exercises JWT expiry after revocation.
+            alice = provider.Client(ISSUER, root / "ca.crt").tokens("alice", passwords["alice"], provider.SHORT_CLIENT, secret, SCOPE)
+            bob = provider.Client(ISSUER, root / "ca.crt").tokens("bob", passwords["bob"], provider.WEB_CLIENT, secret, SCOPE)
             jwt = alice["access_token"]
             expect(base, "GET", "/v1/jobs/" + job, 200, jwt)
             expect(base, "GET", "/v1/documents/" + document + "/pdf", 200, jwt)
@@ -479,8 +471,7 @@ def main():
             converted = json.loads(expect(base, "GET", "/v1/jobs/" + job, 200, jwt))["conversion_id"]
             markdown = expect(base, "GET", "/v1/conversions/" + converted + "/markdown", 200, jwt).decode()
             mcp.exercise(base, converted, markdown, jwt, bob["access_token"])
-            status, _, _ = control.request("/api/oidc/revocation", {"token": jwt, "token_type_hint": "access_token"}, form=True, auth=("pdf2md-jwt", secret))
-            if status != 200: raise RuntimeError("JWT revocation request failed")
+            control.revoke(jwt, provider.SHORT_CLIENT, secret)
             expect(base, "GET", "/v1/history", 200, jwt)
             print("PASS JWT rollout, workspace isolation and local validation after revocation", flush=True)
             claims = json.loads(base64.urlsafe_b64decode(jwt.split(".")[1] + "=="))

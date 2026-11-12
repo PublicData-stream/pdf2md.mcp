@@ -90,6 +90,65 @@ enum Command {
     Status,
     /// Show all observations, optionally restricted to a source.
     History { source: Option<String> },
+    /// Obtain an access token with the configured `[auth.client]`.
+    Oauth {
+        #[command(subcommand)]
+        grant: OauthCommand,
+    },
+}
+
+/// Token-acquisition grants. Tokens are printed as JSON on standard output;
+/// Resource Owner Password Credentials is not supported.
+#[derive(Subcommand)]
+enum OauthCommand {
+    /// Client Credentials grant with the client's own secret.
+    ClientCredentials,
+    /// Device Authorization grant: approve the printed code in a browser.
+    Device,
+    /// Refresh Token grant; reads the refresh token from an environment variable.
+    Refresh {
+        #[arg(long)]
+        refresh_token_env: String,
+    },
+}
+
+async fn oauth(config: &Config, grant: &OauthCommand) -> Result<()> {
+    let client = pdf2md_mcp::oauth::OAuthClient::new(&config.auth)?.ok_or_else(|| {
+        LoadError::new(
+            "config_invalid",
+            "OAuth2 mode with an [auth.client] section is required",
+        )
+    })?;
+    let tokens = match grant {
+        OauthCommand::ClientCredentials => client.client_credentials().await?,
+        OauthCommand::Device => {
+            let device = client.device_authorization().await?;
+            eprintln!(
+                "Open {} and confirm the code {} within {} seconds.",
+                device
+                    .verification_uri_complete
+                    .as_deref()
+                    .unwrap_or(&device.verification_uri),
+                device.user_code,
+                device.expires_in
+            );
+            client.wait_for_device(&device).await?
+        }
+        OauthCommand::Refresh { refresh_token_env } => {
+            let value = std::env::var(refresh_token_env).map_err(|_| {
+                LoadError::new(
+                    "config_invalid",
+                    "refresh token environment variable unavailable",
+                )
+            })?;
+            client.refresh(&value).await?
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&tokens).expect("serializable token response")
+    );
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -274,6 +333,9 @@ async fn run(cli: &Cli) -> Result<()> {
     if let Command::Serve { listen } = &cli.command {
         return serve(cli, config, database_url, *listen).await;
     }
+    if let Command::Oauth { grant } = &cli.command {
+        return oauth(&config, grant).await;
+    }
     if matches!(cli.command, Command::Workspaces) {
         let registry = WorkspaceRegistry::open(&cli.data_dir).await?;
         let entries = registry.list().await?;
@@ -419,6 +481,7 @@ async fn run(cli: &Cli) -> Result<()> {
     let result = async {
         match &cli.command {
             Command::Serve { .. }
+            | Command::Oauth { .. }
             | Command::Schedules { .. }
             | Command::Workspaces
             | Command::ConversionHistory { .. }

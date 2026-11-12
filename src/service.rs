@@ -181,6 +181,7 @@ struct RunningJob {
 }
 pub struct CallerService {
     auth: Authenticator,
+    oauth: Option<Arc<crate::oauth::OAuthClient>>,
     tool_state: tools::ToolState,
     registry: WorkspaceRegistry,
     database_url: Option<String>,
@@ -210,6 +211,7 @@ impl CallerService {
     pub async fn new(root: &Path, config: Config, database_url: Option<String>) -> Result<Self> {
         config.validate()?;
         let auth = Authenticator::new(config.auth.clone()).await?;
+        let oauth = crate::oauth::OAuthClient::new(&config.auth)?.map(Arc::new);
         let scripts = tempfile::Builder::new()
             .prefix("pdf2md-source-snapshot-")
             .tempdir_in("/tmp")
@@ -223,6 +225,7 @@ impl CallerService {
         let registry = WorkspaceRegistry::open(root).await?;
         let service = Self {
             auth,
+            oauth,
             tool_state: tools::ToolState::new(config.mcp.search_concurrency),
             registry,
             database_url,
@@ -259,6 +262,10 @@ impl CallerService {
     }
     pub fn config(&self) -> &Config {
         &self.config
+    }
+    /// The registered OAuth client, when `[auth.client]` is configured.
+    pub fn oauth_client(&self) -> Option<Arc<crate::oauth::OAuthClient>> {
+        self.oauth.clone()
     }
     fn fingerprints(&self) -> Vec<(String, String)> {
         self.definitions

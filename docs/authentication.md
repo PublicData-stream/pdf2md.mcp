@@ -1,9 +1,12 @@
 # Authentication foundations
 
 The HTTP service uses the caller authorization boundary and accepts bearer
-access tokens in OAuth2 mode. It does not implement browser login or issue
-tokens. The local CLI and low-level storage APIs remain trusted operator
-interfaces. See [the HTTP API](http-api.md) for routes and job behavior.
+access tokens in OAuth2 mode. It never issues tokens itself. An optional
+registered OAuth client can obtain tokens from the provider for callers with
+every OAuth 2.0 grant except Resource Owner Password Credentials; see
+[Obtaining access tokens](#obtaining-access-tokens). The local CLI and
+low-level storage APIs remain trusted operator interfaces. See
+[the HTTP API](http-api.md) for routes and job behavior.
 
 ## Modes and permissions
 
@@ -38,7 +41,8 @@ An omitted `[auth]` section selects `none_ro`. For anonymous writes:
 mode = "none_rw"
 ```
 
-For Authelia's default opaque access tokens:
+For [Casdoor](https://casdoor.ai/docs/how-to-connect/oauth/) with token
+introspection:
 
 ```toml
 [auth]
@@ -46,45 +50,83 @@ mode = "oauth2"
 
 [auth.oidc]
 issuer = "https://auth.example.com"
-audience = "https://pdf.example.com"
+audience = "https://pdf.example.com/"
 validation = "introspection"
-access_token_prefix = "authelia_at_"
-client_id = "pdf2md-resource"
+token_profile = "casdoor"
+client_id = "pdf2md-web"
 client_secret = { env = "PDF2MD_OIDC_CLIENT_SECRET" }
 read_scope = "pdf2md:read"
 write_scope = "pdf2md:write"
 operate_scope = "pdf2md:operate"
 ```
 
-Register the introspection client in the provider with `client_secret_basic`.
-Authelia 4.39.28 omits the optional introspection token-type field, including
-for refresh tokens. The explicit `access_token_prefix` distinguishes its
-`authelia_at_` access-token class; remote active-token, audience, subject,
-expiry, and scope checks are still mandatory. Without a configured prefix,
-introspection requires a `Bearer` token-type response. JWT mode rejects the
-prefix setting, so remove it when selecting `validation = "jwt"`.
-Register user-facing clients for Authorization Code with PKCE S256, the service
-audience, and these custom scopes. Token acquisition belongs to those clients;
-this library does not provide a callback or dynamic client registration.
-Keep subject/sector configuration stable: a changed provider subject creates
-a different private workspace. Configure custom scopes and access-token
-audiences using the [Authelia provider configuration](https://www.authelia.com/configuration/identity-providers/openid-connect/provider/)
-and [client configuration](https://www.authelia.com/configuration/identity-providers/openid-connect/clients/).
+Introspection authenticates with `client_secret_basic`. Select
+`validation = "jwt"` to verify RS256 access tokens locally with the provider's
+JWKS; JWT mode does not need introspection credentials. Validators are selected
+explicitly, without fallback. Introspection checks every operation without
+token-result caching. Local JWT validation can continue accepting a revoked
+token until expiry; choose introspection when prompt revocation is required.
 
-Select `validation = "jwt"` for RS256 RFC 9068 access tokens. JWT mode does not
-need introspection credentials. For Authelia 4.39.28 also set
-`jwt_scope_claim = "scp"`, which selects its array of individual scope strings.
-The default `"scope"` selects the standard space-separated string. Only the
-configured claim grants permissions; the validator never merges claims or
-falls back to the other claim. The nondefault setting is valid only in JWT
-mode. This matches the pinned provider's
-[JWT scope format](https://github.com/authelia/authelia/blob/v4.39.28/internal/oidc/config.go).
-Configure Authelia's
-`access_token_signed_response_alg` as `RS256`; an OIDC ID token is never a
-substitute for an access token. Validators are selected explicitly, without
-fallback. Introspection checks every operation without token-result caching.
-Local JWT validation can continue accepting a revoked token until expiry;
-choose introspection when prompt revocation is required.
+### Token profiles
+
+`token_profile` selects how an access token is distinguished from the
+provider's other tokens. The validator never falls back between profiles.
+
+| `token_profile` | JWT validation | Introspection |
+| --- | --- | --- |
+| `rfc9068` (default) | [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html): header `typ` `at+jwt` and a `client_id` claim | `token_type` `Bearer`, or an explicit `access_token_prefix` when the provider omits it |
+| `casdoor` | Header `typ` `JWT`, signed `tokenType` claim `access-token`, and an `azp` claim | The token must be a JWT whose `tokenType` is `access-token`, and the introspected `jti` must match it |
+
+Casdoor signs access, refresh and ID tokens with the same key, and its
+introspection endpoint reports refresh tokens as active `Bearer` tokens. The
+`casdoor` profile therefore requires the access-token class carried by the
+token itself. Introspection looks up the exact token string, so the provider
+authenticates that claim; it is checked before the provider is called. The
+`casdoor` profile requires the default `jwt_scope_claim = "scope"` and rejects
+`access_token_prefix`. Configure Casdoor's
+[token format](https://casdoor.ai/docs/token/overview/) as `JWT-Standard` or
+`JWT-Empty` to keep user attributes out of access tokens; the validator uses
+only `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`, `azp`, `scope` and
+`tokenType`.
+
+For other providers, `access_token_prefix` restricts introspection to an
+issuer-documented access-token prefix when the provider omits the optional
+token-type field. Remote active-token, audience, subject, expiry, and scope
+checks remain mandatory. JWT mode rejects the prefix setting.
+`jwt_scope_claim = "scp"` selects an array of individual scope strings instead
+of the standard space-separated `scope` claim, in JWT mode only. Only the
+configured claim grants permissions; the validator never merges claims. An
+OIDC ID token is never a substitute for an access token.
+
+### Audiences
+
+Access tokens must name `audience` in `aud`. Register it as the
+[RFC 8707](https://www.rfc-editor.org/rfc/rfc8707.html) resource of user-facing
+clients; Casdoor then issues Authorization Code, Device Authorization and
+Refresh Token grants for that resource. Casdoor 4.27.1 ignores the resource
+indicator for the Implicit and Client Credentials grants and sets `aud` to the
+requesting client ID. To accept those tokens, list dedicated client IDs in
+`additional_audiences` (at most 16):
+
+```toml
+additional_audiences = ["pdf2md-web", "pdf2md-machine"]
+```
+
+Only list clients registered exclusively for this service: any access token
+issued to them is accepted. ID tokens remain rejected by the token profile.
+
+### Provider registration
+
+Register clients explicitly; this integration does not depend on Dynamic
+Client Registration. In Casdoor, create an application with the **Agent**
+category and define the custom scopes `pdf2md:read`, `pdf2md:write` and
+`pdf2md:operate` ([custom scopes](https://casdoor.ai/docs/application/scopes/)).
+Enable only the grant types you use. Keep subject configuration stable: a
+changed provider subject creates a different private workspace. Casdoor user
+subjects are user IDs; Client Credentials tokens use the application's
+`owner/name` as subject, so each machine client receives its own workspace.
+
+### Provider connections
 
 Provider endpoints require HTTPS and trusted certificates. `ca_file` can add
 a PEM trust anchor. `client_secret = { file = "secret" }` reads a regular
@@ -94,8 +136,108 @@ Discovery endpoints must use the issuer origin unless their origins appear
 in `allowed_endpoint_origins`. Provider calls have a five-second timeout and
 256 KiB response limit. Discovery and JWKS are cached for five minutes;
 unknown key IDs can trigger one refresh per 30 seconds. TLS verification stays
-enabled. Auth configuration is validated even for operator commands, but
-operator commands do not authenticate to the provider.
+enabled. Auth configuration is validated even for operator commands; only the
+`oauth` commands contact the provider.
+
+## Obtaining access tokens
+
+The optional `[auth.client]` section registers this service as an OAuth client
+of the same issuer. It supports these grants:
+
+| `grant_types` value | Grant | Where |
+| --- | --- | --- |
+| `authorization_code` | Authorization Code with PKCE S256 ([RFC 6749 section 4.1](https://www.rfc-editor.org/rfc/rfc6749#section-4.1), [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636)) | Browser: `GET /oauth/login`, then `GET /oauth/callback` |
+| `implicit` | Implicit ([RFC 6749 section 4.2](https://www.rfc-editor.org/rfc/rfc6749#section-4.2)) | Browser: `GET /oauth/login?grant=implicit`, then `GET /oauth/implicit` |
+| `device_code` | Device Authorization ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) | `POST /oauth/device` and `POST /oauth/token`, or `pdf2md-mcp oauth device` |
+| `refresh_token` | Refresh Token ([RFC 6749 section 6](https://www.rfc-editor.org/rfc/rfc6749#section-6)) | `POST /oauth/token`, or `pdf2md-mcp oauth refresh` |
+| `client_credentials` | Client Credentials ([RFC 6749 section 4.4](https://www.rfc-editor.org/rfc/rfc6749#section-4.4)) | `pdf2md-mcp oauth client-credentials` only |
+
+The Resource Owner Password Credentials grant is not supported: the service
+never receives user passwords, and configuration rejects `password`.
+Authorization Code with PKCE is the recommended browser grant. The Implicit
+grant is deprecated by the
+[OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700#section-2.1.2)
+and omitted from OAuth 2.1; enable it only for compatibility.
+
+```toml
+[auth.client]
+client_id = "pdf2md-web"
+client_secret = { env = "PDF2MD_OAUTH_CLIENT_SECRET" }
+grant_types = ["authorization_code", "device_code", "refresh_token"]
+scopes = ["pdf2md:read", "pdf2md:write"]
+redirect_base_url = "https://pdf.example.com"
+```
+
+`[auth.client]` requires `mode = "oauth2"` and uses the `[auth.oidc]` issuer,
+trust anchors and endpoint-origin rules. Omit `client_secret` for a public
+client, which then sends `client_id` in each request; Client Credentials
+requires a secret. The secret is sent with `client_secret_basic`. Every request
+carries `resource`, which defaults to `[auth.oidc] audience`. Browser grants
+require `redirect_base_url`, the public HTTPS origin of this service
+(loopback HTTP is allowed for development). Register
+`<redirect_base_url>/oauth/callback` and `<redirect_base_url>/oauth/implicit`
+as the client's redirect URIs. The client may be the same provider application
+used for introspection. Routes for disabled grants are not registered.
+
+Browser grants:
+
+- `/oauth/login` redirects to the provider with a random `state`. Authorization
+  Code adds an S256 PKCE challenge; the verifier stays in server memory for ten
+  minutes, at most 1,024 pending sign-ins. The `state` is also bound to the
+  browser with an `HttpOnly`, `SameSite=Lax` cookie, `Secure` for HTTPS.
+- `/oauth/callback` requires the matching cookie and single-use `state`, then
+  checks the [RFC 9207](https://www.rfc-editor.org/rfc/rfc9207) `iss`
+  parameter. It is mandatory when the provider advertises it, as Casdoor does.
+  The code is redeemed with its verifier, and a minimal page shows the access
+  and refresh tokens. ID tokens are never displayed.
+- `/oauth/implicit` reads the token from the URL fragment in the browser, so
+  the server never receives it. The page script checks `state` against a
+  script-readable cookie and `iss` against the configured issuer, then removes
+  the fragment from the address bar.
+
+Pages use minimal markup, `Cache-Control: no-store`, `Referrer-Policy:
+no-referrer` and a content security policy that allows only same-origin
+scripts.
+
+`POST /oauth/device` starts device authorization and returns `device_code`,
+`user_code`, `verification_uri`, `expires_in` and `interval`. Show the user the
+verification URI and code; the provider hosts the approval page. Poll
+`POST /oauth/token` with
+`{"grant_type": "urn:ietf:params:oauth:grant-type:device_code", "device_code": "..."}`
+no more often than `interval`. Refresh with
+`{"grant_type": "refresh_token", "refresh_token": "..."}`. Responses contain
+`access_token`, `token_type`, `expires_in`, `scope` and, when issued,
+`refresh_token`. Casdoor rotates refresh tokens by default; store the new
+value. The broker adds the registered client's credentials to these requests,
+so a confidential client's secret never leaves the service. Client Credentials
+is never brokered over HTTP, because it would issue the service's own
+application token to anonymous callers.
+
+Provider errors become fixed codes without provider descriptions:
+`oauth_authorization_pending`, `oauth_slow_down`, `oauth_access_denied`,
+`oauth_expired_token`, `oauth_invalid_grant`, `oauth_client_rejected`,
+`oauth_invalid_scope`, `oauth_invalid_target` or `oauth_error`. Sign-in errors
+use `oauth_state_mismatch`, `oauth_issuer_mismatch` and
+`oauth_grant_disabled`. Network and malformed-response failures use
+`auth_unavailable`.
+
+The CLI reads the same configuration and prints the token response as JSON on
+standard output. Device authorization prints the verification URI and code on
+standard error and polls until approval, denial or expiry, slowing down when
+asked. Refresh reads the token from a named environment variable so it does
+not appear in process arguments:
+
+```sh
+pdf2md-mcp --config pdf2md.toml oauth device
+pdf2md-mcp --config machine.toml oauth client-credentials
+PDF2MD_REFRESH_TOKEN=... pdf2md-mcp --config pdf2md.toml oauth refresh --refresh-token-env PDF2MD_REFRESH_TOKEN
+```
+
+Use a separate configuration with a dedicated machine client for Client
+Credentials, and add that client ID to `additional_audiences` when the
+provider does not bind its tokens to the resource. Obtained tokens are ordinary
+bearer credentials: they are validated on every request exactly like tokens
+from any other client.
 
 ## Library contract
 
@@ -177,12 +319,16 @@ Core auth, service, and workspace tests run with the documented
 and disposable TLS providers. PostgreSQL tests additionally require
 `PDF2MD_TEST_POSTGRES_URL` pointing to PostgreSQL 18 or newer.
 
-Live Authelia checks use a disposable provider with two synthetic users and
-registered test clients. They exercise real opaque/JWT access tokens,
-permissions, isolation, revocation, expiry, and durable job recovery against
-the library and HTTP boundaries. These checks alone do not establish MCP client
-or Kubernetes deployment acceptance. Run `python3 scripts/test-authelia.py`; see
-[the live harness guide](../examples/authelia/README.md) for requirements and
+Registered-client grants run against a synthetic TLS provider in
+`tests/oauth_client.rs` as part of the core suite.
+
+Live Casdoor checks use a disposable provider with two synthetic users and
+registered test clients. They exercise all five supported grants through the
+registered client, both validators, permissions, isolation, revocation,
+expiry, and durable job recovery against the library and HTTP boundaries.
+These checks alone do not establish MCP client or Kubernetes deployment
+acceptance. Run `python3 scripts/test-casdoor.py`; see
+[the live harness guide](../examples/casdoor/README.md) for requirements and
 provider configuration.
 
 ## MCP authorization

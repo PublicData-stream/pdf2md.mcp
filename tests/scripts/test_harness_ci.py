@@ -33,7 +33,7 @@ class HarnessControls(unittest.TestCase):
     def test_oidc_provider_listener_probe_is_present_in_both_modes(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             root = Path(directory)
-            for name in ("tls.crt", "tls.key", "ca.crt", "users.yml", "configuration.yml", "client-secret", "fixture.crt", "fixture.key", "sample.pdf"):
+            for name in ("tls.crt", "tls.key", "ca.crt", "app.conf", "init_data.json", "client-secret", "fixture.crt", "fixture.key", "sample.pdf"):
                 (root / name).write_bytes(b"synthetic")
             for mode in ("live", "fixture"):
                 with self.subTest(mode=mode), patch.dict(os.environ, {"PDF2MD_FIXTURE_IMAGE": "fixture:local"}):
@@ -190,7 +190,7 @@ class HarnessControls(unittest.TestCase):
                 with patch.dict(os.environ, {"PDF2MD_CI_DIAGNOSTICS_DIR": directory, "PDF2MD_EXPECTED_IMAGE_CONFIG_DIGEST": digest}), \
                      patch.object(sys, "argv", ["test-http-oidc.py", "api:local"]), \
                      patch.object(oidc, "install_shutdown"), patch.object(oidc, "invoke", side_effect=invoke), \
-                     patch.object(oidc, "generate", return_value=("password", "secret")), \
+                     patch.object(oidc, "generate", return_value=({"alice": "password", "bob": "password"}, "secret")), \
                      patch.object(oidc, "resources", return_value=Path(directory) / "resources.json"), \
                      patch.object(oidc.provider, "Client"), patch.object(oidc, "ready"), \
                      patch.object(oidc, "run_test", return_value=("document", "job", True)), \
@@ -301,7 +301,7 @@ class HarnessControls(unittest.TestCase):
         self.assertIn('url = "https://fixture.example/sample.pdf"', oidc.config("jwt", "fixture"))
         with tempfile.TemporaryDirectory(dir="/tmp", prefix="pdf2md-harness-unit-") as directory:
             root = Path(directory)
-            for name in ("tls.crt", "tls.key", "ca.crt", "users.yml", "configuration.yml", "client-secret", "fixture.crt", "fixture.key", "sample.pdf"):
+            for name in ("tls.crt", "tls.key", "ca.crt", "app.conf", "init_data.json", "client-secret", "fixture.crt", "fixture.key", "sample.pdf"):
                 (root / name).write_bytes(b"synthetic")
             with patch.dict(os.environ, {"PDF2MD_FIXTURE_IMAGE": "fixture:local"}):
                 items = json.loads(oidc.resources(root, "api:local", "fixture").read_text())["items"]
@@ -327,17 +327,17 @@ class HarnessControls(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("browser integration tests did not run", result.stderr)
 
-    def test_prebuilt_authelia_missing_or_zero_tests_fails_before_provider_start(self):
+    def test_prebuilt_casdoor_missing_or_zero_tests_fails_before_provider_start(self):
         with tempfile.TemporaryDirectory(dir="/tmp", prefix="pdf2md-provider-unit-") as directory:
             fake = Path(directory) / "fake-tests"
             fake.write_text('#!/bin/sh\nprintf "0 tests, 0 benchmarks\\n"\n')
             fake.chmod(0o755)
             for executable in (str(fake), str(fake) + "-missing"):
-                result = subprocess.run([sys.executable, "scripts/test-authelia.py"], cwd=ROOT,
-                                        env=os.environ | {"PDF2MD_LIVE_AUTHELIA_TEST_EXECUTABLE": executable},
+                result = subprocess.run([sys.executable, "scripts/test-casdoor.py"], cwd=ROOT,
+                                        env=os.environ | {"PDF2MD_LIVE_CASDOOR_TEST_EXECUTABLE": executable},
                                         capture_output=True, text=True, timeout=30)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("prebuilt Authelia", result.stdout)
+                self.assertIn("prebuilt Casdoor", result.stdout)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-//! Opt-in real-provider acceptance. Run through scripts/test-authelia.py.
+//! Opt-in real-provider acceptance. Run through scripts/test-casdoor.py.
 use pdf2md_mcp::{
     auth::{AuthConfig, Authenticator, Identity},
     config::Config,
@@ -14,19 +14,24 @@ use tokio_util::sync::CancellationToken;
 fn token<'a>(fixture: &'a Value, key: &str) -> &'a str {
     fixture[key]["access_token"].as_str().expect("access token")
 }
-fn config(fixture: &Value, validation: &str) -> Config {
-    let auth: AuthConfig = serde_json::from_value(serde_json::json!({
+fn auth_config(fixture: &Value, validation: &str, client: Option<Value>) -> AuthConfig {
+    serde_json::from_value(serde_json::json!({
         "mode": "oauth2",
         "oidc": {
             "issuer": fixture["issuer"], "audience": fixture["audience"],
-            "validation": validation, "client_id": fixture["client_id"],
-            "jwt_scope_claim": if validation == "jwt" { "scp" } else { "scope" },
+            "validation": validation, "token_profile": "casdoor",
+            // Casdoor binds Implicit and Client Credentials tokens to the client ID.
+            "additional_audiences": [fixture["client_id"], fixture["machine_client_id"]],
+            "client_id": fixture["client_id"],
             "client_secret": {"file": fixture["secret_file"]},
-            "ca_file": fixture["ca_file"],
-            "access_token_prefix": if validation == "introspection" { Some("authelia_at_") } else { None }
-        }
+            "ca_file": fixture["ca_file"]
+        },
+        "client": client
     }))
-    .unwrap();
+    .unwrap()
+}
+fn config(fixture: &Value, validation: &str) -> Config {
+    let auth = auth_config(fixture, validation, None);
     Config {
         auth,
         ..Config::default()
@@ -63,12 +68,11 @@ async fn seed(root: &Path, issuer: &str, subject: &str, bytes: &[u8]) -> String 
 }
 
 #[tokio::test]
-#[ignore = "requires disposable real Authelia; run scripts/test-authelia.py"]
-async fn real_authelia_tokens_enforce_scopes_isolation_revocation_and_expiry() {
-    let fixture_path =
-        std::env::var("PDF2MD_LIVE_AUTHELIA_FIXTURE").expect("live fixture required");
+#[ignore = "requires disposable real Casdoor; run scripts/test-casdoor.py"]
+async fn real_casdoor_tokens_enforce_scopes_isolation_revocation_and_expiry() {
+    let fixture_path = std::env::var("PDF2MD_LIVE_CASDOOR_FIXTURE").expect("live fixture required");
     let fixture: Value = serde_json::from_slice(&std::fs::read(fixture_path).unwrap()).unwrap();
-    let phase = std::env::var("PDF2MD_LIVE_AUTHELIA_PHASE").unwrap_or_default();
+    let phase = std::env::var("PDF2MD_LIVE_CASDOOR_PHASE").unwrap_or_default();
     let introspection = Authenticator::new(config(&fixture, "introspection").auth)
         .await
         .unwrap();
@@ -77,13 +81,13 @@ async fn real_authelia_tokens_enforce_scopes_isolation_revocation_and_expiry() {
         .unwrap();
     if phase == "expired" {
         let error = jwt
-            .authenticate(Some(token(&fixture, "alice_jwt")), false)
+            .authenticate(Some(token(&fixture, "short")), false)
             .await
             .unwrap_err();
         assert_eq!(error.code, "auth_invalid");
         assert!(
             introspection
-                .authenticate(Some(token(&fixture, "bob_opaque")), false)
+                .authenticate(Some(token(&fixture, "bob")), false)
                 .await
                 .is_ok()
         );
@@ -91,25 +95,30 @@ async fn real_authelia_tokens_enforce_scopes_isolation_revocation_and_expiry() {
     }
     if phase == "revoked" {
         let error = introspection
-            .authenticate(Some(token(&fixture, "alice_opaque")), false)
+            .authenticate(Some(token(&fixture, "alice")), false)
             .await
             .unwrap_err();
         assert_eq!(error.code, "auth_invalid");
         // Local JWT validation has no immediate revocation guarantee.
         assert!(
-            jwt.authenticate(Some(token(&fixture, "alice_jwt")), false)
+            jwt.authenticate(Some(token(&fixture, "alice")), false)
                 .await
                 .is_ok()
         );
         return;
     }
-    for key in ["alice_opaque", "bob_opaque"] {
+    // The short-lived client issues the same user identity until expiry.
+    assert_eq!(
+        identity(&fixture, "jwt", "short").await,
+        identity(&fixture, "jwt", "alice").await
+    );
+    for key in ["alice", "bob"] {
         introspection
             .authenticate(Some(token(&fixture, key)), true)
             .await
             .unwrap();
     }
-    for key in ["alice_jwt", "bob_jwt"] {
+    for key in ["alice", "bob"] {
         jwt.authenticate(Some(token(&fixture, key)), true)
             .await
             .unwrap();
@@ -129,19 +138,19 @@ async fn real_authelia_tokens_enforce_scopes_isolation_revocation_and_expiry() {
         "auth_forbidden"
     );
     assert!(
-        jwt.authenticate(Some(token(&fixture, "jwt_read_only")), false)
+        jwt.authenticate(Some(token(&fixture, "read_only")), false)
             .await
             .is_ok()
     );
     assert_eq!(
-        jwt.authenticate(Some(token(&fixture, "jwt_read_only")), true)
+        jwt.authenticate(Some(token(&fixture, "read_only")), true)
             .await
             .unwrap_err()
             .code,
         "auth_forbidden"
     );
     for name in ["refresh_token", "id_token"] {
-        let value = fixture["alice_opaque"][name]
+        let value = fixture["alice"][name]
             .as_str()
             .expect("wrong-token fixture");
         assert_eq!(
@@ -157,15 +166,12 @@ async fn real_authelia_tokens_enforce_scopes_isolation_revocation_and_expiry() {
             "auth_invalid"
         );
     }
-    let alice = identity(&fixture, "introspection", "alice_opaque").await;
-    let bob = identity(&fixture, "introspection", "bob_opaque").await;
+    let alice = identity(&fixture, "introspection", "alice").await;
+    let bob = identity(&fixture, "introspection", "bob").await;
     assert_ne!(alice.1, bob.1);
-    assert_eq!(alice, identity(&fixture, "jwt", "alice_jwt").await);
-    assert_eq!(bob, identity(&fixture, "jwt", "bob_jwt").await);
-    for (mode, alice_key, bob_key) in [
-        ("introspection", "alice_opaque", "bob_opaque"),
-        ("jwt", "alice_jwt", "bob_jwt"),
-    ] {
+    assert_eq!(alice, identity(&fixture, "jwt", "alice").await);
+    assert_eq!(bob, identity(&fixture, "jwt", "bob").await);
+    for (mode, alice_key, bob_key) in [("introspection", "alice", "bob"), ("jwt", "alice", "bob")] {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let alice_pdf = b"%PDF-1.7\nsynthetic alice\n%%EOF";
         let alice_id = seed(root.path(), &alice.0, &alice.1, alice_pdf).await;
@@ -228,11 +234,7 @@ async fn real_authelia_tokens_enforce_scopes_isolation_revocation_and_expiry() {
             _ => panic!("expected PDF stream"),
         }
         {
-            let read_key = if mode == "introspection" {
-                "read_only"
-            } else {
-                "jwt_read_only"
-            };
+            let read_key = "read_only";
             let error = service
                 .execute(
                     Some(token(&fixture, read_key)),
@@ -307,20 +309,20 @@ async fn response_json(response: reqwest::Response) -> Value {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable real Authelia; run scripts/test-authelia.py"]
+#[ignore = "requires disposable real Casdoor; run scripts/test-casdoor.py"]
 async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
     use reqwest::StatusCode;
     let fixture_path =
-        std::path::PathBuf::from(std::env::var("PDF2MD_LIVE_AUTHELIA_FIXTURE").unwrap());
+        std::path::PathBuf::from(std::env::var("PDF2MD_LIVE_CASDOOR_FIXTURE").unwrap());
     let fixture: Value = serde_json::from_slice(&std::fs::read(&fixture_path).unwrap()).unwrap();
     let root = fixture_path.parent().unwrap().join("http-workspaces");
     let metadata = fixture_path.parent().unwrap().join("http-test-state.json");
-    let phase = std::env::var("PDF2MD_LIVE_AUTHELIA_PHASE").unwrap_or_default();
+    let phase = std::env::var("PDF2MD_LIVE_CASDOOR_PHASE").unwrap_or_default();
     if phase == "expired" {
         let server = HttpServer::start(&root, &fixture, "jwt").await;
         assert_eq!(
             server
-                .get("/v1/history", Some(token(&fixture, "alice_jwt")))
+                .get("/v1/history", Some(token(&fixture, "short")))
                 .await
                 .status(),
             StatusCode::UNAUTHORIZED
@@ -334,17 +336,14 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
         let server = HttpServer::start(&root, &fixture, "introspection").await;
         assert_eq!(
             server
-                .get(
-                    &format!("/v1/jobs/{job}"),
-                    Some(token(&fixture, "alice_opaque"))
-                )
+                .get(&format!("/v1/jobs/{job}"), Some(token(&fixture, "alice")))
                 .await
                 .status(),
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(
             server
-                .get("/v1/history", Some(token(&fixture, "bob_opaque")))
+                .get("/v1/history", Some(token(&fixture, "bob")))
                 .await
                 .status(),
             StatusCode::OK
@@ -362,7 +361,7 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
                 .unwrap()
         });
         // Observe conversion without reauthorizing Alice: accepted work is independent of later token revocation.
-        let alice = identity(&fixture, "jwt", "alice_jwt").await;
+        let alice = identity(&fixture, "jwt", "alice").await;
         let registry = WorkspaceRegistry::open(&root).await.unwrap();
         let workspace = registry
             .resolve_identity(&alice.0, &alice.1, None)
@@ -393,10 +392,7 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
         server.stop().await;
         let server = HttpServer::start(&root, &fixture, "jwt").await;
         let response = server
-            .get(
-                &format!("/v1/jobs/{job}"),
-                Some(token(&fixture, "alice_jwt")),
-            )
+            .get(&format!("/v1/jobs/{job}"), Some(token(&fixture, "alice")))
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response_json(response).await["status"], "succeeded");
@@ -412,7 +408,7 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
     for name in ["id_token", "refresh_token"] {
         assert_eq!(
             server
-                .get("/v1/history", fixture["alice_opaque"][name].as_str())
+                .get("/v1/history", fixture["alice"][name].as_str())
                 .await
                 .status(),
             StatusCode::UNAUTHORIZED
@@ -436,14 +432,12 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
     let full = server
         .client
         .post(format!("{}/v1/sources/absent/fetch", server.base))
-        .bearer_auth(token(&fixture, "alice_opaque"))
+        .bearer_auth(token(&fixture, "alice"))
         .send()
         .await
         .unwrap();
     assert_eq!(full.status(), StatusCode::NOT_FOUND);
-    let response = server
-        .upload(token(&fixture, "alice_opaque"), pdf.clone())
-        .await;
+    let response = server.upload(token(&fixture, "alice"), pdf.clone()).await;
     assert_eq!(response.status(), StatusCode::CREATED);
     let result = response_json(response).await;
     let document = result["observation"]["document_id"].as_str().unwrap();
@@ -453,7 +447,7 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
         server
             .get(
                 &format!("/v1/documents/{document}/pdf"),
-                Some(token(&fixture, "bob_opaque"))
+                Some(token(&fixture, "bob"))
             )
             .await
             .status(),
@@ -461,16 +455,13 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
     );
     assert_eq!(
         server
-            .get(
-                &format!("/v1/jobs/{job}"),
-                Some(token(&fixture, "bob_opaque"))
-            )
+            .get(&format!("/v1/jobs/{job}"), Some(token(&fixture, "bob")))
             .await
             .status(),
         StatusCode::NOT_FOUND
     );
     let history = server
-        .get("/v1/conversions", Some(token(&fixture, "alice_opaque")))
+        .get("/v1/conversions", Some(token(&fixture, "alice")))
         .await;
     assert_eq!(history.status(), StatusCode::OK);
     assert!(
@@ -482,7 +473,7 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
     );
     let mut bob_pdf = pdf.clone();
     bob_pdf.extend_from_slice(b"\n% bob synthetic document\n");
-    let bob = server.upload(token(&fixture, "bob_opaque"), bob_pdf).await;
+    let bob = server.upload(token(&fixture, "bob"), bob_pdf).await;
     assert_eq!(bob.status(), StatusCode::CREATED);
     let bob = response_json(bob).await;
     let bob_document = bob["observation"]["document_id"].as_str().unwrap();
@@ -490,7 +481,7 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
         server
             .get(
                 &format!("/v1/documents/{bob_document}/pdf"),
-                Some(token(&fixture, "alice_opaque"))
+                Some(token(&fixture, "alice"))
             )
             .await
             .status(),
@@ -505,7 +496,7 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
     let server = HttpServer::start(&root, &fixture, "jwt").await;
     assert_eq!(
         server
-            .upload(token(&fixture, "alice_jwt"), pdf.clone())
+            .upload(token(&fixture, "alice"), pdf.clone())
             .await
             .status(),
         StatusCode::CREATED
@@ -514,7 +505,7 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
         server
             .get(
                 &format!("/v1/documents/{document}/pdf"),
-                Some(token(&fixture, "alice_jwt"))
+                Some(token(&fixture, "alice"))
             )
             .await
             .bytes()
@@ -525,7 +516,7 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
     );
     assert_eq!(
         server
-            .get(&format!("/v1/jobs/{job}"), Some(token(&fixture, "bob_jwt")))
+            .get(&format!("/v1/jobs/{job}"), Some(token(&fixture, "bob")))
             .await
             .status(),
         StatusCode::NOT_FOUND
@@ -534,7 +525,7 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
         server
             .get(
                 &format!("/v1/documents/{document}/pdf"),
-                Some(token(&fixture, "bob_jwt"))
+                Some(token(&fixture, "bob"))
             )
             .await
             .status(),
@@ -542,17 +533,289 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
     );
     assert_eq!(
         server
-            .upload(token(&fixture, "jwt_read_only"), pdf.clone())
+            .upload(token(&fixture, "read_only"), pdf.clone())
             .await
             .status(),
         StatusCode::FORBIDDEN
     );
     assert_eq!(
         server
-            .get("/v1/conversions", Some(token(&fixture, "alice_jwt")))
+            .get("/v1/conversions", Some(token(&fixture, "alice")))
             .await
             .status(),
         StatusCode::OK
     );
     server.stop().await;
+}
+
+/// Emulate Casdoor's sign-in page for an authorization URL produced by pdf2md.
+async fn casdoor_sign_in(fixture: &Value, location: &str, user: &str) -> String {
+    let location = url::Url::parse(location).unwrap();
+    let query: std::collections::HashMap<String, String> =
+        location.query_pairs().into_owned().collect();
+    assert!(
+        location
+            .as_str()
+            .starts_with(fixture["issuer"].as_str().unwrap())
+    );
+    let kind = if query["response_type"] == "code" {
+        "code"
+    } else {
+        "token"
+    };
+    let mut params = vec![
+        ("clientId", query["client_id"].clone()),
+        ("responseType", query["response_type"].clone()),
+        ("redirectUri", query["redirect_uri"].clone()),
+        ("type", kind.to_owned()),
+        ("scope", query["scope"].clone()),
+        ("state", query["state"].clone()),
+        ("nonce", "live-test".to_owned()),
+    ];
+    for name in ["code_challenge", "code_challenge_method", "resource"] {
+        if let Some(value) = query.get(name) {
+            params.push((name, value.clone()));
+        }
+    }
+    let response: Value = provider_client(fixture)
+        .post(
+            url::Url::parse_with_params(
+                &format!("{}/api/login", fixture["issuer"].as_str().unwrap()),
+                &params,
+            )
+            .unwrap(),
+        )
+        .json(&serde_json::json!({
+            "application": query["client_id"], "organization": fixture["organization"],
+            "username": user, "password": fixture["passwords"][user], "autoSignin": true, "type": kind,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["status"], "ok", "synthetic sign-in failed");
+    response["data"].as_str().unwrap().to_owned()
+}
+fn provider_client(fixture: &Value) -> reqwest::Client {
+    let ca = std::fs::read(fixture["ca_file"].as_str().unwrap()).unwrap();
+    reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+        .no_proxy()
+        .build()
+        .unwrap()
+}
+fn textarea(page: &str, id: &str) -> String {
+    let start = page.find(&format!("id=\"{id}\"")).expect("token field");
+    let value = &page[start..];
+    let value = &value[value.find('>').unwrap() + 1..];
+    value[..value.find("</textarea>").unwrap()].to_owned()
+}
+async fn subject(fixture: &Value, bearer: &str) -> String {
+    let validator = Authenticator::new(config(fixture, "introspection").auth)
+        .await
+        .unwrap();
+    match validator.authenticate(Some(bearer), false).await.unwrap() {
+        Identity::User { subject, .. } => subject,
+        Identity::Shared => panic!("OAuth must not become anonymous"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable real Casdoor; run scripts/test-casdoor.py"]
+async fn real_casdoor_grants_through_the_registered_client() {
+    use pdf2md_mcp::oauth::OAuthClient;
+    use reqwest::StatusCode;
+    let fixture_path = std::env::var("PDF2MD_LIVE_CASDOOR_FIXTURE").expect("live fixture required");
+    let fixture: Value = serde_json::from_slice(&std::fs::read(fixture_path).unwrap()).unwrap();
+    if !std::env::var("PDF2MD_LIVE_CASDOOR_PHASE")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return;
+    }
+    let alice = subject(&fixture, token(&fixture, "alice")).await;
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let client = serde_json::json!({
+        "client_id": fixture["client_id"], "client_secret": {"file": fixture["secret_file"]},
+        "grant_types": ["authorization_code", "implicit", "device_code", "refresh_token"],
+        "scopes": ["pdf2md:read", "pdf2md:write"], "redirect_base_url": base,
+    });
+    let service = std::sync::Arc::new(
+        CallerService::new(
+            root.path(),
+            Config {
+                auth: auth_config(&fixture, "introspection", Some(client)),
+                ..Config::default()
+            },
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let cancel = CancellationToken::new();
+    let router = pdf2md_mcp::http::router(service, cancel.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let api = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .unwrap();
+    let history = |bearer: String| {
+        let api = api.clone();
+        let base = base.clone();
+        async move {
+            api.get(format!("{base}/v1/history"))
+                .bearer_auth(bearer)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // Authorization Code with PKCE through /oauth/login and /oauth/callback.
+    let login = api.get(format!("{base}/oauth/login")).send().await.unwrap();
+    assert_eq!(login.status(), StatusCode::SEE_OTHER);
+    let location = login.headers()["location"].to_str().unwrap().to_owned();
+    let cookie = login.headers()["set-cookie"].to_str().unwrap();
+    let cookie = cookie.split(';').next().unwrap().to_owned();
+    let state = url::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let code = casdoor_sign_in(&fixture, &location, "alice").await;
+    let page = api
+        .get(
+            url::Url::parse_with_params(
+                &format!("{base}/oauth/callback"),
+                &[
+                    ("code", code.as_str()),
+                    ("state", &state),
+                    ("iss", fixture["issuer"].as_str().unwrap()),
+                ],
+            )
+            .unwrap(),
+        )
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = page.text().await.unwrap();
+    let code_access = textarea(&page, "access-token");
+    let code_refresh = textarea(&page, "refresh-token");
+    assert_eq!(history(code_access.clone()).await, StatusCode::OK);
+    assert_eq!(subject(&fixture, &code_access).await, alice);
+
+    // Implicit: Casdoor binds the token to the client ID, an additional audience.
+    let login = api
+        .get(format!("{base}/oauth/login?grant=implicit"))
+        .send()
+        .await
+        .unwrap();
+    let location = login.headers()["location"].to_str().unwrap().to_owned();
+    assert!(location.contains("response_type=token"));
+    let implicit = casdoor_sign_in(&fixture, &location, "alice").await;
+    assert_eq!(history(implicit.clone()).await, StatusCode::OK);
+    assert_eq!(subject(&fixture, &implicit).await, alice);
+    let page = api
+        .get(format!("{base}/oauth/implicit"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+
+    // Device Authorization: start, observe pending, approve as Bob, then poll.
+    let device: Value = api
+        .post(format!("{base}/oauth/device"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let grant = "urn:ietf:params:oauth:grant-type:device_code";
+    let poll = || {
+        api.post(format!("{base}/oauth/token"))
+            .json(&serde_json::json!({"grant_type": grant, "device_code": device["device_code"]}))
+            .send()
+    };
+    let pending: Value = poll().await.unwrap().json().await.unwrap();
+    assert_eq!(pending["code"], "oauth_authorization_pending");
+    let approved: Value = provider_client(&fixture)
+        .post(format!("{}/api/login", fixture["issuer"].as_str().unwrap()))
+        .bearer_auth(token(&fixture, "bob"))
+        .json(&serde_json::json!({
+            "application": fixture["client_id"], "organization": fixture["organization"],
+            "type": "device", "userCode": device["user_code"],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(approved["status"], "ok");
+    let response = poll().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let device_tokens: Value = response.json().await.unwrap();
+    let device_access = device_tokens["access_token"].as_str().unwrap().to_owned();
+    assert_eq!(history(device_access.clone()).await, StatusCode::OK);
+    assert_eq!(
+        subject(&fixture, &device_access).await,
+        subject(&fixture, token(&fixture, "bob")).await
+    );
+
+    // Refresh Token: Casdoor rotates refresh tokens by default.
+    let refresh = |value: String| {
+        api.post(format!("{base}/oauth/token"))
+            .json(&serde_json::json!({"grant_type": "refresh_token", "refresh_token": value}))
+            .send()
+    };
+    let refreshed: Value = refresh(code_refresh.clone())
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let refreshed_access = refreshed["access_token"].as_str().unwrap().to_owned();
+    assert_eq!(history(refreshed_access.clone()).await, StatusCode::OK);
+    assert_eq!(subject(&fixture, &refreshed_access).await, alice);
+    let reused: Value = refresh(code_refresh).await.unwrap().json().await.unwrap();
+    assert_eq!(reused["code"], "oauth_invalid_grant");
+    // ID tokens are not access tokens; the broker never returns them.
+    assert!(refreshed.get("id_token").is_none());
+
+    // Client Credentials: an application identity with its own workspace.
+    let machine = auth_config(
+        &fixture,
+        "jwt",
+        Some(serde_json::json!({
+            "client_id": fixture["machine_client_id"],
+            "client_secret": {"file": fixture["secret_file"]},
+            "grant_types": ["client_credentials"],
+            "scopes": ["pdf2md:read", "pdf2md:write"],
+        })),
+    );
+    let machine_token = OAuthClient::new(&machine)
+        .unwrap()
+        .unwrap()
+        .client_credentials()
+        .await
+        .unwrap();
+    assert_eq!(
+        history(machine_token.access_token.clone()).await,
+        StatusCode::OK
+    );
+    let machine_subject = subject(&fixture, &machine_token.access_token).await;
+    assert_ne!(machine_subject, alice);
+    cancel.cancel();
+    server.abort();
 }

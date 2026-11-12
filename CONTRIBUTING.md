@@ -86,9 +86,9 @@ directly before staging. Do not describe local checks as hosted CI, deployment,
 or end-to-end MCP client verification.
 
 Authentication, caller-boundary, and workspace tests are part of the core test
-suite. For real-provider acceptance, run `python3 scripts/test-authelia.py`
+suite. For real-provider acceptance, run `python3 scripts/test-casdoor.py`
 with Docker, OpenSSL, and Python 3 available. See
-[the Authelia harness guide](examples/authelia/README.md). The harness uses
+[the Casdoor harness guide](examples/casdoor/README.md). The harness uses
 disposable state under `/tmp`; keep live tokens and provider credentials out
 of logs and version control. This harness covers the library and HTTP boundaries;
 it does not establish MCP client or Kubernetes deployment acceptance.
@@ -96,9 +96,9 @@ The container HTTP smoke test is `python3 scripts/test-http.py IMAGE`; add
 `--minikube` for its disposable Kubernetes path. The real-provider Kubernetes
 harness is `python3 scripts/test-http-oidc.py IMAGE`. See the script prerequisites.
 
-The bundled API console uses browser JavaScript, HTML, and CSS with two-space
-indentation and LF endings (`.editorconfig`). Its JavaScript lint rules are in
-`eslint.config.mjs`. Run the pinned development lint without installing runtime
+The bundled API console and OAuth sign-in page use browser JavaScript, HTML,
+and CSS with two-space indentation and LF endings (`.editorconfig`). Their
+JavaScript lint rules are in `eslint.config.mjs`. Run the pinned development lint without installing runtime
 Node dependencies into the repository:
 
 ```sh
@@ -121,7 +121,7 @@ repository protection settings is a separate operator action.
 
 Each push and pull request runs workflow/pin checks, API-console lint, Rust
 formatting and workspace Clippy, core PostgreSQL tests, an isolated destructive
-conversion migration, worker unit tests, browser integration, full Authelia
+conversion migration, worker unit tests, browser integration, full Casdoor
 acceptance, Docker CLI/conversion/HTTP/MCP tests, and separate
 conversion/HTTP/OIDC Minikube harnesses. Native executables and images are built
 once per architecture and shared within the run. Consumers verify commit,
@@ -203,14 +203,14 @@ export CI_IMAGE=pdf2md-mcp:ci-local PDF2MD_FIXTURE_IMAGE=pdf2md-fixture:ci-local
 ```
 
 Run `bash scripts/ci/run.sh LANE`
-with any of: `core-postgres`, `cli`, `conversion`, `http`, `browser`, `authelia`,
+with any of: `core-postgres`, `cli`, `conversion`, `http`, `browser`, `casdoor`,
 `k8s-conversion`, `k8s-http`, `k8s-oidc`, `browser-extended`, or `oidc-live`.
 The CLI lane also tests PostgreSQL. The core lane creates separate empty
 databases for ordinary tests and the destructive migration; never substitute
 an application database.
 
 Browser and provider harnesses accept verified prebuilt executables through
-`PDF2MD_BROWSER_TEST_EXECUTABLE` and `PDF2MD_LIVE_AUTHELIA_TEST_EXECUTABLE`.
+`PDF2MD_BROWSER_TEST_EXECUTABLE` and `PDF2MD_LIVE_CASDOOR_TEST_EXECUTABLE`.
 `PDF2MD_TEST_WORKER` selects the browser worker. Omit these settings to use the
 existing Cargo build paths. Required CI invokes
 `python3 scripts/test-http-oidc.py IMAGE --source-mode fixture`; `--source-mode live`

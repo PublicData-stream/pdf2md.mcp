@@ -3,14 +3,25 @@ mode = "oauth2"
 
 [auth.oidc]
 issuer = "https://auth.example.com"
-audience = "https://pdf.example.com"
+audience = "https://pdf.example.com/"
 validation = "introspection"
-access_token_prefix = "authelia_at_"
-client_id = "pdf2md-resource"
+token_profile = "casdoor"
+client_id = "pdf2md-web"
 client_secret = { env = "PDF2MD_OIDC_CLIENT_SECRET" }
 read_scope = "pdf2md:read"
 write_scope = "pdf2md:write"
 operate_scope = "pdf2md:operate"
+# Casdoor binds Implicit and Client Credentials tokens to the client ID.
+# additional_audiences = ["pdf2md-web"]
+
+# Optional: obtain tokens for callers. Register
+# https://pdf.example.com/oauth/callback as a redirect URI.
+[auth.client]
+client_id = "pdf2md-web"
+client_secret = { env = "PDF2MD_OIDC_CLIENT_SECRET" }
+grant_types = ["authorization_code", "device_code", "refresh_token"]
+scopes = ["pdf2md:read", "pdf2md:write"]
+redirect_base_url = "https://pdf.example.com"
 
 [http]
 bind = "127.0.0.1:8080"

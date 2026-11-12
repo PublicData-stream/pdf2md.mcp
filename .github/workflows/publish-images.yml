@@ -1,0 +1,132 @@
+name: Publish runtime images
+
+on:
+  release:
+    types: [published]
+  push:
+    tags: ['*.*.*-build.*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing strict stable, beta, or build tag to publish or retry
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# GHCR has no transaction spanning several tags. Keep writers in this workflow
+# serialized; a replaced pending run can be retried through manual dispatch.
+concurrency:
+  group: pdf2md-runtime-publication
+  cancel-in-progress: false
+
+env:
+  CARGO_TARGET_DIR: /tmp/rust/target
+  TMPDIR: /tmp
+  PYTHONDONTWRITEBYTECODE: '1'
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+
+jobs:
+  resolve:
+    name: Resolve tested release source
+    if: github.repository == 'PublicData-stream/pdf2md.mcp'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      revision: ${{ steps.resolve.outputs.revision }}
+      trusted_revision: ${{ steps.trusted.outputs.revision }}
+      run_id: ${{ steps.resolve.outputs.run_id }}
+      amd64_artifact_id: ${{ steps.resolve.outputs.amd64_artifact_id }}
+      arm64_artifact_id: ${{ steps.resolve.outputs.arm64_artifact_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Pin trusted publication implementation
+        id: trusted
+        run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Resolve tag, versions, CI, and image artifacts
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+        run: python3 scripts/ci/release.py resolve --output-dir /tmp/pdf2md-release/plan
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-plan
+          path: /tmp/pdf2md-release/plan
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish exact tested runtime images
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.trusted_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/ci-setup
+        with:
+          docker: 'true'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-plan
+          path: /tmp/pdf2md-release/plan
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.resolve.outputs.amd64_artifact_id }}
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.resolve.outputs.run_id }}
+          path: /tmp/pdf2md-release/images/amd64
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.resolve.outputs.arm64_artifact_id }}
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.resolve.outputs.run_id }}
+          path: /tmp/pdf2md-release/images/arm64
+      - name: Validate both archives and loaded images before authentication
+        run: python3 scripts/ci/publish.py validate --plan /tmp/pdf2md-release/plan/plan.json --artifacts-dir /tmp/pdf2md-release/images --output-dir /tmp/pdf2md-release/evidence
+      - name: Recheck release and CI identity before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/release.py recheck --plan /tmp/pdf2md-release/plan/plan.json
+      - name: Publish platform manifests and multi-platform index
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          python3 scripts/ci/publish.py publish --plan /tmp/pdf2md-release/plan/plan.json --artifacts-dir /tmp/pdf2md-release/images --output-dir /tmp/pdf2md-release/evidence
+      - name: Verify public images and promote stable aliases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci/publish.py verify --plan /tmp/pdf2md-release/plan/plan.json --output-dir /tmp/pdf2md-release/evidence --anonymous
+          python3 scripts/ci/release.py recheck --plan /tmp/pdf2md-release/plan/plan.json
+          python3 scripts/ci/publish.py aliases --plan /tmp/pdf2md-release/plan/plan.json --output-dir /tmp/pdf2md-release/evidence
+      - name: Remove registry credentials
+        if: always()
+        run: docker logout ghcr.io
+      - name: Save publication evidence, including partial results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ghcr-publication
+          path: /tmp/pdf2md-release/evidence
+          if-no-files-found: warn
+          retention-days: 90

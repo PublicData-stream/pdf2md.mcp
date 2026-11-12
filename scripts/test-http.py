@@ -80,6 +80,11 @@ def exercise(base):
     assert request(base, prefix + "/assets/" + assets[0].removeprefix("assets/"))
     with zipfile.ZipFile(io.BytesIO(request(base, prefix + "/bundle.zip"))) as bundle:
         assert "document.md" in bundle.namelist() and assets[0] in bundle.namelist()
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("mcp_smoke", Path(__file__).with_name("mcp-smoke.py"))
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    smoke.exercise(base, conversion, markdown)
     return document, conversion
 
 
@@ -87,13 +92,17 @@ def verify_restart(base, document, conversion):
     ready(base)
     assert "Conversion smoke test" in request(base, "/v1/conversions/" + conversion + "/markdown").decode()
     assert document in request(base, "/v1/history").decode()
+    spec = importlib.util.spec_from_file_location("mcp_smoke", Path(__file__).with_name("mcp-smoke.py"))
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    smoke.call(base, "read", {"conversion_id": conversion})
 
 
 def docker_smoke(image, base):
     root = base / "data"
     root.mkdir()
     config = base / "config.toml"
-    config.write_text('[auth]\nmode = "none_rw"\n')
+    config.write_text('[auth]\nmode = "none_rw"\n[mcp]\nenabled = true\n')
     config.chmod(0o444)
     name = "pdf2md-http-" + uuid.uuid4().hex[:10]
     mount = ["--mount", f"type=bind,src={root},dst=/data"]
@@ -129,7 +138,7 @@ def minikube_smoke(image, base):
         invoke([*mk, "start", "--driver=docker", "--cpus=2", "--memory=3072", "--container-runtime=containerd"], env=env, timeout=600)
         print("Loading HTTP image into Minikube", flush=True)
         invoke([*mk, "image", "load", image], env=env, timeout=600)
-        config = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "config"}, "data": {"config.toml": '[auth]\nmode = "none_rw"\n'}}
+        config = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "config"}, "data": {"config.toml": '[auth]\nmode = "none_rw"\n[mcp]\nenabled = true\n'}}
         pvc = {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": "data"}, "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}}
         deployment = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "http"}, "spec": {"replicas": 1, "strategy": {"type": "Recreate"}, "selector": {"matchLabels": {"app": "http"}}, "template": {"metadata": {"labels": {"app": "http"}}, "spec": {"securityContext": {"runAsNonRoot": True, "runAsUser": 10001, "runAsGroup": 10001, "fsGroup": 10001}, "containers": [{"name": "http", "image": image, "imagePullPolicy": "Never", "args": ["--data-dir", "/data", "--config", "/etc/pdf2md/config.toml", "serve", "--listen", "0.0.0.0:8080"], "ports": [{"containerPort": 8080}], "readinessProbe": {"httpGet": {"path": "/readyz", "port": 8080}}, "volumeMounts": [{"name": "data", "mountPath": "/data"}, {"name": "config", "mountPath": "/etc/pdf2md/config.toml", "subPath": "config.toml", "readOnly": True}]}], "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "data"}}, {"name": "config", "configMap": {"name": "config"}}]}}}}
         path = base / "resources.json"

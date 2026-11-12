@@ -51,3 +51,16 @@ schemas, and [zip](https://github.com/zip-rs/zip2) (MIT) for bundle archives.
 files distributed with these locked crates under
 `/usr/share/licenses/pdf2md-mcp/http/`. The API console is repository-owned
 HTML, CSS and JavaScript and loads no third-party browser assets.
+
+## MCP and Markdown indexing
+
+The MCP endpoint uses the official [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk)
+(`rmcp` and `rmcp-macros`, Apache-2.0). Markdown structure indexing uses
+[pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark) (MIT).
+`Cargo.lock` records the exact versions. The container copies license files
+from these locked crates under `/usr/share/licenses/pdf2md-mcp/http/`.
+
+The runtime image installs Debian's [ripgrep](https://github.com/BurntSushi/ripgrep)
+package (MIT OR Unlicense); its package copyright and license information
+is available under `/usr/share/doc/ripgrep/`. The service invokes ripgrep
+only with server-constructed arguments against verified Markdown input.

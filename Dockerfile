@@ -46,7 +46,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && install -D /tmp/rust/target/release/pdf2md-obscura-worker /out/pdf2md-obscura-worker \
     && python3 -c 'import json,pathlib,shutil,subprocess; m=json.loads(subprocess.check_output(["cargo","metadata","--locked","--format-version=1"])); p=next(p for p in m["packages"] if p["name"]=="obscura-browser" and (p.get("source") or "").endswith("#e3007167016b169bb58d8b5124ca9662a0b37f2d")); d=pathlib.Path(p["manifest_path"]).parent; parents=[d,*list(d.parents)[:4]]; license_path=next(x/"LICENSE" for x in parents if (x/"LICENSE").is_file()); o=pathlib.Path("/out/obscura"); o.mkdir(parents=True,exist_ok=True); shutil.copy2(license_path,o/"LICENSE"); n=license_path.parent/"NOTICE"; n.exists() and shutil.copy2(n,o/"NOTICE"); q=next(p for p in m["packages"] if p["name"]=="pdf_oxide" and p["version"]=="0.3.78"); d=pathlib.Path(q["manifest_path"]).parent; o=pathlib.Path("/out/pdf_oxide"); o.mkdir(parents=True,exist_ok=True); [shutil.copy2(d/n,o/n) for n in ("LICENSE-MIT","LICENSE-APACHE","NOTICE")]'
 
-RUN python3 -c 'import json,pathlib,shutil,subprocess; m=json.loads(subprocess.check_output(["cargo","metadata","--locked","--format-version=1"])); [(lambda p: [(lambda f: (pathlib.Path("/out/http",p["name"]).mkdir(parents=True,exist_ok=True),shutil.copy2(f,pathlib.Path("/out/http",p["name"],f.name))))(f) for f in pathlib.Path(p["manifest_path"]).parent.glob("LICENSE*") if f.is_file()])(p) for p in m["packages"] if p["name"] in ("axum","utoipa","zip")]'
+RUN python3 -c 'import json,pathlib,shutil,subprocess; m=json.loads(subprocess.check_output(["cargo","metadata","--locked","--format-version=1"])); [(lambda p: [(lambda f: (pathlib.Path("/out/http",p["name"]).mkdir(parents=True,exist_ok=True),shutil.copy2(f,pathlib.Path("/out/http",p["name"],f.name))))(f) for f in pathlib.Path(p["manifest_path"]).parent.glob("LICENSE*") if f.is_file()])(p) for p in m["packages"] if p["name"] in ("axum","utoipa","zip","rmcp","rmcp-macros","pulldown-cmark")]'
 
 FROM debian:bookworm-slim AS runtime
 
@@ -56,6 +56,7 @@ RUN apt-get update \
         libgcc-s1 \
         libssl3 \
         libstdc++6 \
+        ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home --home-dir /home/pdf2md \
         --shell /usr/sbin/nologin pdf2md \

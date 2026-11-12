@@ -35,6 +35,7 @@ def load(name, path):
 
 provider = load("authelia_harness", "test-authelia.py")
 conversion = load("conversion_harness", "test-conversion.py")
+mcp = load("mcp_smoke", "mcp-smoke.py")
 ISSUER = "https://127.0.0.1:9091"
 SCOPE = "openid offline_access pdf2md:read pdf2md:write pdf2md:operate"
 
@@ -48,7 +49,10 @@ def invoke(args, *, env=None, timeout=120):
 
 
 def config(mode):
-    return f'''[auth]
+    return f'''[mcp]
+enabled = true
+resource_url = "{provider.AUDIENCE}"
+[auth]
 mode = "oauth2"
 [auth.oidc]
 issuer = "{ISSUER}"
@@ -180,6 +184,10 @@ def run_test(base, control, password, secret):
     expect(base, "GET", prefix + "/assets/" + assets[0].removeprefix("assets/"), 200, a)
     with zipfile.ZipFile(io.BytesIO(expect(base, "GET", prefix + "/bundle.zip", 200, a))) as archive:
         if not {"manifest.json", "document.md", assets[0]}.issubset(archive.namelist()): raise RuntimeError("conversion bundle incomplete")
+    markdown = expect(base, "GET", prefix + "/markdown", 200, a).decode()
+    mcp.exercise(base, job["conversion_id"], markdown, readonly["access_token"], b)
+    if mcp.request(base, "tools/list")[0] != 401:
+        raise RuntimeError("MCP accepted missing bearer token")
     print("PASS opaque OIDC HTTP upload, conversion, bundle, scopes and workspace isolation", flush=True)
     # Report the scheduled acquisition and the explicit source request separately.
     before = {j["id"] for j in json.loads(expect(base, "GET", "/v1/jobs", 200, a))["items"]}
@@ -211,6 +219,8 @@ def run_test(base, control, password, secret):
     status, _, _ = control.request("/api/oidc/revocation", {"token": a, "token_type_hint": "access_token"}, form=True, auth=("pdf2md-opaque", secret))
     if status != 200: raise RuntimeError("opaque token revocation failed")
     expect(base, "GET", "/v1/history", 401, a)
+    if mcp.request(base, "tools/list", token=a)[0] != 401:
+        raise RuntimeError("MCP accepted revoked opaque token")
     expect(base, "GET", "/v1/history", 200, b)
     print("PASS opaque revocation and unaffected second user", flush=True)
     return document, job_id, all(result["status"] == "succeeded" for result in (scheduled_result, source_result))
@@ -319,6 +329,9 @@ def main():
             expect(base, "GET", "/v1/jobs/" + job, 404, bob["access_token"])
             for kind in ("id_token", "refresh_token"):
                 expect(base, "GET", "/v1/history", 401, alice[kind])
+            converted = json.loads(expect(base, "GET", "/v1/jobs/" + job, 200, jwt))["conversion_id"]
+            markdown = expect(base, "GET", "/v1/conversions/" + converted + "/markdown", 200, jwt).decode()
+            mcp.exercise(base, converted, markdown, jwt, bob["access_token"])
             status, _, _ = control.request("/api/oidc/revocation", {"token": jwt, "token_type_hint": "access_token"}, form=True, auth=("pdf2md-jwt", secret))
             if status != 200: raise RuntimeError("JWT revocation request failed")
             expect(base, "GET", "/v1/history", 200, jwt)
@@ -330,7 +343,9 @@ def main():
                 time.sleep(duration)
                 remaining = max(0, claims["exp"] - time.time() + 2)
             expect(base, "GET", "/v1/history", 401, jwt)
-            print("PASS expired JWT rejected over HTTP", flush=True)
+            if mcp.request(base, "tools/list", token=jwt)[0] != 401:
+                raise RuntimeError("MCP accepted expired JWT")
+            print("PASS expired JWT rejected over HTTP and MCP", flush=True)
             if not browser_passed:
                 raise RuntimeError("configured browser-source acceptance did not pass")
         finally:

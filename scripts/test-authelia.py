@@ -17,13 +17,18 @@ import secrets
 import socket
 import ssl
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-IMAGE = "authelia/authelia:4.39.28@sha256:bd97cff4fcbf715b5ff1f9ae286afbe6033afce385302520b0368122d43a6f54"
+sys.dont_write_bytecode = True
+
+from ci.minikube import install_shutdown, checked_cleanup, cleanup
+
+IMAGE = os.environ.get("PDF2MD_AUTHELIA_IMAGE", "authelia/authelia:4.39.28@sha256:bd97cff4fcbf715b5ff1f9ae286afbe6033afce385302520b0368122d43a6f54")
 AUDIENCE = "https://pdf2md.example.test/"
 CALLBACK = "http://127.0.0.1:49199/callback"
 
@@ -129,6 +134,7 @@ class Client:
 
 
 def main():
+    install_shutdown()
     os.chdir(Path(__file__).resolve().parent.parent)
     os.environ["TMPDIR"] = "/tmp"
     os.environ["CARGO_TARGET_DIR"] = "/tmp/rust/target"
@@ -143,8 +149,16 @@ def main():
         cargo += ["--profile", profile, "--config", f'profile.{profile}.inherits="dev"']
     # Compile once and run the captured binary: short-lived token tests must not
     # trigger another build after token issuance or between revocation phases.
-    executable = None
-    if not os.environ.get("PDF2MD_AUTHELIA_SKIP_RUST"):
+    executable = os.environ.get("PDF2MD_LIVE_AUTHELIA_TEST_EXECUTABLE")
+    if executable:
+        executable = str(Path(executable).resolve())
+        if not Path(executable).is_file() or not os.access(executable, os.X_OK):
+            raise RuntimeError("prebuilt Authelia test executable is unavailable")
+        listed = subprocess.run([executable, "--ignored", "--list"], check=True,
+                                stdout=subprocess.PIPE, text=True, timeout=30)
+        if not any(line.endswith(": test") for line in listed.stdout.splitlines()):
+            raise RuntimeError("prebuilt Authelia executable has no ignored tests")
+    if not os.environ.get("PDF2MD_AUTHELIA_SKIP_RUST") and not executable:
         built = subprocess.run(cargo + ["--no-run", "--message-format=json"], check=True, stdout=subprocess.PIPE, text=True)
         for line in built.stdout.splitlines():
             artifact = json.loads(line)
@@ -219,7 +233,7 @@ def main():
                 time.sleep(0.5)
             else:
                 raise RuntimeError("provider failed to become ready (" + last_error + ")")
-            print("Authelia 4.39.28 ready (pinned image digest); discovery issuer matches=" + str(discovery.get("issuer") == issuer) + "; introspection advertised=" + str("introspection_endpoint" in discovery), flush=True)
+            print("Authelia ready (selected image); discovery issuer matches=" + str(discovery.get("issuer") == issuer) + "; introspection advertised=" + str("introspection_endpoint" in discovery), flush=True)
             (root / "client-secret").write_text(client_secret)
             fixture = {"secret_file": str(root / "client-secret"), "issuer": issuer, "audience": AUDIENCE, "ca_file": str(root / "ca.crt"), "client_id": "pdf2md-opaque", "client_secret": client_secret}
             for user in ["alice", "bob"]:
@@ -263,10 +277,8 @@ def main():
             subprocess.run(test, check=True, timeout=120)
             print("Live Authelia acceptance passed: both validators, scopes, two-user isolation, revocation, JWT expiry", flush=True)
         finally:
-            try:
-                subprocess.run(docker + ["rm", "--force", container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=True)
-            except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-                raise RuntimeError("disposable container cleanup failed or is unconfirmed: " + container) from None
+            cleanup("disposable Authelia container",
+                    lambda: checked_cleanup(docker + ["rm", "--force", container], timeout=30))
 
 
 if __name__ == "__main__":

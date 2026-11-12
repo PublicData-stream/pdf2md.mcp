@@ -11,8 +11,13 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import uuid
+
+sys.dont_write_bytecode = True
+
+from ci.minikube import install_shutdown, checked_cleanup, cleanup, start_args, verify_image
 
 
 def invoke(args, *, env=None, timeout=120):
@@ -70,7 +75,7 @@ def docker_smoke(image, base):
         assert json.loads(cli("conversion-history"))["bundle_id"] == attempt["bundle_id"]
         print("PASS Docker default UID 10001, network-disabled conversion, PNG export, restart persistence")
     finally:
-        invoke([*common, "--user", "0:0", "--entrypoint", "chown", image, "-R", owner, "/data"])
+        cleanup("conversion bind mount", lambda: checked_cleanup([*common, "--user", "0:0", "--entrypoint", "chown", image, "-R", owner, "/data"]))
 
 
 def minikube_smoke(image, base):
@@ -86,7 +91,7 @@ def minikube_smoke(image, base):
     started = False
     try:
         started = True
-        invoke([*mk, "start", "--driver=docker", "--cpus=2", "--memory=3072", "--container-runtime=containerd"], env=env, timeout=600)
+        invoke(start_args(mk), env=env, timeout=600)
         invoke([*mk, "image", "load", image], env=env, timeout=600)
         documents = [
             {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": namespace}},
@@ -112,6 +117,7 @@ def minikube_smoke(image, base):
                                 {"name": "fixture", "configMap": {"name": "fixture"}}]}}}}
             apply(spec, name)
             kube("wait", "--namespace", namespace, "--for=condition=complete", f"job/{name}", "--timeout=180s", timeout=200)
+            verify_image(kube, "job-name=" + name, "conversion", namespace=namespace)
             return kube("logs", "--namespace", namespace, f"job/{name}", "-c", "conversion")
         first = job("convert", "pdf2md-mcp --data-dir /data scan >/dev/null; cp /fixture/sample.pdf /data/pdfs/sample.pdf; pdf2md-mcp --data-dir /data --json scan >/dev/null; pdf2md-mcp --data-dir /data --json conversion-history")
         # Logs include the structured automatic-conversion summary on stderr.
@@ -123,10 +129,11 @@ def minikube_smoke(image, base):
         print("PASS minikube non-root Job, Markdown/PNG export and persistence across Jobs")
     finally:
         if started:
-            invoke([*mk, "delete"], env=env, timeout=180)
+            cleanup("disposable conversion profile", lambda: checked_cleanup([*mk, "delete"], env=env))
 
 
 def main():
+    install_shutdown()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image")
     parser.add_argument("--minikube", action="store_true")

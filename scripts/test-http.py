@@ -21,6 +21,10 @@ import urllib.request
 import uuid
 import zipfile
 
+sys.dont_write_bytecode = True
+
+from ci.minikube import install_shutdown, checked_cleanup, cleanup, start_args, verify_image
+
 
 def invoke(args, *, env=None, timeout=120):
     result = subprocess.run(args, env=env, text=True, capture_output=True, timeout=timeout)
@@ -121,8 +125,9 @@ def docker_smoke(image, base):
         verify_restart(url, document, conversion)
         print("PASS Docker HTTP upload, conversion, bundle and restart persistence")
     finally:
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-        subprocess.run(["docker", "run", "--rm", "--network", "none", *mount, "--user", "0:0", "--entrypoint", "chown", image, "-R", "0:0", "/data"], capture_output=True)
+        cleanup("disposable HTTP container",
+                lambda: checked_cleanup(["docker", "rm", "-f", name]),
+                lambda: checked_cleanup(["docker", "run", "--rm", "--network", "none", *mount, "--user", "0:0", "--entrypoint", "chown", image, "-R", "0:0", "/data"]))
 
 
 def minikube_smoke(image, base):
@@ -135,7 +140,7 @@ def minikube_smoke(image, base):
     forward = None
     try:
         print("Starting disposable Minikube HTTP profile", flush=True)
-        invoke([*mk, "start", "--driver=docker", "--cpus=2", "--memory=3072", "--container-runtime=containerd"], env=env, timeout=600)
+        invoke(start_args(mk), env=env, timeout=600)
         print("Loading HTTP image into Minikube", flush=True)
         invoke([*mk, "image", "load", image], env=env, timeout=600)
         config = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "config"}, "data": {"config.toml": '[auth]\nmode = "none_rw"\n[mcp]\nenabled = true\n'}}
@@ -146,6 +151,7 @@ def minikube_smoke(image, base):
         kube("apply", "-f", str(path))
         print("Waiting for Minikube HTTP deployment", flush=True)
         kube("rollout", "status", "deployment/http", "--timeout=180s", timeout=200)
+        verify_image(kube, "app=http", "http")
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
@@ -159,17 +165,25 @@ def minikube_smoke(image, base):
         forward = None
         kube("rollout", "restart", "deployment/http")
         kube("rollout", "status", "deployment/http", "--timeout=180s", timeout=200)
+        verify_image(kube, "app=http", "http")
         forward = start_forward()
         verify_restart(url, document, conversion)
         print("PASS minikube HTTP upload, conversion, bundle and rollout persistence")
     finally:
-        if forward:
-            forward.terminate()
-            forward.wait(timeout=10)
-        subprocess.run([*mk, "delete"], env=env, capture_output=True, timeout=180)
+        def stop_forward():
+            if forward:
+                forward.terminate()
+                try:
+                    forward.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    forward.kill()
+                    forward.wait(timeout=10)
+        cleanup("disposable HTTP profile", stop_forward,
+                lambda: checked_cleanup([*mk, "delete"], env=env))
 
 
 def main():
+    install_shutdown()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image")
     parser.add_argument("--minikube", action="store_true")

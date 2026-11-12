@@ -12,16 +12,32 @@ openssl pkcs8 -topk8 -nocrypt -in "$fixture_dir/key.pem" -outform der -out "$fix
 export SSL_CERT_FILE="$fixture_dir/cert.pem"
 export PDF2MD_TEST_CERT_FILE="$fixture_dir/cert.der"
 export PDF2MD_TEST_KEY_FILE="$fixture_dir/key.der"
-export PDF2MD_TEST_WORKER="$CARGO_TARGET_DIR/debug/pdf2md-obscura-worker"
-cargo build -p pdf2md-obscura-worker --locked
-cargo test -p pdf2md-mcp --lib browser_e2e --locked -- --ignored --test-threads=1 --skip browser_e2e_large --skip browser_e2e_slow | tee "$fixture_dir/test-output"
+export PDF2MD_TEST_WORKER="${PDF2MD_TEST_WORKER:-$CARGO_TARGET_DIR/debug/pdf2md-obscura-worker}"
+if [[ -n ${PDF2MD_BROWSER_TEST_EXECUTABLE:-} ]]; then
+  if [[ ! -x $PDF2MD_BROWSER_TEST_EXECUTABLE || ! -x $PDF2MD_TEST_WORKER ]]; then
+    echo "prebuilt browser test executable or worker is unavailable" >&2
+    exit 1
+  fi
+else
+  cargo build -p pdf2md-obscura-worker --locked
+fi
+run_browser_tests() {
+  local filter=$1
+  shift
+  if [[ -n ${PDF2MD_BROWSER_TEST_EXECUTABLE:-} ]]; then
+    "$PDF2MD_BROWSER_TEST_EXECUTABLE" "$filter" --ignored --test-threads=1 "$@"
+  else
+    cargo test -p pdf2md-mcp --lib "$filter" --locked -- --ignored --test-threads=1 "$@"
+  fi
+}
+run_browser_tests browser_e2e --skip browser_e2e_large --skip browser_e2e_slow | tee "$fixture_dir/test-output"
 if ! grep -Eq "^test result: ok\. [1-9][0-9]* passed;" "$fixture_dir/test-output"; then
   echo "browser integration tests did not run" >&2
   exit 1
 fi
 
 if [[ ${RUN_LARGE_PDF_TESTS:-0} == 1 ]]; then
-  cargo test -p pdf2md-mcp --lib browser_e2e_large --locked -- --ignored --test-threads=1 | tee "$fixture_dir/large-test-output"
+  run_browser_tests browser_e2e_large | tee "$fixture_dir/large-test-output"
   if ! grep -Eq "^test result: ok\. [1-9][0-9]* passed;" "$fixture_dir/large-test-output"; then
     echo "large browser integration tests did not run" >&2
     exit 1
@@ -29,7 +45,7 @@ if [[ ${RUN_LARGE_PDF_TESTS:-0} == 1 ]]; then
 fi
 
 if [[ ${RUN_SLOW_BROWSER_TESTS:-0} == 1 ]]; then
-  cargo test -p pdf2md-mcp --lib browser_e2e_slow --locked -- --ignored --test-threads=1 | tee "$fixture_dir/slow-test-output"
+  run_browser_tests browser_e2e_slow | tee "$fixture_dir/slow-test-output"
   if ! grep -Eq "^test result: ok\. [1-9][0-9]* passed;" "$fixture_dir/slow-test-output"; then
     echo "slow browser integration tests did not run" >&2
     exit 1

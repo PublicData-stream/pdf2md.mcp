@@ -12,6 +12,10 @@ import tempfile
 import time
 import uuid
 
+sys.dont_write_bytecode = True
+
+from ci.minikube import install_shutdown, cleanup
+
 CLI = os.environ.get("PDF2MD_TEST_CLI", "/tmp/rust/target/debug/pdf2md-mcp")
 IMAGE = sys.argv[1] if len(sys.argv) > 1 else "pdf2md-mcp:local"
 FIRST = b"%PDF-1.7\nsynthetic first\n%%EOF\n"
@@ -20,11 +24,49 @@ WATCHED = b"%PDF-1.7\nsynthetic watched\n%%EOF\n"
 DOCKER_USER = None
 
 
-def invoke(args, expected=0, timeout=15):
-    proc = subprocess.run(args, text=True, capture_output=True, timeout=timeout)
-    if (proc.returncode == 0) != (expected == 0):
-        raise AssertionError(f"command failed expectation: {args[0]} {args[-1]}, exit={proc.returncode}, stderr={proc.stderr}")
-    return proc
+DOCKER_TIMEOUT = 120
+
+
+def remove_container(name):
+    # --rm may already have removed it. Query only this invocation's exact name;
+    # an unavailable daemon is a cleanup failure, never evidence of absence.
+    command = ["docker", "container", "ls", "--all", "--filter", "name=^/" + name + "$", "--format", "{{.Names}}"]
+    listed = subprocess.run(command, text=True, capture_output=True, timeout=DOCKER_TIMEOUT, check=True)
+    if name not in listed.stdout.splitlines():
+        return
+    removed = subprocess.run(["docker", "rm", "--force", name], text=True, capture_output=True, timeout=DOCKER_TIMEOUT)
+    if removed.returncode:
+        # A concurrently finishing --rm container may have disappeared.
+        listed = subprocess.run(command, text=True, capture_output=True, timeout=DOCKER_TIMEOUT, check=True)
+        if name in listed.stdout.splitlines():
+            raise RuntimeError("disposable CLI container removal failed")
+
+
+def invoke(args, expected=0, timeout=None):
+    args = list(args)
+    is_docker = args[0] == "docker"
+    timeout = timeout if timeout is not None else (DOCKER_TIMEOUT if is_docker else 15)
+    name = None
+    detached = False
+    if is_docker and len(args) > 1 and args[1] == "run":
+        detached = "-d" in args or "--detach" in args
+        if "--name" in args:
+            name = args[args.index("--name") + 1]
+        else:
+            name = "pdf2md-cli-" + uuid.uuid4().hex
+            args[2:2] = ["--name", name]
+    failed = False
+    try:
+        proc = subprocess.run(args, text=True, capture_output=True, timeout=timeout)
+        if (proc.returncode == 0) != (expected == 0):
+            raise AssertionError(f"command failed expectation: {args[0]} {args[-1]}, exit={proc.returncode}, stderr={proc.stderr}")
+        return proc
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        if name and (not detached or failed):
+            cleanup("disposable CLI container", lambda: remove_container(name))
 
 
 def observations(proc):
@@ -35,7 +77,7 @@ def digest(value):
     return hashlib.sha256(value).hexdigest()
 
 
-def wait_for(check, description, timeout=15):
+def wait_for(check, description, timeout=120):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         try:
@@ -101,7 +143,7 @@ def exercise_local(root, pg=False):
 def docker_run(root, *args, expected=0):
     return invoke(["docker", "run", "--rm", "--user", DOCKER_USER,
                    "--mount", f"type=bind,src={root},dst=/data", IMAGE,
-                   "--data-dir", "/data", "--json", *args], expected=expected, timeout=20)
+                   "--data-dir", "/data", "--json", *args], expected=expected, timeout=DOCKER_TIMEOUT)
 
 
 def exercise_docker(root):
@@ -129,22 +171,20 @@ def exercise_docker(root):
         assert len(rows) == 1 and rows[0]["document_id"] == digest(b"%PDF-1.7 default user\n%%EOF\n")
         print("PASS Docker actual default UID 10001:10001 scan")
     finally:
-        subprocess.run(["docker", "run", "--rm", "--user", "0:0", "--mount", mount,
-                        "--entrypoint", "chown", IMAGE, "-R", restore_owner, "/data"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=True)
-        shutil.rmtree(smoke)
+        cleanup("default-user bind mount",
+                lambda: invoke(["docker", "run", "--rm", "--user", "0:0", "--mount", mount,
+                                "--entrypoint", "chown", IMAGE, "-R", restore_owner, "/data"]),
+                lambda: shutil.rmtree(smoke))
     assert observations(docker_run(root, "scan")) == []
     (root / "pdfs" / "container.pdf").write_bytes(FIRST)
     rows = observations(docker_run(root, "scan"))
     assert len(rows) == 1 and rows[0]["document_id"] == digest(FIRST)
     assert observations(docker_run(root, "scan")) == []
     name = "pdf2md-validation-" + uuid.uuid4().hex
-    created = False
     try:
         invoke(["docker", "run", "-d", "--name", name, "--user", DOCKER_USER,
                 "--mount", f"type=bind,src={root},dst=/data", IMAGE,
                 "--data-dir", "/data", "--json", "watch"])
-        created = True
         (root / "pdfs" / "watched.pdf").write_bytes(WATCHED)
         def observed():
             state = invoke(["docker", "inspect", "--format", "{{.State.Running}}", name]).stdout.strip()
@@ -152,7 +192,7 @@ def exercise_docker(root):
             rows = observations(docker_run(root, "status"))
             return any(row.get("document_id") == digest(WATCHED) for row in rows)
         wait_for(observed, "container watch and concurrent status")
-        invoke(["docker", "stop", "--time", "8", name], timeout=12)
+        invoke(["docker", "stop", "--time", "8", name], timeout=60)
         code = invoke(["docker", "inspect", "--format", "{{.State.ExitCode}}", name]).stdout.strip()
         assert code == "0", f"container exit {code}"
         assert not list((root / ".staging").iterdir())
@@ -162,15 +202,15 @@ def exercise_docker(root):
         assert any(row.get("outcome") == "failed" for row in observations(docker_run(root, "scan", expected=1)))
         print("PASS Docker scan, watch, concurrent status, restart history, shutdown, invalid PDF")
     finally:
-        if created:
-            subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=False)
+        cleanup("CLI watch container", lambda: remove_container(name))
 
 
 def main():
+    install_shutdown()
     if len(sys.argv) > 2:
         raise SystemExit("usage: test-cli-docker.py [image]")
-    with tempfile.TemporaryDirectory(prefix="pdf2md-cli-test-", dir="/tmp") as temp:
-        base = Path(temp)
+    base = Path(tempfile.mkdtemp(prefix="pdf2md-cli-test-", dir="/tmp"))
+    try:
         exercise_local(base / "local")
         if os.environ.get("PDF2MD_TEST_POSTGRES_URL"):
             exercise_local(base / "postgres", pg=True)
@@ -179,6 +219,8 @@ def main():
         docker = base / "docker"
         docker.mkdir()
         exercise_docker(docker)
+    finally:
+        cleanup("CLI fixture directory", lambda: shutil.rmtree(base))
 
 
 if __name__ == "__main__":

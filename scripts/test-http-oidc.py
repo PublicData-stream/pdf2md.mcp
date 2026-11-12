@@ -5,6 +5,7 @@ Usage: python3 scripts/test-http-oidc.py IMAGE
 Requires rootless Docker with its data root under /tmp, Minikube and OpenSSL.
 All credentials, Kubernetes state and configuration are disposable under /tmp.
 """
+import argparse
 import base64
 import importlib.util
 import io
@@ -27,6 +28,8 @@ import zipfile
 
 sys.dont_write_bytecode = True
 
+from ci.minikube import install_shutdown, checked_cleanup, cleanup, start_args
+
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(path))
     module = importlib.util.module_from_spec(spec)
@@ -48,7 +51,15 @@ def invoke(args, *, env=None, timeout=120):
     return result.stdout.decode()
 
 
-def config(mode):
+def source_url(source_mode):
+    if source_mode == "fixture":
+        return "https://fixture.example/sample.pdf"
+    if source_mode == "live":
+        return "https://www.rfc-editor.org/rfc/rfc9110.pdf"
+    raise RuntimeError("invalid source mode")
+
+
+def config(mode, source_mode="live"):
     return f'''[mcp]
 enabled = true
 resource_url = "{provider.AUDIENCE}"
@@ -61,19 +72,19 @@ validation = "{mode}"
 client_id = "pdf2md-opaque"
 client_secret = {{ file = "/config/client-secret" }}
 ca_file = "/config/ca.crt"
-''' + ('access_token_prefix = "authelia_at_"\n' if mode == "introspection" else 'jwt_scope_claim = "scp"\n') + '''[http]
+''' + ('access_token_prefix = "authelia_at_"\n' if mode == "introspection" else 'jwt_scope_claim = "scp"\n') + f'''[http]
 published_sources = ["fixture"]
 [[sources]]
 id = "fixture"
 mode = "obscura"
-url = "https://www.rfc-editor.org/rfc/rfc9110.pdf"
+url = "{source_url(source_mode)}"
 interval_secs = 3600
 timeout_secs = 60
 max_bytes = 10485760
 '''
 
 
-def generate(root):
+def generate(root, source_mode="live"):
     provider.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=pdf2md-test-ca", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-addext", "subjectKeyIdentifier=hash", "-keyout", str(root / "ca.key"), "-out", str(root / "ca.crt")])
     provider.run(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=127.0.0.1", "-keyout", str(root / "tls.key"), "-out", str(root / "tls.csr")])
     (root / "tls.ext").write_text("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\nauthorityKeyIdentifier=keyid,issuer\nsubjectKeyIdentifier=hash\n")
@@ -88,13 +99,18 @@ def generate(root):
     (root / "users.yml").write_text(json.dumps({"users": users}))
     (root / "configuration.yml").write_text(json.dumps(settings))
     (root / "client-secret").write_text(secret)
+    if source_mode == "fixture":
+        provider.run(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=fixture.example", "-keyout", str(root / "fixture.key"), "-out", str(root / "fixture.csr")])
+        (root / "fixture.ext").write_text("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:fixture.example\n")
+        provider.run(["openssl", "x509", "-req", "-in", str(root / "fixture.csr"), "-CA", str(root / "ca.crt"), "-CAkey", str(root / "ca.key"), "-CAcreateserial", "-days", "1", "-extfile", str(root / "fixture.ext"), "-out", str(root / "fixture.crt")])
+        (root / "sample.pdf").write_bytes(conversion.fixture())
     return password, secret
 
 
-def resources(root, image):
+def resources(root, image, source_mode="live"):
     secret_names = ("tls.crt", "tls.key", "ca.crt", "users.yml", "configuration.yml", "client-secret")
     secret = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "provider-config"}, "type": "Opaque", "data": {name: base64.b64encode((root / name).read_bytes()).decode() for name in secret_names}}
-    cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-config"}, "data": {"config.toml": config("introspection")}}
+    cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-config"}, "data": {"config.toml": config("introspection", source_mode)}}
     def pvc(name):
         return {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": name}, "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}}
     deployment = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "oidc-api"}, "spec": {"replicas": 1, "strategy": {"type": "Recreate"}, "selector": {"matchLabels": {"app": "oidc-api"}}, "template": {"metadata": {"labels": {"app": "oidc-api"}, "annotations": {"test-mode": "introspection"}}, "spec": {"securityContext": {"runAsNonRoot": True, "runAsUser": 10001, "runAsGroup": 10001, "fsGroup": 10001}, "containers": [
@@ -108,8 +124,35 @@ def resources(root, image):
     pod["volumes"].extend([{"name": "api-local-config", "emptyDir": {}}, {"name": "api-local-secret", "emptyDir": {}}])
     api_container = pod["containers"][1]
     api_container["volumeMounts"] = [{"name": "data", "mountPath": "/data"}, {"name": "api-local-config", "mountPath": "/etc/pdf2md", "readOnly": True}, {"name": "api-local-secret", "mountPath": "/config", "readOnly": True}]
+    if source_mode == "fixture":
+        fixture_secret = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "https-fixture"},
+                          "type": "Opaque", "data": {name: base64.b64encode((root / name).read_bytes()).decode()
+                          for name in ("ca.crt", "fixture.crt", "fixture.key", "sample.pdf")}}
+        pod["volumes"].append({"name": "fixture-data", "secret": {"secretName": "https-fixture"}})
+        fixture_image = os.environ.get("PDF2MD_FIXTURE_IMAGE")
+        if not fixture_image:
+            raise RuntimeError("fixture source mode requires PDF2MD_FIXTURE_IMAGE")
+        pod["hostAliases"] = [{"ip": "93.184.216.34", "hostnames": ["fixture.example"]}]
+        pod["initContainers"].insert(0, {
+            "name": "fixture-local-route", "image": fixture_image, "imagePullPolicy": "Never",
+            "args": ["route"],
+            "securityContext": {"runAsNonRoot": False, "runAsUser": 0,
+                                "allowPrivilegeEscalation": False,
+                                "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN"]}}})
+        pod["containers"].append({
+            "name": "https-fixture", "image": fixture_image, "imagePullPolicy": "Never",
+            "args": ["serve"],
+            "securityContext": {"allowPrivilegeEscalation": False,
+                                "capabilities": {"drop": ["ALL"], "add": ["NET_BIND_SERVICE"]}},
+            "readinessProbe": {"exec": {"command": ["python3", "/fixture/server.py", "ready"]},
+                               "timeoutSeconds": 5, "periodSeconds": 5},
+            "volumeMounts": [{"name": "fixture-data", "mountPath": "/fixture-data", "readOnly": True}]})
+        api_container["env"] = [{"name": "SSL_CERT_FILE", "value": "/config/ca.crt"}]
     path = root / "resources.json"
-    path.write_text(json.dumps({"apiVersion": "v1", "kind": "List", "items": [secret, cm, pvc("data"), pvc("provider-state"), deployment]}))
+    items = [secret, cm, pvc("data"), pvc("provider-state"), deployment]
+    if source_mode == "fixture":
+        items.append(fixture_secret)
+    path.write_text(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
     path.chmod(0o600)
     return path
 
@@ -156,7 +199,7 @@ def ready(base, control):
     raise RuntimeError("provider and HTTP service did not become ready")
 
 
-def run_test(base, control, password, secret):
+def run_test(base, control, password, secret, source_mode="live"):
     def tokens(user, client, scopes):
         return provider.Client(ISSUER, control.cert).tokens(user, password, "pdf2md-" + client, secret, scopes)
     alice = tokens("alice", "opaque", SCOPE)
@@ -209,11 +252,18 @@ def run_test(base, control, password, secret):
     source_result = poll(base, a, body["id"], timeout=120)
     for name, result in (("scheduled", scheduled_result), ("explicit", source_result)):
         if result["status"] == "succeeded":
+            if source_mode == "fixture":
+                expected_document = hashlib.sha256(conversion.fixture()).hexdigest()
+                if result.get("document_id") != expected_document:
+                    raise RuntimeError("fixture browser acquisition returned unexpected PDF bytes")
+                acquired = expect(base, "GET", "/v1/documents/" + expected_document + "/pdf", 200, a)
+                if acquired != conversion.fixture():
+                    raise RuntimeError("fixture browser acquisition PDF content does not match")
             print("PASS " + name + " configured browser source", flush=True)
         else:
             print(name.capitalize() + " configured browser source failed; sanitized error code=" + str(result.get("error_code")), flush=True)
     if scheduled_result["status"] != "succeeded" or source_result["status"] != "succeeded":
-        direct = json.loads(expect(base, "POST", "/v1/acquisitions", 202, a, json.dumps({"url": "https://www.rfc-editor.org/rfc/rfc9110.pdf"}).encode(), "application/json"))
+        direct = json.loads(expect(base, "POST", "/v1/acquisitions", 202, a, json.dumps({"url": source_url(source_mode)}).encode(), "application/json"))
         direct_result = poll(base, a, direct["id"], timeout=120)
         print("Direct HTTPS comparison: " + direct_result["status"] + "; sanitized error code=" + str(direct_result.get("error_code")), flush=True)
     status, _, _ = control.request("/api/oidc/revocation", {"token": a, "token_type_hint": "access_token"}, form=True, auth=("pdf2md-opaque", secret))
@@ -247,9 +297,14 @@ def local_config_digest(image):
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise RuntimeError("expected exactly one local HTTP image name")
-    image = sys.argv[1]
+    install_shutdown()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("image")
+    parser.add_argument("--source-mode", choices=("fixture", "live"), default="live")
+    args = parser.parse_args()
+    image = args.image
+    if args.source_mode == "fixture" and not os.environ.get("PDF2MD_FIXTURE_IMAGE"):
+        raise RuntimeError("fixture source mode requires PDF2MD_FIXTURE_IMAGE")
     image_index = invoke(["docker", "image", "inspect", image, "--format", "{{.Id}}"]).strip()
     expected_image_id = os.environ.get("PDF2MD_EXPECTED_IMAGE_CONFIG_DIGEST") or local_config_digest(image)
     if expected_image_id and (not expected_image_id.startswith("sha256:") or len(expected_image_id) != 71):
@@ -267,7 +322,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="pdf2md-http-oidc-", dir="/tmp") as tmp:
         root = Path(tmp)
         root.chmod(0o700)
-        password, secret = generate(root)
+        password, secret = generate(root, args.source_mode)
         env = os.environ.copy()
         env.update(MINIKUBE_HOME=str(root / "minikube"), KUBECONFIG=str(root / "kubeconfig"), TMPDIR="/tmp")
         for name in ("NO_PROXY", "no_proxy"):
@@ -304,17 +359,19 @@ def main():
                     proc.wait(timeout=10)
         try:
             started = True
-            invoke([*mk, "start", "--driver=docker", "--cpus=2", "--memory=3072", "--container-runtime=containerd"], env=env, timeout=600)
+            invoke(start_args(mk), env=env, timeout=600)
             invoke([*mk, "image", "load", image], env=env, timeout=600)
-            kube("apply", "-f", str(resources(root, image)))
+            if args.source_mode == "fixture":
+                invoke([*mk, "image", "load", os.environ["PDF2MD_FIXTURE_IMAGE"]], env=env, timeout=600)
+            kube("apply", "-f", str(resources(root, image, args.source_mode)))
             rollout()
             start_forward()
             control = provider.Client(ISSUER, root / "ca.crt")
             control.cert = root / "ca.crt"
             ready(base, control)
-            document, job, browser_passed = run_test(base, control, password, secret)
+            document, job, browser_passed = run_test(base, control, password, secret, args.source_mode)
             stop_forward()
-            cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-config"}, "data": {"config.toml": config("jwt")}}
+            cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-config"}, "data": {"config.toml": config("jwt", args.source_mode)}}
             (root / "jwt-config.json").write_text(json.dumps(cm))
             kube("apply", "-f", str(root / "jwt-config.json"))
             kube("rollout", "restart", "deployment/oidc-api")
@@ -349,11 +406,11 @@ def main():
             if not browser_passed:
                 raise RuntimeError("configured browser-source acceptance did not pass")
         finally:
-            stop_forward()
+            actions = [stop_forward]
             if started:
-                result = subprocess.run([*mk, "delete"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
-                if result.returncode: raise RuntimeError("disposable Minikube cleanup failed or is unconfirmed")
-                print("PASS disposable Minikube profile cleanup", flush=True)
+                actions.append(lambda: checked_cleanup([*mk, "delete"], env=env))
+            cleanup("disposable OIDC profile", *actions)
+            print("PASS disposable Minikube profile cleanup", flush=True)
 
 
 if __name__ == "__main__":

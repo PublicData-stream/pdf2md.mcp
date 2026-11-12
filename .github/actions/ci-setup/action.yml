@@ -53,6 +53,10 @@ runs:
       if: inputs.rust == 'true'
       shell: bash
       run: bash scripts/ci/setup-rust.sh
+    - name: Prepare rootless Docker session
+      if: inputs.docker == 'true'
+      shell: bash
+      run: bash scripts/ci/setup-docker-session.sh
     - name: Set up rootless Docker
       if: inputs.docker == 'true'
       uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0

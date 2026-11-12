@@ -102,11 +102,15 @@ indentation and LF endings (`.editorconfig`). Its JavaScript lint rules are in
 Node dependencies into the repository:
 
 ```sh
-npm_config_cache=/tmp/pdf2md-http-npm-cache npx --yes --package eslint@10.14.0 eslint src/http/docs.js eslint.config.mjs
+scripts/lint-console.sh
 ```
 
-The Rust service embeds the console assets; Node is required only for this
-optional contributor lint command.
+The helper uses Node.js 26.13.1 or newer and npm to bootstrap the exact pnpm
+version in `package.json`. It copies the lint inputs into a disposable workspace
+under `/tmp`, installs the committed lockfile with `--frozen-lockfile`, and
+removes that workspace after success or failure. Package stores and caches also
+stay under `/tmp`; no repository `node_modules` is created. The Rust service
+embeds the console assets; Node and pnpm are development tools only.
 
 ### CI coverage and reproduction
 
@@ -264,7 +268,7 @@ storage under `/tmp`; remove any daemon, builder and smoke-test resources you
 create. A passing readiness probe does not establish BuildKit, complete image
 builds, Kubernetes, native ARM64 or hosted Actions acceptance.
 
-Dependabot opens weekly action, Docker/Compose and Cargo update PRs without
+Dependabot opens weekly action, Docker/Compose, Cargo and npm update PRs without
 automatic merging. Coordinate Rust image/toolchain changes with documented
 versions. Installer versions/checksums in `scripts/ci/install-tools.sh` receive
 manual review. Native jobs and image builds limit Cargo/CMake parallelism to

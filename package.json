@@ -1,0 +1,14 @@
+{
+  "name": "pdf2md-mcp-development",
+  "private": true,
+  "packageManager": "pnpm@12.18.0",
+  "engines": {
+    "node": ">=26.13.1"
+  },
+  "scripts": {
+    "lint": "eslint src/http/docs.js eslint.config.mjs"
+  },
+  "devDependencies": {
+    "eslint": "10.14.0"
+  }
+}

@@ -33,3 +33,10 @@ updates:
     groups:
       rust-dependencies:
         patterns: ['*']
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '04:00'
+      timezone: Etc/UTC

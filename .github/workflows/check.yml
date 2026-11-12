@@ -45,7 +45,7 @@ jobs:
       - uses: ./.github/actions/ci-setup
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 26.12.1
+          node-version: 26.13.1
           package-manager-cache: false
       - name: Check workflow, pins, and helpers
         run: |
@@ -54,7 +54,7 @@ jobs:
           python3 -m unittest discover -s tests/scripts -p 'test_*.py'
           git diff --check
       - name: Lint API console
-        run: npx --yes --package eslint@10.14.0 eslint src/http/docs.js eslint.config.mjs
+        run: scripts/lint-console.sh
 
   core:
     name: ${{ matrix.check_name }}

@@ -2,3 +2,4 @@
 /pdf2md-mcp-data/
 /.env
 *.log
+/node_modules/

@@ -1,5 +1,8 @@
-# syntax=docker/dockerfile:1
-FROM rust:1.99.1-bookworm AS build
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
+
+ARG CARGO_BUILD_JOBS=2
+ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 
 ENV CARGO_HOME=/usr/local/cargo \
     CARGO_TARGET_DIR=/tmp/rust/target \
@@ -48,7 +51,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 RUN python3 -c 'import json,pathlib,shutil,subprocess; m=json.loads(subprocess.check_output(["cargo","metadata","--locked","--format-version=1"])); [(lambda p: [(lambda f: (pathlib.Path("/out/http",p["name"]).mkdir(parents=True,exist_ok=True),shutil.copy2(f,pathlib.Path("/out/http",p["name"],f.name))))(f) for f in pathlib.Path(p["manifest_path"]).parent.glob("LICENSE*") if f.is_file()])(p) for p in m["packages"] if p["name"] in ("axum","utoipa","zip","rmcp","rmcp-macros","pulldown-cmark")]'
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \

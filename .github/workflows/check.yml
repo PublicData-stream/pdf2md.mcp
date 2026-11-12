@@ -3,28 +3,417 @@ name: Rust checks
 on:
   push:
   pull_request:
+  schedule:
+    - cron: '17 3 * * *'
   workflow_dispatch:
+    inputs:
+      extended_tests:
+        description: Run large/slow browser tests and live RFC OIDC acceptance
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TARGET_DIR: /tmp/rust/target
   TMPDIR: /tmp
+  PYTHONDONTWRITEBYTECODE: '1'
+  CARGO_BUILD_JOBS: '2'
+  CMAKE_BUILD_PARALLEL_LEVEL: '2'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  npm_config_cache: /tmp/pdf2md-ci/npm
+  PDF2MD_TEST_KUBERNETES_VERSION: v1.37.0
 
 jobs:
-  core:
-    name: Format, lint, and core tests
-    runs-on: ubuntu-latest
+  source:
+    name: Workflow and source checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: 1.99.1
-          components: clippy, rustfmt
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Lint core package
-        run: cargo clippy --locked --package pdf2md-mcp --all-targets -- -D warnings
-      - name: Test core package
-        run: cargo test --locked --package pdf2md-mcp
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/ci-setup
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.12.1
+          package-manager-cache: false
+      - name: Check workflow, pins, and helpers
+        run: |
+          actionlint
+          python3 scripts/ci/check.py source
+          python3 -m unittest discover -s tests/scripts -p 'test_*.py'
+          git diff --check
+      - name: Lint API console
+        run: npx --yes --package eslint@10.14.0 eslint src/http/docs.js eslint.config.mjs
+
+  core:
+    name: ${{ matrix.check_name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            check_name: Format, lint, and core tests
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            check_name: Format, lint, and core tests (ARM64)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/ci-setup
+        with:
+          docker: 'true'
+          rust: 'true'
+          minikube: 'false'
+      - name: Format, lint, and build
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo build --locked --package pdf2md-mcp --package pdf2md-obscura-worker
+          cargo test --locked --package pdf2md-mcp --no-run --message-format=json > /tmp/pdf2md-ci/cargo.json
+      - name: Test core with PostgreSQL and isolated migration
+        run: bash scripts/ci/run.sh core-postgres
+      - name: Test browser worker
+        run: cargo test --locked --package pdf2md-obscura-worker
+      - name: Package native test executables
+        run: python3 scripts/ci/artifacts.py pack-native --cargo-json /tmp/pdf2md-ci/cargo.json --output /tmp/pdf2md-ci/native --commit "$GITHUB_SHA" --arch "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: success()
+        with:
+          name: native-${{ matrix.arch }}
+          path: /tmp/pdf2md-ci/native
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: core-${{ matrix.arch }}-diagnostics
+          path: /tmp/pdf2md-ci/diagnostics
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  images:
+    name: Build container images (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/ci-setup
+        with:
+          docker: 'true'
+          rust: 'false'
+          minikube: 'false'
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.PDF2MD_BUILDKIT_IMAGE }}
+      - name: Build exact runtime and fixture images
+        run: |
+          docker buildx build --load --platform "linux/${{ matrix.arch }}" --provenance=false --build-arg "CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS" --build-arg "CMAKE_BUILD_PARALLEL_LEVEL=$CMAKE_BUILD_PARALLEL_LEVEL" --tag "pdf2md-mcp:ci-$GITHUB_SHA-${{ matrix.arch }}" .
+          docker buildx build --load --platform "linux/${{ matrix.arch }}" --provenance=false --tag "pdf2md-fixture:ci-$GITHUB_SHA-${{ matrix.arch }}" scripts/ci/fixture
+      - name: Save image artifacts
+        run: |
+          mkdir -p /tmp/pdf2md-ci/{image,fixture}
+          docker save --output /tmp/pdf2md-ci/image/image.tar "pdf2md-mcp:ci-$GITHUB_SHA-${{ matrix.arch }}"
+          python3 scripts/ci/artifacts.py pack-image --image "pdf2md-mcp:ci-$GITHUB_SHA-${{ matrix.arch }}" --archive /tmp/pdf2md-ci/image/image.tar --output /tmp/pdf2md-ci/image --commit "$GITHUB_SHA" --arch "${{ matrix.arch }}"
+          docker save --output /tmp/pdf2md-ci/fixture/image.tar "pdf2md-fixture:ci-$GITHUB_SHA-${{ matrix.arch }}"
+          python3 scripts/ci/artifacts.py pack-image --image "pdf2md-fixture:ci-$GITHUB_SHA-${{ matrix.arch }}" --archive /tmp/pdf2md-ci/fixture/image.tar --output /tmp/pdf2md-ci/fixture --commit "$GITHUB_SHA" --arch "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: success()
+        with:
+          name: image-${{ matrix.arch }}
+          path: /tmp/pdf2md-ci/image
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: success()
+        with:
+          name: fixture-${{ matrix.arch }}
+          path: /tmp/pdf2md-ci/fixture
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  e2e:
+    name: Docker E2E (${{ matrix.arch }}, ${{ matrix.suite }})
+    needs: [core, images]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [cli, conversion, http]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/ci-setup
+        with:
+          docker: 'true'
+          rust: 'false'
+          minikube: 'false'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: native-${{ matrix.arch }}
+          path: /tmp/pdf2md-ci/native
+      - name: Restore verified native binaries
+        run: python3 scripts/ci/artifacts.py restore-native --input /tmp/pdf2md-ci/native --commit "$GITHUB_SHA" --arch "${{ matrix.arch }}"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: /tmp/pdf2md-ci/image
+      - name: Load verified runtime image
+        run: python3 scripts/ci/artifacts.py load-image --input /tmp/pdf2md-ci/image --commit "$GITHUB_SHA" --arch "${{ matrix.arch }}"
+      - name: Run harness
+        run: bash scripts/ci/run.sh "${{ matrix.suite }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: e2e-${{ matrix.arch }}-${{ matrix.suite }}-diagnostics
+          path: /tmp/pdf2md-ci/diagnostics
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  native-e2e:
+    name: Native integration (${{ matrix.arch }}, ${{ matrix.suite }})
+    needs: [core]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [browser, authelia]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/ci-setup
+        with:
+          docker: 'true'
+          rust: 'false'
+          minikube: 'false'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: native-${{ matrix.arch }}
+          path: /tmp/pdf2md-ci/native
+      - name: Restore verified native binaries
+        run: python3 scripts/ci/artifacts.py restore-native --input /tmp/pdf2md-ci/native --commit "$GITHUB_SHA" --arch "${{ matrix.arch }}"
+      - name: Run harness
+        run: bash scripts/ci/run.sh "${{ matrix.suite }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: native-e2e-${{ matrix.arch }}-${{ matrix.suite }}-diagnostics
+          path: /tmp/pdf2md-ci/diagnostics
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  kubernetes:
+    name: Kubernetes E2E (${{ matrix.arch }}, ${{ matrix.suite }})
+    needs: [images]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [k8s-conversion, k8s-http, k8s-oidc]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/ci-setup
+        with:
+          docker: 'true'
+          rust: 'false'
+          minikube: 'true'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: /tmp/pdf2md-ci/image
+      - name: Load verified runtime image
+        run: python3 scripts/ci/artifacts.py load-image --input /tmp/pdf2md-ci/image --commit "$GITHUB_SHA" --arch "${{ matrix.arch }}"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fixture-${{ matrix.arch }}
+          path: /tmp/pdf2md-ci/fixture
+      - name: Load verified fixture image
+        run: python3 scripts/ci/artifacts.py load-image --input /tmp/pdf2md-ci/fixture --commit "$GITHUB_SHA" --arch "${{ matrix.arch }}" --env-name PDF2MD_FIXTURE_IMAGE
+      - name: Run harness
+        run: bash scripts/ci/run.sh "${{ matrix.suite }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: kubernetes-${{ matrix.arch }}-${{ matrix.suite }}-diagnostics
+          path: /tmp/pdf2md-ci/diagnostics
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  extended-browser:
+    name: Extended browser (${{ matrix.arch }}, ${{ matrix.suite }})
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.extended_tests)
+    needs: [core]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [browser-extended]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/ci-setup
+        with:
+          docker: 'true'
+          rust: 'false'
+          minikube: 'false'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: native-${{ matrix.arch }}
+          path: /tmp/pdf2md-ci/native
+      - name: Restore verified native binaries
+        run: python3 scripts/ci/artifacts.py restore-native --input /tmp/pdf2md-ci/native --commit "$GITHUB_SHA" --arch "${{ matrix.arch }}"
+      - name: Run harness
+        run: bash scripts/ci/run.sh "${{ matrix.suite }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: extended-browser-${{ matrix.arch }}-${{ matrix.suite }}-diagnostics
+          path: /tmp/pdf2md-ci/diagnostics
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  extended-oidc:
+    name: Live RFC OIDC (${{ matrix.arch }}, ${{ matrix.suite }})
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.extended_tests)
+    needs: [images]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [oidc-live]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/ci-setup
+        with:
+          docker: 'true'
+          rust: 'false'
+          minikube: 'true'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: /tmp/pdf2md-ci/image
+      - name: Load verified runtime image
+        run: python3 scripts/ci/artifacts.py load-image --input /tmp/pdf2md-ci/image --commit "$GITHUB_SHA" --arch "${{ matrix.arch }}"
+      - name: Run harness
+        run: bash scripts/ci/run.sh "${{ matrix.suite }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: extended-oidc-${{ matrix.arch }}-${{ matrix.suite }}-diagnostics
+          path: /tmp/pdf2md-ci/diagnostics
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  ci-summary:
+    name: CI summary
+    if: always()
+    needs: [source, core, images, e2e, native-e2e, kubernetes, extended-browser, extended-oidc]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # Inline gate: do not execute a summary helper from PR-controlled files.
+      - name: Require every selected job group
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          EXTENDED: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.extended_tests) }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          needs = json.loads(os.environ['NEEDS_JSON'])
+          required = {'source', 'core', 'images', 'e2e', 'native-e2e', 'kubernetes'}
+          if os.environ['EXTENDED'] == 'true':
+              required |= {'extended-browser', 'extended-oidc'}
+          failed = sorted(key for key in required if needs.get(key, {}).get('result') != 'success')
+          if os.environ['EXTENDED'] != 'true':
+              failed += sorted(key for key in {'extended-browser', 'extended-oidc'}
+                               if needs.get(key, {}).get('result') != 'skipped')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write('| Job group | Result |\n|---|---|\n')
+              for key in sorted(needs):
+                  output.write(f"| {key} | {needs[key]['result']} |\n")
+          if failed:
+              raise SystemExit('Required checks did not succeed: ' + ', '.join(failed))
+          PYTHON

@@ -1,0 +1,77 @@
+name: Prepare isolated CI tools
+description: Install pinned tools and keep disposable build and Docker state in /tmp
+inputs:
+  rust:
+    description: Install Rust and browser build dependencies
+    default: 'false'
+  docker:
+    description: Start a dedicated rootless Docker daemon
+    default: 'false'
+  minikube:
+    description: Install the pinned Minikube binary
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Prepare temporary paths
+      shell: bash
+      run: |
+        mkdir -p /tmp/pdf2md-ci/{cargo,rustup,docker-config/cli-plugins,tools,diagnostics}
+        {
+          echo CARGO_HOME=/tmp/pdf2md-ci/cargo
+          echo RUSTUP_HOME=/tmp/pdf2md-ci/rustup
+          echo DOCKER_CONFIG=/tmp/pdf2md-ci/docker-config
+          echo XDG_CACHE_HOME=/tmp/pdf2md-ci/cache
+          echo MINIKUBE_HOME=/tmp/pdf2md-ci/minikube
+          echo KUBECONFIG=/tmp/pdf2md-ci/kubeconfig
+        } >> "$GITHUB_ENV"
+        echo /tmp/pdf2md-ci/tools >> "$GITHUB_PATH"
+        python3 - <<'PY'
+        import json, pathlib, platform, shutil
+        pathlib.Path('/tmp/pdf2md-ci/diagnostics/environment.json').write_text(json.dumps({
+            'architecture': platform.machine(), 'tmp_free_bytes': shutil.disk_usage('/tmp').free
+        }) + '\n')
+        PY
+        df -h /tmp
+    - name: Install checked tools
+      shell: bash
+      env:
+        INSTALL_MINIKUBE: ${{ inputs.minikube }}
+      run: bash scripts/ci/install-tools.sh
+    - name: Read image catalog
+      shell: bash
+      run: |
+        docker compose -f scripts/ci/compose.yml config --format json > /tmp/pdf2md-ci/images.json
+        python3 scripts/ci/check.py images --compose-json /tmp/pdf2md-ci/images.json
+    - name: Install native dependencies
+      if: inputs.rust == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends build-essential clang cmake libclang-dev libssl-dev llvm-dev ninja-build pkg-config python3 openssl
+    - name: Install Rust
+      if: inputs.rust == 'true'
+      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      with:
+        toolchain: 1.99.1
+        components: clippy, rustfmt
+    - name: Set up rootless Docker
+      if: inputs.docker == 'true'
+      uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0
+      with:
+        version: v29.9.3
+        rootless: true
+        set-host: true
+        runtime-basedir: /tmp/pdf2md-ci/docker-runtime
+    - name: Verify disposable daemon
+      if: inputs.docker == 'true'
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import json, pathlib, subprocess
+        info = json.loads(subprocess.check_output(['docker', 'info', '--format', '{{json .}}']))
+        assert 'name=rootless' in info['SecurityOptions'], 'rootless Docker required'
+        assert pathlib.Path(info['DockerRootDir']).resolve().is_relative_to('/tmp'), 'Docker data must be in /tmp'
+        assert info['CgroupVersion'] == '2', 'rootless Minikube requires cgroup v2'
+        print('Verified rootless Docker, /tmp storage and cgroup v2')
+        PY

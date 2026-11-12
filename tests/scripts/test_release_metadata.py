@@ -10,6 +10,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("release_metadata", ROOT / "scripts/ci/release_metadata.py")
@@ -65,6 +66,40 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         metadata.write_json(self.plan_path, self.plan)
         metadata.write_json(self.base / "report.json", self.report)
         self.args = SimpleNamespace(plan=self.plan_path, lock=self.lock, output_dir=self.base)
+
+    def test_prepared_sboms_have_fresh_serials_for_attest_cyclonedx_detection(self):
+        # actions/attest src/sbom.ts at the workflow's pinned revision requires
+        # bomFormat, serialNumber and specVersion to recognize CycloneDX.
+        # This compatibility check is not full CycloneDX schema validation.
+        serials = set()
+        scanner_serial = "urn:uuid:11111111-1111-4111-8111-111111111111"
+        for version in ("1.6", "1.7"):
+            for has_scanner_serial in (False, True):
+                for arch in metadata.ARCHES:
+                    path = self.base / ("runtime-" + arch + ".cdx.json")
+                    runtime = metadata.read_json(path)
+                    runtime["specVersion"] = version
+                    if has_scanner_serial:
+                        runtime["serialNumber"] = scanner_serial
+                    else:
+                        runtime.pop("serialNumber", None)
+                    metadata.write_json(path, runtime)
+                for generation in range(2):
+                    metadata.prepare(self.args)
+                    for target in (*metadata.ARCHES, "index"):
+                        with self.subTest(version=version, scanner_serial=has_scanner_serial,
+                                          generation=generation, target=target):
+                            sbom = metadata.read_json(self.base / ("sbom-" + target + ".cdx.json"))
+                            self.assertEqual(sbom["bomFormat"], "CycloneDX")
+                            self.assertEqual(sbom["specVersion"], version)
+                            serial = sbom["serialNumber"]
+                            identity = uuid.UUID(serial)
+                            self.assertEqual(identity.urn, serial)
+                            self.assertEqual(identity.version, 4)
+                            self.assertEqual(identity.variant, uuid.RFC_4122)
+                            self.assertNotEqual(serial, scanner_serial)
+                            self.assertNotIn(serial, serials)
+                            serials.add(serial)
 
     def test_source_inventory_is_distinguished_from_runtime_and_has_integrity(self):
         metadata.prepare(self.args)

@@ -10,6 +10,7 @@ import re
 import shutil
 import tomllib
 from urllib.parse import quote
+import uuid
 
 REPOSITORY = "PublicData-stream/pdf2md.mcp"
 IMAGE = "ghcr.io/publicdata-stream/pdf2md.mcp"
@@ -129,6 +130,7 @@ def platform_sbom(plan, row, arch, runtime, lock, lock_digest):
     }
     return {
         "bomFormat": "CycloneDX", "specVersion": runtime["specVersion"], "version": 1,
+        "serialNumber": uuid.uuid4().urn,
         "metadata": {"component": root},
         "components": [*runtime_components, inventory],
         "dependencies": scanned.get("dependencies", []),
@@ -183,6 +185,7 @@ def prepare(args):
         raise ValueError("platform SBOM schema versions disagree")
     index = {
         "bomFormat": "CycloneDX", "specVersion": sboms["amd64"]["specVersion"], "version": 1,
+        "serialNumber": uuid.uuid4().urn,
         "metadata": {"component": {"type": "container", "name": IMAGE, "version": plan["tag"],
                                     "bom-ref": IMAGE + "@" + report["index_digest"]}},
         "components": [], "dependencies": [],

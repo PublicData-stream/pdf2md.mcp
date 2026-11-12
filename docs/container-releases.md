@@ -33,9 +33,11 @@ GitHub Release. Build-candidate publication is triggered only when a matching
 tag is newly created. An existing eligible tag, including a historical tag,
 can be retried with **Actions → Publish runtime images → Run workflow** from
 `main`, supplying its exact name in `release_tag`. To retry
-`0.1.0-build.3d979305` after the workflow repair reaches `main`, start a fresh
+`0.1.0-build.a87a3361` after the SBOM workflow repair reaches `main`, start a fresh
 manual dispatch from the repaired `main`; rerunning the old publication run
-uses its old workflow revision.
+uses its old workflow revision. Keep the existing annotated tag and reuse its
+retained, tested image artifacts. Matching canonical image digests are reused;
+conflicting digests remain an error.
 
 ## Exact tested-image gate
 
@@ -122,6 +124,13 @@ Cargo.lock source inventory. That inventory lists resolved source packages,
 including optional and development packages; it is not a claim that every
 listed package is linked into the runtime executable. The aggregate index SBOM
 combines the platform SBOMs.
+
+Each generated platform or index SBOM has a fresh UUID4 URN in `serialNumber`,
+including when the same inputs are processed again. These are new composite
+documents, so they do not reuse the scanner document's serial number. The
+[pinned attestation action's CycloneDX detector](https://github.com/actions/attest/blob/1e69f48acb82d1966a394da916b4c1698aa569d6/src/sbom.ts)
+requires `bomFormat`, `serialNumber`, and `specVersion`; passing that detector
+does not establish complete CycloneDX schema validation.
 
 Verify a published image's promotion attestation against the repository,
 expected signer workflow, subject digest, and predicate type with GitHub CLI:

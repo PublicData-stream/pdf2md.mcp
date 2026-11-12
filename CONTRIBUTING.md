@@ -106,6 +106,93 @@ npm_config_cache=/tmp/pdf2md-http-npm-cache npx --yes --package eslint@10.14.0 e
 The Rust service embeds the console assets; Node is required only for this
 optional contributor lint command.
 
+### CI coverage and reproduction
+
+`.github/workflows/check.yml` runs native AMD64 and ARM64 checks on Ubuntu
+24.04. It preserves the existing AMD64 core check name and adds a stable
+`CI summary` covering every selected job group. Selecting that summary in
+repository protection settings is a separate operator action.
+
+Each push and pull request runs workflow/pin checks, API-console lint, Rust
+formatting and workspace Clippy, core PostgreSQL tests, an isolated destructive
+conversion migration, worker unit tests, browser integration, full Authelia
+acceptance, Docker CLI/conversion/HTTP/MCP tests, and separate
+conversion/HTTP/OIDC Minikube harnesses. Native executables and images are built
+once per architecture and shared within the run. Consumers verify commit,
+architecture and checksums. Image configuration IDs identify local images;
+they are not published registry digests or independent provenance.
+
+Daily runs at 03:17 UTC also run large/slow browser cases and live RFC
+acquisition through OIDC Kubernetes. Manual dispatch includes these only when
+`extended_tests` is enabled. Only superseded PR runs are cancelled. Matrix
+failures do not cancel other lanes, and the summary rejects failed, cancelled
+or unexpectedly skipped required groups.
+
+CI uses a dedicated rootless Docker daemon with storage under `/tmp`, Minikube
+1.39.0, Kubernetes 1.37.0 and containerd. Local harnesses require the same
+rootless Docker storage boundary and create fresh profiles. Keep credentials,
+certificates, Docker volumes, caches, kubeconfigs and test outputs under `/tmp`.
+Cleanup failures fail an otherwise successful lane and remain visible alongside
+an existing failure.
+
+Required OIDC checks use a synthetic HTTPS PDF in the disposable Pod. A
+test-only `NET_ADMIN` init container configures and verifies a Pod-local
+loopback route before the API starts. The fixture sidecar uses a trusted test
+CA; the API retains its normal UID, TLS checks and public-address policy.
+This is test scaffolding, not a deployment example. The harness's default
+source remains the public RFC.
+
+Run helper checks and export the image catalog from the repository root:
+
+```sh
+export CARGO_TARGET_DIR=/tmp/rust/target TMPDIR=/tmp PYTHONDONTWRITEBYTECODE=1
+actionlint
+python3 scripts/ci/check.py source
+python3 -m unittest discover -s tests/scripts -p 'test_*.py'
+docker compose -f scripts/ci/compose.yml config --format json > /tmp/pdf2md-ci-images.json
+python3 scripts/ci/check.py images --compose-json /tmp/pdf2md-ci-images.json > /tmp/pdf2md-ci-images.env
+set -a
+. /tmp/pdf2md-ci-images.env
+set +a
+export PDF2MD_TEST_KUBERNETES_VERSION=v1.37.0
+```
+
+Build the runtime and fixture images in the selected rootless daemon:
+
+```sh
+docker build --provenance=false --tag pdf2md-mcp:ci-local .
+docker build --provenance=false --tag pdf2md-fixture:ci-local scripts/ci/fixture
+export CI_IMAGE=pdf2md-mcp:ci-local PDF2MD_FIXTURE_IMAGE=pdf2md-fixture:ci-local
+```
+
+Run `bash scripts/ci/run.sh LANE`
+with any of: `core-postgres`, `cli`, `conversion`, `http`, `browser`, `authelia`,
+`k8s-conversion`, `k8s-http`, `k8s-oidc`, `browser-extended`, or `oidc-live`.
+The CLI lane also tests PostgreSQL. The core lane creates separate empty
+databases for ordinary tests and the destructive migration; never substitute
+an application database.
+
+Browser and provider harnesses accept verified prebuilt executables through
+`PDF2MD_BROWSER_TEST_EXECUTABLE` and `PDF2MD_LIVE_AUTHELIA_TEST_EXECUTABLE`.
+`PDF2MD_TEST_WORKER` selects the browser worker. Omit these settings to use the
+existing Cargo build paths. Required CI invokes
+`python3 scripts/test-http-oidc.py IMAGE --source-mode fixture`; `--source-mode live`
+retains external-source acceptance.
+
+External actions use full commit SHAs with version comments. Container images
+use digests; the shared test-image catalog is `scripts/ci/compose.yml`.
+Dependabot opens weekly action, Docker/Compose and Cargo update PRs without
+automatic merging. Coordinate Rust image/toolchain changes with documented
+versions. Installer versions/checksums in `scripts/ci/install-tools.sh` receive
+manual review. Native jobs and image builds limit Cargo/CMake parallelism to
+two; the Dockerfile exposes these as build arguments for local overrides.
+Artifacts expire after seven days; rerun the complete workflow
+when a downstream rerun's build artifacts have expired. Diagnostics contain
+allowlisted status information, never credentials or raw provider configuration.
+
+Local AMD64 results do not establish native ARM64, hosted Actions, registry
+publication, deployment, or acceptance by an external MCP client.
+
 ## Testing and Fixtures
 
 Rust unit and integration tests are the project's executable verification

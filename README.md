@@ -35,6 +35,9 @@ repository has no supported release policy.
 
 ## Build and Run
 
+See [CI coverage and reproduction](CONTRIBUTING.md#ci-coverage-and-reproduction)
+for the native architecture matrix and local Docker, Minikube, and provider checks.
+
 Build the default CLI and, when `obscura` or `browser` acquisition is needed,
 its separate worker from the repository root:
 

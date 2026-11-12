@@ -181,6 +181,27 @@ retains external-source acceptance.
 
 External actions use full commit SHAs with version comments. Container images
 use digests; the shared test-image catalog is `scripts/ci/compose.yml`.
+Rust-enabled CI jobs use the official rustup and executable proxies already
+provided by the Ubuntu AMD64 and ARM64 runners. `scripts/ci/setup-rust.sh`
+installs Rust 1.99.1 with the minimal profile plus Clippy and rustfmt into the
+isolated `/tmp/pdf2md-ci/rustup` home, without updating rustup itself. Cargo state
+stays in `/tmp/pdf2md-ci/cargo`. The helper verifies the compiler version,
+isolated sysroot and component commands, then selects the runner proxies and
+exact toolchain for subsequent steps. Missing runner tools or failed checks
+fail setup; jobs with `rust: 'false'` do not invoke it. Local development still
+accepts Rust 1.88 or newer; there is no repository toolchain override.
+
+For focused Rust setup validation, run `bash -n scripts/ci/setup-rust.sh`,
+`actionlint`, `python3 scripts/ci/check.py source` and the Python helper tests
+shown above. The setup tests use disposable state under `/tmp` and stub commands
+to cover installation failures, tool selection and step environment propagation.
+To check an actual installation, run the helper with fresh `CARGO_HOME`,
+`RUSTUP_HOME`, `GITHUB_ENV` and `GITHUB_PATH` paths under `/tmp`,
+`CARGO_TARGET_DIR=/tmp/rust/target` and `TMPDIR=/tmp`. Apply its environment and
+path files in a fresh shell, verify `cargo --version`, `rustc --version`,
+`cargo fmt --version` and `cargo clippy --version`, and compile a synthetic
+Rust program under `/tmp`. Remove the disposable setup state afterwards.
+
 Dependabot opens weekly action, Docker/Compose and Cargo update PRs without
 automatic merging. Coordinate Rust image/toolchain changes with documented
 versions. Installer versions/checksums in `scripts/ci/install-tools.sh` receive

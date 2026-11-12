@@ -51,10 +51,8 @@ runs:
         sudo apt-get install --yes --no-install-recommends build-essential clang cmake libclang-dev libssl-dev llvm-dev ninja-build pkg-config python3 openssl
     - name: Install Rust
       if: inputs.rust == 'true'
-      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      with:
-        toolchain: 1.99.1
-        components: clippy, rustfmt
+      shell: bash
+      run: bash scripts/ci/setup-rust.sh
     - name: Set up rootless Docker
       if: inputs.docker == 'true'
       uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0

@@ -6,7 +6,7 @@
     "node": ">=26.13.1"
   },
   "scripts": {
-    "lint": "eslint src/http/docs.js eslint.config.mjs"
+    "lint": "eslint src/http/docs.js src/http/oauth-implicit.js eslint.config.mjs"
   },
   "devDependencies": {
     "eslint": "10.14.0"

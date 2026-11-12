@@ -1,6 +1,7 @@
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use pdf2md_mcp::auth::{
-    AuthConfig, AuthMode, Authenticator, Identity, OidcConfig, OidcSecret, TokenValidation,
+    AuthConfig, AuthMode, Authenticator, Identity, OidcConfig, OidcSecret, TokenProfile,
+    TokenValidation,
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use serde_json::{Value, json};
@@ -65,6 +66,8 @@ impl Fixture {
                 issuer: issuer.clone(),
                 audience: "https://pdf2md.example/mcp".into(),
                 validation: method,
+                token_profile: TokenProfile::Rfc9068,
+                additional_audiences: vec![],
                 access_token_prefix: None,
                 jwt_scope_claim: "scope".into(),
                 client_id: Some("pdf2md-test".into()),
@@ -78,6 +81,7 @@ impl Fixture {
                 allowed_endpoint_origins: vec![],
                 ca_file: Some(ca),
             }),
+            client: None,
         };
         let introspection = Arc::new(Mutex::new(claims(&issuer)));
         let jwks = Arc::new(Mutex::new(json!({"keys":[jwk("first")]})));
@@ -173,6 +177,25 @@ fn token(issuer: &str, kid: &str, update: impl FnOnce(&mut Value)) -> String {
     )
     .unwrap()
 }
+/// Casdoor-format access token: `typ` `JWT`, signed `tokenType`, and `azp`.
+fn casdoor_token(issuer: &str, kid: &str, update: impl FnOnce(&mut Value)) -> String {
+    let mut claims = claims(issuer);
+    let object = claims.as_object_mut().unwrap();
+    object.remove("client_id");
+    object.remove("token_type");
+    object.insert("azp".into(), json!("pdf2md-test"));
+    object.insert("tokenType".into(), json!("access-token"));
+    update(&mut claims);
+    let mut header = Header::new(Algorithm::RS256);
+    header.typ = Some("JWT".into());
+    header.kid = Some(kid.into());
+    encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(TEST_KEY.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
 fn jwk(kid: &str) -> Value {
     json!({"kty":"RSA","use":"sig","alg":"RS256","kid":kid,"n":TEST_MODULUS,"e":"AQAB"})
 }
@@ -195,6 +218,7 @@ async fn anonymous_modes_enforce_write_policy_and_ignore_untrusted_identity() {
     let rw = Authenticator::new(AuthConfig {
         mode: AuthMode::NoneRw,
         oidc: None,
+        client: None,
     })
     .await
     .unwrap();
@@ -405,7 +429,8 @@ fn configuration_rejects_incomplete_oauth_and_keeps_secrets_redacted() {
     assert!(
         AuthConfig {
             mode: AuthMode::Oauth2,
-            oidc: None
+            oidc: None,
+            client: None,
         }
         .validate()
         .is_err()
@@ -654,7 +679,7 @@ async fn caller_boundary_keeps_user_history_and_known_pdf_hashes_private() {
 }
 
 #[tokio::test]
-async fn introspection_requires_a_token_class_and_accepts_explicit_authelia_prefix() {
+async fn introspection_requires_a_token_class_and_accepts_explicit_prefix() {
     let mut fixture = Fixture::new(TokenValidation::Introspection).await;
     fixture
         .introspection
@@ -666,24 +691,20 @@ async fn introspection_requires_a_token_class_and_accepts_explicit_authelia_pref
     let strict = Authenticator::new(fixture.config.clone()).await.unwrap();
     assert_eq!(
         strict
-            .authenticate(Some("authelia_at_synthetic"), false)
+            .authenticate(Some("vendor_at_synthetic"), false)
             .await
             .unwrap_err()
             .code,
         "auth_invalid"
     );
-    fixture.config.oidc.as_mut().unwrap().access_token_prefix = Some("authelia_at_".into());
+    fixture.config.oidc.as_mut().unwrap().access_token_prefix = Some("vendor_at_".into());
     let prefixed = Authenticator::new(fixture.config.clone()).await.unwrap();
     prefixed
-        .authenticate(Some("authelia_at_synthetic"), true)
+        .authenticate(Some("vendor_at_synthetic"), true)
         .await
         .unwrap();
     let requests = fixture.intro_count.load(Ordering::SeqCst);
-    for token in [
-        "authelia_rt_synthetic",
-        "authelia_ac_synthetic",
-        "unprefixed",
-    ] {
+    for token in ["vendor_rt_synthetic", "vendor_ac_synthetic", "unprefixed"] {
         assert_eq!(
             prefixed
                 .authenticate(Some(token), false)
@@ -706,7 +727,7 @@ async fn introspection_requires_a_token_class_and_accepts_explicit_authelia_pref
         *fixture.introspection.lock().unwrap() = response;
         assert_eq!(
             prefixed
-                .authenticate(Some("authelia_at_synthetic"), false)
+                .authenticate(Some("vendor_at_synthetic"), false)
                 .await
                 .unwrap_err()
                 .code,
@@ -718,7 +739,7 @@ async fn introspection_requires_a_token_class_and_accepts_explicit_authelia_pref
         assert!(fixture.config.validate().is_err());
     }
     let oidc = fixture.config.oidc.as_mut().unwrap();
-    oidc.access_token_prefix = Some("authelia_at_".into());
+    oidc.access_token_prefix = Some("vendor_at_".into());
     oidc.validation = TokenValidation::Jwt;
     assert!(fixture.config.validate().is_err());
 }
@@ -984,10 +1005,12 @@ async fn oauth_and_both_anonymous_modes_preserve_and_hide_each_others_data() {
         AuthConfig {
             mode: AuthMode::NoneRo,
             oidc: None,
+            client: None,
         },
         AuthConfig {
             mode: AuthMode::NoneRw,
             oidc: None,
+            client: None,
         },
         fixture.config.clone(),
     ] {
@@ -1237,4 +1260,157 @@ async fn durable_jobs_are_private_and_global_capacity_covers_multiple_identities
         service.jobs(Some("alice")).await.unwrap_err().code,
         "auth_invalid"
     );
+}
+
+#[tokio::test]
+async fn casdoor_jwt_profile_requires_signed_access_token_class_and_azp() {
+    let mut fixture = Fixture::new(TokenValidation::Jwt).await;
+    fixture.config.oidc.as_mut().unwrap().token_profile = TokenProfile::Casdoor;
+    let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
+    let issuer = fixture.issuer.clone();
+    assert_eq!(
+        auth.authenticate(Some(&casdoor_token(&issuer, "first", |_| {})), true)
+            .await
+            .unwrap(),
+        Identity::User {
+            issuer: issuer.clone(),
+            subject: "alice".into()
+        }
+    );
+    for token in [
+        // Casdoor refresh and ID tokens share the signing key and format.
+        casdoor_token(&issuer, "first", |c| {
+            c["tokenType"] = json!("refresh-token")
+        }),
+        casdoor_token(&issuer, "first", |c| c["tokenType"] = json!("id-token")),
+        casdoor_token(&issuer, "first", |c| {
+            c.as_object_mut().unwrap().remove("tokenType");
+        }),
+        casdoor_token(&issuer, "first", |c| {
+            c.as_object_mut().unwrap().remove("azp");
+        }),
+        casdoor_token(&issuer, "first", |c| c["aud"] = json!(["pdf2md-test"])),
+        // The RFC 9068 header type is not part of the Casdoor profile.
+        token(&issuer, "first", |c| c["tokenType"] = json!("access-token")),
+    ] {
+        assert_eq!(
+            auth.authenticate(Some(&token), false)
+                .await
+                .unwrap_err()
+                .code,
+            "auth_invalid"
+        );
+    }
+    // The default RFC 9068 profile rejects Casdoor's generic JWT type.
+    fixture.config.oidc.as_mut().unwrap().token_profile = TokenProfile::Rfc9068;
+    let strict = Authenticator::new(fixture.config.clone()).await.unwrap();
+    assert_eq!(
+        strict
+            .authenticate(Some(&casdoor_token(&issuer, "first", |_| {})), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+}
+
+#[tokio::test]
+async fn additional_audiences_accept_client_bound_grants_in_both_validators() {
+    let mut fixture = Fixture::new(TokenValidation::Jwt).await;
+    let issuer = fixture.issuer.clone();
+    let oidc = fixture.config.oidc.as_mut().unwrap();
+    oidc.token_profile = TokenProfile::Casdoor;
+    let machine = casdoor_token(&issuer, "first", |c| {
+        c["aud"] = json!(["pdf2md-machine"]);
+        c["sub"] = json!("admin/pdf2md-machine");
+    });
+    let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
+    assert!(auth.authenticate(Some(&machine), false).await.is_err());
+    fixture.config.oidc.as_mut().unwrap().additional_audiences = vec!["pdf2md-machine".into()];
+    let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
+    assert_eq!(
+        auth.authenticate(Some(&machine), false).await.unwrap(),
+        Identity::User {
+            issuer: issuer.clone(),
+            subject: "admin/pdf2md-machine".into()
+        }
+    );
+    let other = casdoor_token(&issuer, "first", |c| c["aud"] = json!(["other-client"]));
+    assert!(auth.authenticate(Some(&other), false).await.is_err());
+
+    let mut introspection = Fixture::new(TokenValidation::Introspection).await;
+    introspection
+        .config
+        .oidc
+        .as_mut()
+        .unwrap()
+        .additional_audiences = vec!["pdf2md-machine".into()];
+    introspection.introspection.lock().unwrap()["aud"] = json!(["pdf2md-machine"]);
+    let auth = Authenticator::new(introspection.config.clone())
+        .await
+        .unwrap();
+    auth.authenticate(Some("opaque"), false).await.unwrap();
+
+    for audiences in [
+        vec![String::new()],
+        vec!["https://pdf2md.example/mcp".into()],
+        vec!["bad\u{7}".into()],
+        (0..17).map(|i| format!("client-{i}")).collect(),
+    ] {
+        fixture.config.oidc.as_mut().unwrap().additional_audiences = audiences;
+        assert!(fixture.config.validate().is_err());
+    }
+}
+
+#[tokio::test]
+async fn casdoor_introspection_rejects_refresh_tokens_before_and_after_provider_lookup() {
+    let mut fixture = Fixture::new(TokenValidation::Introspection).await;
+    fixture.config.oidc.as_mut().unwrap().token_profile = TokenProfile::Casdoor;
+    let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
+    let issuer = fixture.issuer.clone();
+    auth.authenticate(Some(&casdoor_token(&issuer, "first", |_| {})), true)
+        .await
+        .unwrap();
+    let requests = fixture.intro_count.load(Ordering::SeqCst);
+    // Casdoor's introspection reports refresh tokens as active Bearer tokens.
+    for token in [
+        casdoor_token(&issuer, "first", |c| {
+            c["tokenType"] = json!("refresh-token")
+        }),
+        casdoor_token(&issuer, "first", |c| c["tokenType"] = json!("id-token")),
+        casdoor_token(&issuer, "first", |c| {
+            c.as_object_mut().unwrap().remove("jti");
+        }),
+        "opaque-not-a-jwt".into(),
+        "a.%%%.c".into(),
+    ] {
+        assert_eq!(
+            auth.authenticate(Some(&token), false)
+                .await
+                .unwrap_err()
+                .code,
+            "auth_invalid"
+        );
+    }
+    assert_eq!(fixture.intro_count.load(Ordering::SeqCst), requests);
+    // The introspected record must describe the same token.
+    let other = casdoor_token(&issuer, "first", |c| c["jti"] = json!("another-token"));
+    assert_eq!(
+        auth.authenticate(Some(&other), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    for (prefix, claim) in [(Some("vendor_at_"), "scope"), (None, "scp")] {
+        let oidc = fixture.config.oidc.as_mut().unwrap();
+        oidc.access_token_prefix = prefix.map(Into::into);
+        oidc.jwt_scope_claim = claim.into();
+        oidc.validation = if claim == "scp" {
+            TokenValidation::Jwt
+        } else {
+            TokenValidation::Introspection
+        };
+        assert!(fixture.config.validate().is_err());
+    }
 }

@@ -16,8 +16,11 @@ the background `watch`/`run` daemon processes pending conversions. The trusted C
 also request conversions, retry them, select pages, inspect history, and export
 verified bundles. The HTTP service provides isolated caller workspaces with
 `none_ro`, `none_rw`,
-and OIDC-backed `oauth2` modes; see [authentication](docs/authentication.md)
-and the [HTTP API](docs/http-api.md). An opt-in MCP endpoint exposes eight read-only retrieval and search tools;
+and OIDC-backed `oauth2` modes, validated against providers such as Casdoor.
+An optional registered OAuth client obtains caller tokens with Authorization
+Code with PKCE, Implicit, Device Authorization, Refresh Token and Client
+Credentials grants; Resource Owner Password Credentials is not supported. See
+[authentication](docs/authentication.md) and the [HTTP API](docs/http-api.md). An opt-in MCP endpoint exposes eight read-only retrieval and search tools;
 see [MCP tools](docs/mcp.md). There is no OCR. Runtime container image tags
 and publication evidence are documented in the
 [container release guide](docs/container-releases.md). No stable-release
@@ -144,7 +147,8 @@ curl http://127.0.0.1:8080/healthz
 
 It binds to `127.0.0.1:8080` by default. `--listen` overrides the bind address.
 Caller mode defaults to `none_ro`; `none_rw` permits shared writes, and OAuth2
-uses per-user workspaces and scopes. See the [HTTP API guide](docs/http-api.md),
+uses per-user workspaces and scopes. With `[auth.client]`, OAuth2 callers can
+sign in at `/oauth/login` or run `pdf2md-mcp oauth device`. See the [HTTP API guide](docs/http-api.md),
 [authentication guide](docs/authentication.md), and
 [Kubernetes example](examples/kubernetes/README.md).
 

@@ -227,7 +227,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [browser, authelia]
+        suite: [browser, casdoor]
         arch: [amd64, arm64]
         include:
           - arch: amd64

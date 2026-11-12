@@ -11,7 +11,9 @@ Use a trusted TLS-terminating proxy when accessing the service across a network.
 
 The default authentication mode is anonymous read-only. In `none_rw`, callers
 share one writable workspace. OAuth2 uses bearer access tokens and isolates
-workspaces by issuer and subject; it does not provide login or issue tokens.
+workspaces by issuer and subject. The service never issues tokens; an optional
+registered client under `/oauth/` obtains them from the provider (see
+[Obtaining access tokens](authentication.md#obtaining-access-tokens)).
 Read operations require the configured read scope, and mutations require both
 read and write scopes. See [authentication](authentication.md) for validation,
 provider setup, and workspace boundaries.
@@ -32,6 +34,8 @@ response fields. Main routes are:
 | `POST /v1/jobs/{id}/cancel`, `/retry` | Cancel or retry a job. |
 | `GET /v1/sources`, `POST /v1/sources/{id}/fetch` | List or fetch operator-published sources. |
 | `GET /v1/schedules`, `PUT /v1/schedules/{source_id}` | Inspect or enable/disable schedules for published sources. |
+| `GET /oauth/login`, `/oauth/callback`, `/oauth/implicit` | Optional browser sign-in (Authorization Code with PKCE, or Implicit) when `[auth.client]` enables it. |
+| `POST /oauth/device`, `POST /oauth/token` | Optional Device Authorization start, device-code polling and refresh-token exchange. |
 
 List responses contain `items` and `next_cursor`; the default page size is 100
 and the maximum is 1,000. Uploads return HTTP 201 with `observation` and
@@ -102,6 +106,8 @@ inspect the corresponding conversion job and history.
 ## Limits and deployment
 
 The upload limit inherits the configured acquisition limit (1 GiB by default).
+The `/oauth/` routes are not part of the OpenAPI document; see
+[Obtaining access tokens](authentication.md#obtaining-access-tokens).
 JSON bodies are limited to 64 KiB. HTTP defaults cap jobs at 100 per workspace
 and 1,000 total and allow four concurrent downloads. `[http]` accepts `bind`,
 `published_sources`, `per_workspace_jobs`, `total_jobs`, and `downloads`.
@@ -115,8 +121,9 @@ or per-user disk quotas.
 
 Run `python3 scripts/test-http.py IMAGE --minikube` for disposable Docker and
 anonymous RW Kubernetes workflows, including persistence across restart. Run
-`python3 scripts/test-authelia.py` for real opaque/JWT HTTP and library token,
-scope, isolation, revocation, expiry, and accepted-job recovery checks.
+`python3 scripts/test-casdoor.py` for real Casdoor grants through the registered
+client and for introspection/JWT HTTP and library token, scope, isolation,
+revocation, expiry, and accepted-job recovery checks.
 `python3 scripts/test-http-oidc.py IMAGE` exercises real OIDC inside a disposable
 Minikube deployment. Browser-source upstream acceptance is reported separately
 from authentication and conversion assertions. These harnesses keep generated

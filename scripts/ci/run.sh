@@ -117,7 +117,7 @@ case "$lane" in
   conversion) python3 scripts/test-conversion.py "${CI_IMAGE:?expected CI image}" ;;
   http) python3 scripts/test-http.py "${CI_IMAGE:?expected CI image}" ;;
   browser) scripts/test-browser.sh ;;
-  authelia) python3 scripts/test-authelia.py ;;
+  casdoor) python3 scripts/test-casdoor.py ;;
   k8s-conversion) python3 scripts/test-conversion.py "${CI_IMAGE:?expected CI image}" --minikube ;;
   k8s-http) python3 scripts/test-http.py "${CI_IMAGE:?expected CI image}" --minikube ;;
   k8s-oidc) python3 scripts/test-http-oidc.py "${CI_IMAGE:?expected CI image}" --source-mode fixture ;;

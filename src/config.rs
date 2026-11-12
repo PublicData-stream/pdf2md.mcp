@@ -341,6 +341,13 @@ impl Config {
                     *file = base.join(&*file);
                 }
             }
+            if let Some(client) = &mut cfg.auth.client
+                && let Some(secret) = &mut client.client_secret
+                && let Some(file) = &mut secret.file
+                && file.is_relative()
+            {
+                *file = base.join(&*file);
+            }
             for source in &mut cfg.sources {
                 for header in &mut source.headers {
                     relative_secret(&mut header.value, base);

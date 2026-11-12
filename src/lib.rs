@@ -9,6 +9,7 @@ pub mod jobs;
 pub mod manual;
 pub mod mcp;
 pub mod model;
+pub mod oauth;
 pub mod policy;
 pub mod runtime;
 pub mod service;

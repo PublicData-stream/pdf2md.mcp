@@ -1,6 +1,7 @@
 //! Transport-independent OAuth access-token validation.
 //!
-//! These types do not implement browser login or issue application tokens.
+//! These types validate access tokens only. Token acquisition for the optional
+//! registered client lives in [`crate::oauth`]; this module never issues tokens.
 use crate::error::{LoadError, Result};
 use futures_util::StreamExt;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
@@ -16,8 +17,11 @@ use std::{
 use tokio::sync::Mutex;
 use url::Url;
 
-const MAX_RESPONSE: usize = 256 * 1024;
-const MAX_TOKEN: usize = 64 * 1024;
+pub(crate) const MAX_RESPONSE: usize = 256 * 1024;
+pub(crate) const MAX_TOKEN: usize = 64 * 1024;
+const MAX_ADDITIONAL_AUDIENCES: usize = 16;
+/// Casdoor's signed access-token class claim and value.
+const CASDOOR_TOKEN_TYPE: &str = "access-token";
 const METADATA_TTL: Duration = Duration::from_secs(300);
 const KEY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -30,10 +34,10 @@ fn invalid() -> LoadError {
 fn forbidden() -> LoadError {
     LoadError::new("auth_forbidden", "operation is not permitted")
 }
-fn unavailable() -> LoadError {
+pub(crate) fn unavailable() -> LoadError {
     LoadError::transient("auth_unavailable", "identity provider is unavailable")
 }
-fn config_error() -> LoadError {
+pub(crate) fn config_error() -> LoadError {
     LoadError::new("auth_config", "invalid authentication configuration")
 }
 
@@ -51,6 +55,8 @@ pub enum AuthMode {
 pub struct AuthConfig {
     pub mode: AuthMode,
     pub oidc: Option<OidcConfig>,
+    /// Optional registered OAuth client used to obtain tokens for callers.
+    pub client: Option<crate::oauth::OAuthClientConfig>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -59,6 +65,18 @@ pub enum TokenValidation {
     #[default]
     Introspection,
     Jwt,
+}
+
+/// Provider-specific access-token conventions. Each profile is explicit; the
+/// validator never falls back from one profile to another.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenProfile {
+    /// RFC 9068 JWTs (`typ` `at+jwt`, `client_id`) and RFC 7662 introspection.
+    #[default]
+    Rfc9068,
+    /// Casdoor JWTs (`typ` `JWT`, signed `tokenType` `access-token`, `azp`).
+    Casdoor,
 }
 
 fn read_scope() -> String {
@@ -81,6 +99,12 @@ pub struct OidcConfig {
     pub audience: String,
     #[serde(default)]
     pub validation: TokenValidation,
+    #[serde(default)]
+    pub token_profile: TokenProfile,
+    /// Additional accepted access-token audiences, for example dedicated client
+    /// IDs whose provider cannot bind a grant to the resource (RFC 8707).
+    #[serde(default)]
+    pub additional_audiences: Vec<String>,
     /// Optional issuer-documented access-token discriminator for introspection
     /// providers that omit token_type. This never replaces introspection.
     pub access_token_prefix: Option<String>,
@@ -113,7 +137,7 @@ impl fmt::Debug for OidcSecret {
     }
 }
 impl OidcSecret {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.env.is_some() == self.file.is_some()
             || self.env.as_ref().is_some_and(|name| name.is_empty())
         {
@@ -121,7 +145,7 @@ impl OidcSecret {
         }
         Ok(())
     }
-    fn resolve(&self) -> Result<String> {
+    pub(crate) fn resolve(&self) -> Result<String> {
         self.validate()?;
         let value = if let Some(name) = &self.env {
             std::env::var(name).map_err(|_| config_error())?
@@ -141,7 +165,7 @@ impl OidcSecret {
     }
 }
 
-fn read_file(path: &std::path::Path, max: usize) -> Result<Vec<u8>> {
+pub(crate) fn read_file(path: &std::path::Path, max: usize) -> Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -161,7 +185,7 @@ fn read_file(path: &std::path::Path, max: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn https_url(value: &str) -> Result<Url> {
+pub(crate) fn https_url(value: &str) -> Result<Url> {
     let url = Url::parse(value).map_err(|_| config_error())?;
     if url.scheme() != "https"
         || url.host_str().is_none()
@@ -174,7 +198,7 @@ fn https_url(value: &str) -> Result<Url> {
     }
     Ok(url)
 }
-fn valid_scope(scope: &str) -> bool {
+pub(crate) fn valid_scope(scope: &str) -> bool {
     !scope.is_empty()
         && scope
             .bytes()
@@ -183,7 +207,7 @@ fn valid_scope(scope: &str) -> bool {
 impl AuthConfig {
     pub fn validate(&self) -> Result<()> {
         if self.mode != AuthMode::Oauth2 {
-            return if self.oidc.is_none() {
+            return if self.oidc.is_none() && self.client.is_none() {
                 Ok(())
             } else {
                 Err(config_error())
@@ -192,6 +216,15 @@ impl AuthConfig {
         let oidc = self.oidc.as_ref().ok_or_else(config_error)?;
         https_url(&oidc.issuer)?;
         if oidc.audience.is_empty()
+            || oidc.additional_audiences.len() > MAX_ADDITIONAL_AUDIENCES
+            || oidc.additional_audiences.iter().any(|value| {
+                value.is_empty()
+                    || value.len() > 1024
+                    || value == &oidc.audience
+                    || value.bytes().any(|b| b.is_ascii_control())
+            })
+            || (oidc.token_profile == TokenProfile::Casdoor
+                && (oidc.jwt_scope_claim != "scope" || oidc.access_token_prefix.is_some()))
             || !matches!(oidc.jwt_scope_claim.as_str(), "scope" | "scp")
             || (oidc.validation == TokenValidation::Introspection
                 && oidc.jwt_scope_claim != "scope")
@@ -228,6 +261,9 @@ impl AuthConfig {
                 .as_ref()
                 .ok_or_else(config_error)?
                 .validate()?;
+        }
+        if let Some(client) = &self.client {
+            client.validate(oidc)?;
         }
         Ok(())
     }
@@ -274,15 +310,7 @@ impl Authenticator {
         crate::configure_tls();
         let provider = if config.mode == AuthMode::Oauth2 {
             let oidc = config.oidc.expect("validated OIDC configuration");
-            let mut builder = reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none());
-            if let Some(path) = &oidc.ca_file {
-                let bytes = read_file(path, MAX_RESPONSE)?;
-                let certificate =
-                    reqwest::Certificate::from_pem(&bytes).map_err(|_| config_error())?;
-                builder = builder.add_root_certificate(certificate);
-            }
+            let client = provider_client(&oidc)?;
             let secret = if oidc.validation == TokenValidation::Introspection {
                 Some(
                     oidc.client_secret
@@ -295,7 +323,7 @@ impl Authenticator {
             };
             Some(Provider {
                 config: oidc,
-                client: builder.build().map_err(|_| config_error())?,
+                client,
                 secret,
                 metadata: Mutex::new(None),
                 keys: Mutex::new(KeyCache::default()),
@@ -376,6 +404,10 @@ struct Claims {
     token_use: Option<String>,
     jti: Option<String>,
     client_id: Option<String>,
+    azp: Option<String>,
+    /// Casdoor's token-class claim.
+    #[serde(rename = "tokenType")]
+    casdoor_token_type: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -391,18 +423,65 @@ impl Audience {
         }
     }
 }
+/// Accept a discovered provider endpoint only at the issuer origin or an
+/// explicitly allowed origin.
+/// Validate a provider endpoint. Unlike the issuer, an endpoint may carry a
+/// query component, which RFC 6749 section 3.1 requires clients to retain.
+pub(crate) fn provider_endpoint(config: &OidcConfig, value: &str) -> Result<Url> {
+    let url = Url::parse(value).map_err(|_| unavailable())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(unavailable());
+    }
+    let issuer = https_url(&config.issuer).map_err(|_| unavailable())?;
+    if url.origin() != issuer.origin()
+        && !config.allowed_endpoint_origins.iter().any(|allowed| {
+            Url::parse(allowed).is_ok_and(|allowed| allowed.origin() == url.origin())
+        })
+    {
+        return Err(unavailable());
+    }
+    Ok(url)
+}
+
+/// Build the HTTPS client used for provider calls, with optional extra trust.
+pub(crate) fn provider_client(config: &OidcConfig) -> Result<reqwest::Client> {
+    crate::configure_tls();
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(path) = &config.ca_file {
+        let bytes = read_file(path, MAX_RESPONSE)?;
+        let certificate = reqwest::Certificate::from_pem(&bytes).map_err(|_| config_error())?;
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder.build().map_err(|_| config_error())
+}
+
+/// Decode a JWT payload without verifying it. Use only for provider-issued
+/// tokens whose authenticity is established separately (for example by
+/// introspection of the exact token string).
+fn unverified_payload(token: &str) -> Option<Claims> {
+    use base64::Engine;
+    let mut parts = token.split('.');
+    let (Some(_), Some(payload), Some(_), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 impl Provider {
     fn endpoint(&self, value: &str) -> Result<Url> {
-        let url = https_url(value).map_err(|_| unavailable())?;
-        let issuer = https_url(&self.config.issuer).map_err(|_| unavailable())?;
-        if url.origin() != issuer.origin()
-            && !self.config.allowed_endpoint_origins.iter().any(|allowed| {
-                Url::parse(allowed).is_ok_and(|allowed| allowed.origin() == url.origin())
-            })
-        {
-            return Err(unavailable());
-        }
-        Ok(url)
+        provider_endpoint(&self.config, value)
     }
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: Url) -> Result<T> {
         let response = self
@@ -458,10 +537,14 @@ impl Provider {
             .sub
             .as_ref()
             .is_none_or(|sub| sub.is_empty() || sub.len() > 4096)
-            || claims
-                .aud
-                .as_ref()
-                .is_none_or(|aud| !aud.contains(&self.config.audience))
+            || claims.aud.as_ref().is_none_or(|aud| {
+                !aud.contains(&self.config.audience)
+                    && !self
+                        .config
+                        .additional_audiences
+                        .iter()
+                        .any(|accepted| aud.contains(accepted))
+            })
             || claims.exp.is_none_or(|exp| exp <= now)
             || claims.nbf.is_some_and(|nbf| nbf > now)
             || claims.iat.is_some_and(|iat| iat > now)
@@ -484,6 +567,24 @@ impl Provider {
         {
             return Err(invalid());
         }
+        // Casdoor introspection reports refresh tokens as active Bearer
+        // tokens. Its tokens are JWTs whose exact string the provider looks
+        // up, so the issued token-class claim distinguishes access tokens; the
+        // introspected jti must also identify the same token.
+        let casdoor_jti = if self.config.token_profile == TokenProfile::Casdoor {
+            let payload = unverified_payload(token).ok_or_else(invalid)?;
+            if payload.casdoor_token_type.as_deref() != Some(CASDOOR_TOKEN_TYPE) {
+                return Err(invalid());
+            }
+            Some(
+                payload
+                    .jti
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(invalid)?,
+            )
+        } else {
+            None
+        };
         let discovery = self.discovery().await?;
         let response = self
             .client
@@ -514,6 +615,9 @@ impl Provider {
         };
         if !claims.active
             || !access_type
+            || casdoor_jti
+                .as_ref()
+                .is_some_and(|expected| claims.jti.as_ref() != Some(expected))
             || claims
                 .token_use
                 .as_ref()
@@ -526,9 +630,14 @@ impl Provider {
     }
     async fn jwt(&self, token: &str) -> Result<Claims> {
         let header = decode_header(token).map_err(|_| invalid())?;
+        let profile = self.config.token_profile;
         if header.alg != Algorithm::RS256
-            || !header.typ.as_ref().is_some_and(|typ| {
-                typ.eq_ignore_ascii_case("at+jwt") || typ.eq_ignore_ascii_case("application/at+jwt")
+            || !header.typ.as_ref().is_some_and(|typ| match profile {
+                TokenProfile::Rfc9068 => {
+                    typ.eq_ignore_ascii_case("at+jwt")
+                        || typ.eq_ignore_ascii_case("application/at+jwt")
+                }
+                TokenProfile::Casdoor => typ.eq_ignore_ascii_case("JWT"),
             })
             || header.jku.is_some()
             || header.x5u.is_some()
@@ -590,7 +699,10 @@ impl Provider {
         validation.leeway = 0;
         validation.validate_nbf = true;
         validation.set_issuer(&[self.config.issuer.as_str()]);
-        validation.set_audience(&[self.config.audience.as_str()]);
+        let client_claim = match profile {
+            TokenProfile::Rfc9068 => "client_id",
+            TokenProfile::Casdoor => "azp",
+        };
         validation.set_required_spec_claims(&[
             "iss",
             "sub",
@@ -598,18 +710,24 @@ impl Provider {
             "exp",
             "iat",
             "jti",
-            "client_id",
+            client_claim,
         ]);
+        let mut audiences = vec![self.config.audience.as_str()];
+        audiences.extend(self.config.additional_audiences.iter().map(String::as_str));
+        validation.set_audience(&audiences);
         let mut claims = decode::<Claims>(token, &key, &validation)
             .map_err(|_| invalid())?
             .claims;
         self.validate_claims(&claims, true)?;
+        let client = match profile {
+            TokenProfile::Rfc9068 => claims.client_id.as_ref(),
+            TokenProfile::Casdoor => claims.azp.as_ref(),
+        };
         if claims.iat.is_none()
             || claims.jti.as_ref().is_none_or(|value| value.is_empty())
-            || claims
-                .client_id
-                .as_ref()
-                .is_none_or(|value| value.is_empty())
+            || client.is_none_or(|value| value.is_empty())
+            || (profile == TokenProfile::Casdoor
+                && claims.casdoor_token_type.as_deref() != Some(CASDOOR_TOKEN_TYPE))
         {
             return Err(invalid());
         }
@@ -637,7 +755,9 @@ impl Provider {
         Ok(claims)
     }
 }
-async fn decode_response<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+pub(crate) async fn decode_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T> {
     if !response.status().is_success()
         || response
             .content_length()
@@ -658,7 +778,7 @@ async fn decode_response<T: serde::de::DeserializeOwned>(response: reqwest::Resp
 }
 
 // RFC 6749 section 2.3.1 applies form encoding before HTTP Basic encoding.
-fn oauth_basic_component(value: &str) -> String {
+pub(crate) fn oauth_basic_component(value: &str) -> String {
     let encoded = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("", value)
         .finish();

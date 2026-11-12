@@ -1,4 +1,5 @@
 //! HTTP transport for the workspace-authorized caller service.
+mod oauth;
 mod spec;
 
 use crate::{auth::AuthMode, error::LoadError, service::CallerService};
@@ -54,6 +55,7 @@ pub fn router(service: Arc<CallerService>, cancel: CancellationToken) -> Router 
         .mcp
         .enabled
         .then(|| crate::mcp::router(app.service.clone(), app.cancel.clone()));
+    let oauth = app.service.oauth_client();
     let rest = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
@@ -83,6 +85,14 @@ pub fn router(service: Arc<CallerService>, cancel: CancellationToken) -> Router 
         .layer(DefaultBodyLimit::max(max))
         .layer(middleware::from_fn(response_headers))
         .with_state(app);
+    let rest = match oauth {
+        Some(client) => rest.merge(
+            oauth::router(client)
+                .layer(DefaultBodyLimit::max(JSON_LIMIT))
+                .layer(middleware::from_fn(response_headers)),
+        ),
+        None => rest,
+    };
     if let Some(mcp) = mcp {
         rest.merge(mcp)
     } else {

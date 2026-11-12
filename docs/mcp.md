@@ -37,7 +37,10 @@ header. Configure the provider to issue access tokens for the existing
 `auth.oidc.audience`, and ensure that clients requesting the advertised resource
 receive that audience. The service preserves the configured token validator;
 it does not issue tokens or register OAuth clients. Use provider-side client
-registration with Authorization Code and PKCE where appropriate.
+registration with Authorization Code and PKCE where appropriate. Tokens obtained
+through the service's optional
+[registered client](authentication.md#obtaining-access-tokens) are accepted
+like any other access token.
 
 OAuth protected-resource metadata advertises the configured issuer and read
 scope. Authentication challenges link to that metadata. Keep the public URL

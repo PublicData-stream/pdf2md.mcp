@@ -128,15 +128,15 @@ impl Provider {
                             200,
                             json!({
                                 "issuer": origin,
-                                "authorization_endpoint": format!("{origin}/authorize"),
-                                "token_endpoint": format!("{origin}/token"),
+                                "authorization_endpoint": format!("{origin}/authorize?tenant=pdf2md"),
+                                "token_endpoint": format!("{origin}/token?tenant=pdf2md"),
                                 "device_authorization_endpoint": format!("{origin}/device"),
                                 "introspection_endpoint": format!("{origin}/introspect"),
                                 "jwks_uri": format!("{origin}/jwks"),
                                 "authorization_response_iss_parameter_supported": true,
                             }),
                         ),
-                        "/token" => {
+                        "/token?tenant=pdf2md" => {
                             log.lock().unwrap().push(Recorded {
                                 path,
                                 authorization,
@@ -300,6 +300,8 @@ async fn authorization_code_login_binds_state_pkce_issuer_and_browser_cookie() {
     let api = Api::start(&provider, &[GrantType::AuthorizationCode]).await;
     let (query, set_cookie) = api.login("authorization_code").await;
     assert_eq!(query["response_type"], "code");
+    // RFC 6749 section 3.1: the endpoint query component is retained.
+    assert_eq!(query["tenant"], "pdf2md");
     assert_eq!(query["client_id"], "pdf2md-web");
     assert_eq!(query["code_challenge_method"], "S256");
     assert_eq!(query["resource"], AUDIENCE);
@@ -361,7 +363,8 @@ async fn authorization_code_login_binds_state_pkce_issuer_and_browser_cookie() {
     assert!(page.contains("access-1") && page.contains("refresh-1"));
     assert!(!page.contains("ignored"), "ID tokens are not displayed");
     let request = provider.last();
-    assert_eq!(request.path, "/token");
+    // RFC 6749 section 3.2: the endpoint query component is retained.
+    assert_eq!(request.path, "/token?tenant=pdf2md");
     assert_eq!(request.form["grant_type"], "authorization_code");
     assert_eq!(request.form["code"], "abc");
     assert_eq!(request.form["resource"], AUDIENCE);
@@ -568,6 +571,17 @@ async fn library_client_credentials_and_device_polling_use_registered_client() {
         client.wait_for_device(&device).await.unwrap_err().code,
         "oauth_access_denied"
     );
+    // Expiry is reported within the code lifetime, not after a long interval.
+    let mut short = device.clone();
+    short.expires_in = 1;
+    short.interval = 3600;
+    let expired = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.wait_for_device(&short),
+    )
+    .await
+    .expect("device expiry is reported without waiting for the interval");
+    assert_eq!(expired.unwrap_err().code, "oauth_expired_token");
     provider
         .token_responses
         .lock()
@@ -629,6 +643,13 @@ scopes = ["pdf2md:read"]
         parse("grant_types = [\"implicit\"]\nredirect_base_url = \"http://pdf.example\"\n")
             .is_err()
     );
+    // RFC 8707 resources may be any absolute URI without a fragment.
+    assert!(parse("grant_types = [\"device_code\"]\nresource = \"urn:pdf2md:api\"\n").is_ok());
+    assert!(
+        parse("grant_types = [\"device_code\"]\nresource = \"https://pdf.example/#api\"\n")
+            .is_err()
+    );
+    assert!(parse("grant_types = [\"device_code\"]\nresource = \"pdf2md-api\"\n").is_err());
     // Client settings are rejected outside OAuth2 mode.
     let anonymous: Config = toml::from_str(
         "[auth]\nmode = \"none_rw\"\n[auth.client]\nclient_id = \"x\"\ngrant_types = [\"device_code\"]\nscopes = [\"a\"]\n",

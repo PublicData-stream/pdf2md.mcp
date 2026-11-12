@@ -114,7 +114,8 @@ impl OAuthClientConfig {
         }
         let resource = self.resource.as_deref().unwrap_or(&oidc.audience);
         let parsed = Url::parse(resource).map_err(|_| config_error())?;
-        if parsed.fragment().is_some() || parsed.cannot_be_a_base() {
+        // RFC 8707 section 2: any absolute URI without a fragment, such as a URN.
+        if parsed.fragment().is_some() {
             return Err(config_error());
         }
         Ok(())
@@ -519,7 +520,9 @@ impl OAuthClient {
         let deadline = Instant::now() + Duration::from_secs(device.expires_in);
         let mut interval = Duration::from_secs(device.interval.max(1));
         loop {
-            tokio::time::sleep(interval).await;
+            // Never wait past the device code's lifetime to report expiry.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(interval.min(remaining)).await;
             if Instant::now() >= deadline {
                 return Err(oauth_error("expired_token"));
             }

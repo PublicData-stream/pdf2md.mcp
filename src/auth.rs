@@ -425,8 +425,18 @@ impl Audience {
 }
 /// Accept a discovered provider endpoint only at the issuer origin or an
 /// explicitly allowed origin.
+/// Validate a provider endpoint. Unlike the issuer, an endpoint may carry a
+/// query component, which RFC 6749 section 3.1 requires clients to retain.
 pub(crate) fn provider_endpoint(config: &OidcConfig, value: &str) -> Result<Url> {
-    let url = https_url(value).map_err(|_| unavailable())?;
+    let url = Url::parse(value).map_err(|_| unavailable())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(unavailable());
+    }
     let issuer = https_url(&config.issuer).map_err(|_| unavailable())?;
     if url.origin() != issuer.origin()
         && !config.allowed_endpoint_origins.iter().any(|allowed| {

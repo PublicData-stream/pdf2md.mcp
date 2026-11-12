@@ -68,12 +68,4 @@ runs:
     - name: Verify disposable daemon
       if: inputs.docker == 'true'
       shell: bash
-      run: |
-        python3 - <<'PY'
-        import json, pathlib, subprocess
-        info = json.loads(subprocess.check_output(['docker', 'info', '--format', '{{json .}}']))
-        assert 'name=rootless' in info['SecurityOptions'], 'rootless Docker required'
-        assert pathlib.Path(info['DockerRootDir']).resolve().is_relative_to('/tmp'), 'Docker data must be in /tmp'
-        assert info['CgroupVersion'] == '2', 'rootless Minikube requires cgroup v2'
-        print('Verified rootless Docker, /tmp storage and cgroup v2')
-        PY
+      run: python3 scripts/ci/verify-docker.py

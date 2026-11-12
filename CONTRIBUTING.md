@@ -132,8 +132,20 @@ CI uses a dedicated rootless Docker daemon with storage under `/tmp`, Minikube
 1.39.0, Kubernetes 1.37.0 and containerd. Local harnesses require the same
 rootless Docker storage boundary and create fresh profiles. Keep credentials,
 certificates, Docker volumes, caches, kubeconfigs and test outputs under `/tmp`.
-Cleanup failures fail an otherwise successful lane and remain visible alongside
-an existing failure.
+Before starting Docker, CI starts the runner's user manager and D-Bus socket,
+checks delegated CPU, memory and process controllers, and exports the verified
+user bus address. The setup action keeps its own daemon runtime under `/tmp`;
+the explicit bus address connects containerd/runc to the user manager despite
+that runtime-directory override. The host's existing systemd/D-Bus facilities
+remain host-managed.
+
+The Docker readiness probe starts a networkless container from the pinned
+PostgreSQL catalog image with an overridden shell entrypoint. It checks the
+effective cgroup CPU quota, memory ceiling and process limit, then removes the
+container. Metadata checks alone do not establish container readiness. Fixed
+probe/cleanup status codes are retained in diagnostics, including failed image
+build jobs. Cleanup failures fail an otherwise successful lane and remain
+visible alongside an existing failure.
 
 Required OIDC checks use a synthetic HTTPS PDF in the disposable Pod. A
 test-only `NET_ADMIN` init container configures and verifies a Pod-local
@@ -201,6 +213,21 @@ To check an actual installation, run the helper with fresh `CARGO_HOME`,
 path files in a fresh shell, verify `cargo --version`, `rustc --version`,
 `cargo fmt --version` and `cargo clippy --version`, and compile a synthetic
 Rust program under `/tmp`. Remove the disposable setup state afterwards.
+
+For focused Docker setup validation, run `bash -n scripts/ci/setup-docker-session.sh`,
+`actionlint`, `python3 scripts/ci/check.py source` and the Python helper tests
+above. The offline tests cover user-session failures, environment propagation,
+missing delegation, rejected daemon metadata, ignored limits and cleanup,
+including interruption. On a Linux host with a user systemd manager and the
+required delegated controllers, run the session helper with `GITHUB_ENV` set
+to a disposable file under `/tmp`. It enables lingering for the current user
+and starts the user manager and D-Bus socket; it does not restart existing
+Docker services. Apply the exported bus address before starting a separate
+rootless daemon. After exporting the pinned image catalog, run
+`python3 scripts/ci/verify-docker.py`. Run live daemon checks only with Docker
+storage under `/tmp`; remove any daemon, builder and smoke-test resources you
+create. A passing readiness probe does not establish BuildKit, complete image
+builds, Kubernetes, native ARM64 or hosted Actions acceptance.
 
 Dependabot opens weekly action, Docker/Compose and Cargo update PRs without
 automatic merging. Coordinate Rust image/toolchain changes with documented

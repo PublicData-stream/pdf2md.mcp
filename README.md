@@ -238,8 +238,10 @@ PostgreSQL integration cases skip their PostgreSQL path when
 external database paths. Other storage tests use SQLite. The
 browser end-to-end cases are ignored in the default test run; the script builds
 the worker and uses local TLS fixtures and OpenSSL to run them. The CI workflow
-runs formatting, core lint, and core tests;
-it does not build the browser worker or Docker image.
+runs native AMD64 and ARM64 Rust checks, browser-worker builds and integration
+tests, container builds, and Docker and Kubernetes harnesses. See
+[CI coverage and reproduction](CONTRIBUTING.md#ci-coverage-and-reproduction)
+for required and extended checks and their acceptance boundaries.
 ## Container
 
 Build an image containing the CLI, conversion worker, and browser worker:

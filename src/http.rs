@@ -48,7 +48,13 @@ pub fn router(service: Arc<CallerService>, cancel: CancellationToken) -> Router 
         cancel,
         ready: Arc::new(AtomicBool::new(true)),
     };
-    Router::new()
+    let mcp = app
+        .service
+        .config()
+        .mcp
+        .enabled
+        .then(|| crate::mcp::router(app.service.clone(), app.cancel.clone()));
+    let rest = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
         .route("/openapi.json", get(openapi))
@@ -76,7 +82,12 @@ pub fn router(service: Arc<CallerService>, cancel: CancellationToken) -> Router 
         .route("/v1/conversions/{id}/bundle.zip", get(bundle))
         .layer(DefaultBodyLimit::max(max))
         .layer(middleware::from_fn(response_headers))
-        .with_state(app)
+        .with_state(app);
+    if let Some(mcp) = mcp {
+        rest.merge(mcp)
+    } else {
+        rest
+    }
 }
 
 #[derive(Debug)]

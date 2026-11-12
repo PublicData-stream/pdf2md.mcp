@@ -256,6 +256,17 @@ impl Store {
         store.verify_conversion_bundles().await?;
         Ok(store)
     }
+    pub(crate) async fn tool_documents_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<String>> {
+        sqlx::query_scalar("SELECT DISTINCT document_id FROM observations WHERE namespace=$1 AND document_id IS NOT NULL ORDER BY document_id LIMIT $2 OFFSET $3")
+            .bind(&self.namespace)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .bind(i64::try_from(offset).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool).await.map_err(db_error)
+    }
     pub async fn history_page(
         &self,
         source: Option<&str>,

@@ -450,3 +450,182 @@ async fn interrupted_publication_removes_orphan_but_preserves_committed_bundle()
     );
     drop(store);
 }
+
+#[tokio::test]
+async fn legacy_profile_survives_reopen_export_and_requires_upgrade_for_pages() {
+    use pdf2md_mcp::{
+        config::Config,
+        conversion::{Artifact, ConversionManifest},
+        service::CallerService,
+        workspace::WorkspaceRegistry,
+    };
+    use sha2::{Digest, Sha256};
+    use tokio_util::sync::CancellationToken;
+
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let registry = WorkspaceRegistry::open(root.path()).await.unwrap();
+    let shared = registry.resolve_shared(None).await.unwrap();
+    let input = root.path().join("legacy.pdf");
+    std::fs::write(&input, b"%PDF-1.4\n%%EOF\n").unwrap();
+    let store = Store::open(&shared, None).await.unwrap();
+    let document = store
+        .accept(&input, "legacy", "manual", None, "legacy")
+        .await
+        .unwrap()
+        .document_id
+        .unwrap();
+    let options = ConversionOptions::default();
+    let attempt = store
+        .request_conversion(&document, &options, false)
+        .await
+        .unwrap();
+    let content = b"<!-- pdf-page: 1 -->\n\nLegacy text\n";
+    let manifest = ConversionManifest {
+        format_version: 1,
+        document_id: document.clone(),
+        converter: "pdf_oxide/0.3.78;profile/1".into(),
+        options: options.clone(),
+        pages: vec![1],
+        warnings: vec![],
+        artifacts: vec![Artifact {
+            path: "document.md".into(),
+            sha256: format!("{:x}", Sha256::digest(content)),
+            bytes: content.len() as u64,
+        }],
+    };
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let bundle = format!("{:x}", Sha256::digest(&manifest_bytes));
+    let path = shared.join("conversions").join(&bundle);
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("manifest.json"), &manifest_bytes).unwrap();
+    std::fs::write(path.join("document.md"), content).unwrap();
+    let profile = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(&document, &manifest.converter, &options)).unwrap())
+    );
+    let fixtures = [
+        ("", 0u64, None),
+        ("가\n나", 2, Some((2u64, 2u64, 3u64))),
+        ("A\r\nB\r\n", 2, Some((1, 1, 3))),
+        ("one\ntwo", 2, Some((2, 2, 3))),
+    ];
+    let mut cases = Vec::new();
+    for (i, (text, lines, range)) in fixtures.into_iter().enumerate() {
+        let opts = ConversionOptions {
+            pages: Some(vec![i as u32 + 2]),
+        };
+        let entry = store
+            .request_conversion(&document, &opts, false)
+            .await
+            .unwrap();
+        let item = ConversionManifest {
+            format_version: 1,
+            document_id: document.clone(),
+            converter: manifest.converter.clone(),
+            options: opts.clone(),
+            pages: opts.pages.clone().unwrap(),
+            warnings: vec![],
+            artifacts: vec![Artifact {
+                path: "document.md".into(),
+                sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+                bytes: text.len() as u64,
+            }],
+        };
+        let bytes = serde_json::to_vec(&item).unwrap();
+        let id = format!("{:x}", Sha256::digest(&bytes));
+        let path = shared.join("conversions").join(&id);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("manifest.json"), bytes).unwrap();
+        std::fs::write(path.join("document.md"), text).unwrap();
+        let key = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(&document, &item.converter, &opts)).unwrap())
+        );
+        cases.push((entry.id, id, key, text, lines, range));
+    }
+    drop(store);
+    let pool = db(&shared).await;
+    for (entry, id, key, _, _, _) in &cases {
+        sqlx::query("UPDATE conversion_attempts SET status='succeeded',bundle_id=$1,profile_key=$2 WHERE id=$3").bind(id).bind(key).bind(entry).execute(&pool).await.unwrap();
+    }
+    sqlx::query(
+        "UPDATE conversion_attempts SET status='succeeded',bundle_id=$1,profile_key=$2 WHERE id=$3",
+    )
+    .bind(&bundle)
+    .bind(profile)
+    .bind(&attempt.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    let store = Store::open(&shared, None).await.unwrap();
+    assert_eq!(
+        store
+            .verified_conversion_manifest(&attempt.id)
+            .await
+            .unwrap()
+            .format_version,
+        1
+    );
+    let next = store
+        .request_conversion(&document, &options, false)
+        .await
+        .unwrap();
+    assert_ne!(next.id, attempt.id);
+    assert_eq!(next.status, "pending");
+    drop(store);
+    let output = root.path().join("legacy-export");
+    Store::export_conversion(&shared, None, &attempt.id, &output)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(output.join("document.md")).unwrap(), content);
+    assert!(!output.join("text-index.json").exists());
+    let service = CallerService::new(root.path(), Config::default(), None)
+        .await
+        .unwrap();
+    let result = service
+        .call_tool(
+            None,
+            "read-page",
+            serde_json::json!({"conversion_id":attempt.id,"pages":"1"}),
+            &CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.err().unwrap().code, "upgrade_required");
+    let cancel = CancellationToken::new();
+    for (id, _, _, text, lines, range) in cases {
+        let read = service
+            .call_tool(
+                None,
+                "read",
+                serde_json::json!({"conversion_id":id}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.text.as_deref(), Some(text));
+        for (tool, expected) in [("count", lines), ("size", text.len() as u64)] {
+            let result = service
+                .call_tool(None, tool, serde_json::json!({"conversion_id":id}), &cancel)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.data["results"][0]["value"], expected,
+                "{tool} for {text:?}"
+            );
+        }
+        let (start, end, size) = range.unwrap_or((1, 1, 0));
+        for (tool, expected) in [("count", end - start + 1), ("size", size)] {
+            let result = service.call_tool(None, tool, serde_json::json!({"conversion_id":id,"selectors":[{"kind":"lines","start":start,"end":end}]}), &cancel).await;
+            if range.is_some() {
+                assert_eq!(
+                    result.unwrap().data["results"][0]["value"],
+                    expected,
+                    "{tool} for {text:?}"
+                );
+            } else {
+                assert_eq!(result.err().unwrap().code, "selector_not_found");
+            }
+        }
+    }
+}

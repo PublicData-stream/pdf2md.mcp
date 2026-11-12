@@ -7,6 +7,7 @@ pub mod error;
 pub mod http;
 pub mod jobs;
 pub mod manual;
+pub mod mcp;
 pub mod model;
 pub mod policy;
 pub mod runtime;

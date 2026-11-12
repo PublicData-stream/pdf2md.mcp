@@ -163,6 +163,7 @@ fn daemon_keeps_reads_responsive_and_preserves_unstarted_work_on_shutdown() {
     assert!(cli(dir.path(), &["scan"]).status.success());
     let worker = dir.path().join("slow-worker");
     let marker = dir.path().join("started");
+    let stderr_path = dir.path().join("daemon-stderr.log");
     fs::write(&worker, format!("#!/usr/bin/python3\nimport os,sys,time\nsys.stdin.buffer.read()\nopen({:?},'w').write(str(os.getpid()))\ntime.sleep(60)\n", marker.to_str().unwrap())).unwrap();
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_pdf2md-mcp"))
@@ -174,7 +175,7 @@ fn daemon_keeps_reads_responsive_and_preserves_unstarted_work_on_shutdown() {
             "watch",
         ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(fs::File::create(&stderr_path).unwrap())
         .spawn()
         .unwrap();
     struct Cleanup<'a>(&'a mut std::process::Child);
@@ -198,9 +199,15 @@ fn daemon_keeps_reads_responsive_and_preserves_unstarted_work_on_shutdown() {
     while !marker.exists() {
         assert!(
             start.elapsed() < Duration::from_secs(30),
-            "worker did not start"
+            "worker did not start; daemon stderr: {}",
+            fs::read_to_string(&stderr_path).unwrap_or_default()
         );
-        assert!(guard.0.try_wait().unwrap().is_none());
+        if let Some(status) = guard.0.try_wait().unwrap() {
+            panic!(
+                "daemon exited with {status}; stderr: {}",
+                fs::read_to_string(&stderr_path).unwrap_or_default()
+            );
+        }
         thread::sleep(Duration::from_millis(50));
     }
     let before_read = Instant::now();

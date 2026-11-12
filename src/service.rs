@@ -32,6 +32,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 mod dispatcher;
+pub mod tools;
 
 /// Compatibility API for callers of the original transport-independent service.
 pub enum Operation {
@@ -180,6 +181,7 @@ struct RunningJob {
 }
 pub struct CallerService {
     auth: Authenticator,
+    tool_state: tools::ToolState,
     registry: WorkspaceRegistry,
     database_url: Option<String>,
     config: Config,
@@ -221,6 +223,7 @@ impl CallerService {
         let registry = WorkspaceRegistry::open(root).await?;
         let service = Self {
             auth,
+            tool_state: tools::ToolState::new(config.mcp.search_concurrency),
             registry,
             database_url,
             acquisitions: Arc::new(Semaphore::new(config.limits.concurrency)),

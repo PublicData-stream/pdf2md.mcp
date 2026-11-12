@@ -15,6 +15,8 @@ pub struct Config {
     pub auth: crate::auth::AuthConfig,
     #[serde(default)]
     pub http: HttpConfig,
+    #[serde(default)]
+    pub mcp: crate::mcp::McpConfig,
     pub database_url_env: Option<String>,
     #[serde(default)]
     pub limits: Limits,
@@ -361,6 +363,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         self.conversion.limits.validate()?;
         self.auth.validate()?;
+        self.mcp.validate(&self.auth)?;
         if self.http.bind.parse::<std::net::SocketAddr>().is_err()
             || self.http.per_workspace_jobs == 0
             || self.http.total_jobs == 0

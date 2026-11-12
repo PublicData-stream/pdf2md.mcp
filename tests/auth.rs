@@ -16,6 +16,9 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 
+#[path = "common/conversion_pdf.rs"]
+mod conversion_pdf;
+
 struct Fixture {
     config: AuthConfig,
     issuer: String,
@@ -412,6 +415,128 @@ fn configuration_rejects_incomplete_oauth_and_keeps_secrets_redacted() {
         file: None,
     };
     assert_eq!(format!("{secret:?}"), "OidcSecret([redacted])");
+}
+
+#[tokio::test]
+async fn section_reads_require_read_scope_and_stay_in_the_callers_workspace() {
+    use pdf2md_mcp::{config::Config, service::CallerService};
+    use std::{io::Write, path::Path, time::Duration};
+    use tokio_util::sync::CancellationToken;
+
+    let fixture = Fixture::new(TokenValidation::Introspection).await;
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let service = Arc::new(
+        CallerService::new(
+            dir.path(),
+            Config {
+                auth: fixture.config.clone(),
+                ..Config::default()
+            },
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let cancel = CancellationToken::new();
+    let mut upload = service.prepare_upload(Some("alice-token")).await.unwrap();
+    upload.write_all(&conversion_pdf::sample_pdf()).unwrap();
+    let conversion = service
+        .finish_upload(upload, &cancel)
+        .await
+        .unwrap()
+        .conversion_job
+        .unwrap()
+        .id;
+    let runner = {
+        let service = service.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            service
+                .run(
+                    Path::new("unused-browser-worker"),
+                    Path::new(env!("CARGO_BIN_EXE_pdf2md-convert-worker")),
+                    &cancel,
+                )
+                .await
+                .unwrap();
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let job = service
+                .get_job(Some("alice-token"), &conversion)
+                .await
+                .unwrap();
+            if job.status == "succeeded" {
+                break;
+            }
+            assert!(
+                job.status == "queued" || job.status == "running",
+                "{}",
+                job.status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    runner.await.unwrap();
+    let request_cancel = CancellationToken::new();
+    fixture.introspection.lock().unwrap()["scope"] = json!("pdf2md:read");
+    let inventory = service
+        .call_tool(
+            Some("alice-readonly"),
+            "list",
+            json!({"kind":"blocks","conversion_id":conversion}),
+            &request_cancel,
+        )
+        .await
+        .unwrap()
+        .data;
+    let args = json!({"conversion_id":conversion,"selectors":[{"kind":"block","id":inventory["items"][0]["id"]}]});
+    let read = service
+        .call_tool(
+            Some("alice-readonly"),
+            "read-section",
+            args.clone(),
+            &request_cancel,
+        )
+        .await
+        .unwrap()
+        .data;
+    assert!(read["bytes"].as_u64().unwrap() > 0);
+    fixture.introspection.lock().unwrap()["sub"] = json!("bob");
+    assert_eq!(
+        service
+            .call_tool(
+                Some("bob-token"),
+                "read-section",
+                args.clone(),
+                &request_cancel
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+        "conversion_not_found"
+    );
+    fixture.introspection.lock().unwrap()["sub"] = json!("alice");
+    fixture.introspection.lock().unwrap()["scope"] = json!("pdf2md:write");
+    assert_eq!(
+        service
+            .call_tool(
+                Some("alice-writeonly"),
+                "read-section",
+                args,
+                &request_cancel
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+        "auth_forbidden"
+    );
 }
 
 #[tokio::test]

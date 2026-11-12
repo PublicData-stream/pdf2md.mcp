@@ -17,7 +17,7 @@ also request conversions, retry them, select pages, inspect history, and export
 verified bundles. The HTTP service provides isolated caller workspaces with
 `none_ro`, `none_rw`,
 and OIDC-backed `oauth2` modes; see [authentication](docs/authentication.md)
-and the [HTTP API](docs/http-api.md). An opt-in MCP endpoint exposes seven read-only retrieval and search tools;
+and the [HTTP API](docs/http-api.md). An opt-in MCP endpoint exposes eight read-only retrieval and search tools;
 see [MCP tools](docs/mcp.md). There is no OCR. The
 repository has no supported release policy.
 

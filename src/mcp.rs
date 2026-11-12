@@ -354,6 +354,12 @@ fn tools() -> Vec<Tool> {
             vec!["conversion_id", "pages"],
         ),
         (
+            "read-section",
+            "Read exact Markdown sections or blocks selected by IDs from list, in request order",
+            json!({"conversion_id":{"type":"string"},"selectors":{"type":"array","minItems":1,"maxItems":500,"uniqueItems":true,"items":{"type":"object","properties":{"kind":{"enum":["section","block"]},"id":{"type":"string"}},"required":["kind","id"],"additionalProperties":false}}}),
+            vec!["conversion_id", "selectors"],
+        ),
+        (
             "table",
             "Read embedded PDF outline and bookmarks as a Markdown table of contents",
             json!({"conversion_id":{"type":"string"}}),

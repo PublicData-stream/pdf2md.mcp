@@ -35,12 +35,41 @@ def text(result):
     return "\n".join(item["text"] for item in result.get("content", []) if item.get("type") == "text")
 
 
+def verify_sections(base, conversion, markdown, token=None):
+    selectors = []
+    spans = []
+    for kind in ("sections", "blocks"):
+        inventory = call(base, "list", {"kind": kind, "conversion_id": conversion}, token)["structuredContent"]
+        entries = inventory["items"][:2]
+        if kind == "blocks" and not entries:
+            raise RuntimeError("MCP block inventory missing")
+        for span in entries:
+            selectors.append({"kind": kind[:-1], "id": span["id"]})
+            spans.append(span)
+    result = call(base, "read-section", {"conversion_id": conversion, "selectors": selectors}, token)
+    data = result["structuredContent"]
+    if json.loads(text(result)) != data or data["conversion_id"] != conversion:
+        raise RuntimeError("MCP section response differs")
+    source = markdown.encode("utf-8")
+    if len(data["results"]) != len(selectors):
+        raise RuntimeError("MCP section result count differs")
+    total = 0
+    for item, selector, span in zip(data["results"], selectors, spans):
+        expected = source[span["start"]:span["end"]]
+        if item["selector"] != selector or item["span"] != span or item["text"].encode("utf-8") != expected or item["bytes"] != len(expected):
+            raise RuntimeError("MCP section source slice differs")
+        total += len(expected)
+    if data["bytes"] != total:
+        raise RuntimeError("MCP section byte total differs")
+    return selectors
+
+
 def exercise(base, conversion, markdown, token=None, other_token=None):
     status, body = request(base, "initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "pdf2md-smoke", "version": "1"}}, token)
     if status != 200 or body.get("result", {}).get("protocolVersion") != "2025-11-25":
         raise RuntimeError("MCP initialization failed")
     status, body = request(base, "tools/list", token=token)
-    expected = {"list", "read", "read-page", "table", "rg", "count", "size"}
+    expected = {"list", "read", "read-page", "read-section", "table", "rg", "count", "size"}
     if status != 200 or {tool["name"] for tool in body.get("result", {}).get("tools", [])} != expected:
         raise RuntimeError("MCP tool discovery differs")
     read = call(base, "read", {"conversion_id": conversion}, token)
@@ -49,7 +78,7 @@ def exercise(base, conversion, markdown, token=None, other_token=None):
         raise RuntimeError("MCP read did not return complete stored Markdown")
     call(base, "list", {"kind": "documents"}, token)
     call(base, "list", {"kind": "conversions"}, token)
-    call(base, "list", {"kind": "blocks", "conversion_id": conversion}, token)
+    selectors = verify_sections(base, conversion, markdown, token)
     page = call(base, "read-page", {"conversion_id": conversion, "pages": "1"}, token)
     if "Conversion smoke test" not in text(page) + json.dumps(page.get("structuredContent", {})):
         raise RuntimeError("MCP page text missing")
@@ -64,7 +93,8 @@ def exercise(base, conversion, markdown, token=None, other_token=None):
         raise RuntimeError("MCP ripgrep match missing")
     if other_token:
         call(base, "read", {"conversion_id": conversion}, other_token, succeeds=False)
+        call(base, "read-section", {"conversion_id": conversion, "selectors": selectors}, other_token, succeeds=False)
         result = call(base, "rg", {"pattern": "Conversion smoke test", "literal": True}, other_token)
         if conversion in json.dumps(result):
             raise RuntimeError("MCP search crossed user workspaces")
-    print("PASS seven MCP tools, whole Markdown, indexed pages, ripgrep" + (" and OIDC isolation" if other_token else ""), flush=True)
+    print("PASS eight MCP tools, whole Markdown, indexed pages and sections, ripgrep" + (" and OIDC isolation" if other_token else ""), flush=True)

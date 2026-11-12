@@ -6,7 +6,7 @@ worker, a conversion worker binary, and integration tests. `pdf_oxide` converts
 accepted PDFs into immutable Markdown bundles. A transport-independent caller
 service supports anonymous RO/RW and OAuth2/OIDC authentication with isolated
 workspaces and supports HTTP acquisition and conversion jobs. The project has
-an opt-in Streamable HTTP MCP endpoint with seven read-only tools and no OCR.
+an opt-in Streamable HTTP MCP endpoint with eight read-only tools and no OCR.
 See [MCP tools](docs/mcp.md) for contracts and compatibility. This document is the source of truth for contributor
 workflow. See
 [Repository Guidelines](AGENTS.md) for agent orientation and the

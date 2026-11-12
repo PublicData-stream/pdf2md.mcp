@@ -190,4 +190,4 @@ provider configuration.
 The opt-in MCP endpoint uses these same modes, scopes, token validators, and
 issuer/subject workspace boundaries. It requires explicit public-resource
 configuration in OAuth mode and advertises protected-resource metadata. See
-[MCP tools](mcp.md#authentication). All seven tools require only read access.
+[MCP tools](mcp.md#authentication). All eight tools require only read access.

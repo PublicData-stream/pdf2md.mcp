@@ -125,4 +125,4 @@ credentials and configuration under `/tmp` and remove their own resources.
 ## MCP endpoint
 
 The same listener can optionally expose `/mcp`. See [MCP tools](mcp.md) for
-enablement, OAuth discovery, seven tool contracts, and retained bundle support.
+enablement, OAuth discovery, eight tool contracts, and retained bundle support.

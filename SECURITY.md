@@ -12,7 +12,7 @@ conversion history. Conversion runs in a separate worker process through the
 trusted CLI, daemon, or HTTP service. The caller service supports anonymous
 RO/RW and OAuth2/OIDC modes, with separate per-user workspace roots and
 application authorization. The CLI and raw storage/library APIs remain trusted
-operator interfaces. The opt-in MCP endpoint exposes seven read-only tools through the same caller
+operator interfaces. The opt-in MCP endpoint exposes eight read-only tools through the same caller
 authorization boundary. Search invokes ripgrep with constructed arguments and
 verified Markdown input. The project does not provide OCR. No stable-release security support policy, maintenance window,
 or backport commitment is established. Include the affected commit when

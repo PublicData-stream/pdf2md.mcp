@@ -95,6 +95,19 @@ struct MeasureArgs {
     selectors: Option<Vec<Selector>>,
 }
 
+#[derive(Deserialize, Serialize, Hash, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum StructureSelector {
+    Section { id: String },
+    Block { id: String },
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SectionArgs {
+    conversion_id: String,
+    selectors: Vec<StructureSelector>,
+}
+
 impl CallerService {
     pub async fn call_tool(
         &self,
@@ -128,6 +141,7 @@ impl CallerService {
                 })
             }
             "read-page" => self.tool_pages(&workspace, parse(arguments)?).await,
+            "read-section" => self.tool_sections(&workspace, parse(arguments)?).await,
             "table" => self.tool_table(&workspace, parse(arguments)?).await,
             "count" | "size" => {
                 self.tool_measure(&workspace, parse(arguments)?, name == "size")
@@ -194,6 +208,7 @@ impl CallerService {
                             json!([
                                 "read",
                                 "read-page",
+                                "read-section",
                                 "table",
                                 "rg",
                                 "count",
@@ -241,6 +256,52 @@ impl CallerService {
         });
         Ok(output(
             json!({"kind":kind,"items":values,"next_cursor":next}),
+        ))
+    }
+    async fn tool_sections(
+        &self,
+        workspace: &AuthorizedWorkspace,
+        arg: SectionArgs,
+    ) -> Result<ToolOutput> {
+        if arg.selectors.is_empty() || arg.selectors.len() > 500 {
+            return Err(invalid());
+        }
+        let mut seen = HashSet::new();
+        if arg.selectors.iter().any(|s| !seen.insert(s)) {
+            return Err(invalid());
+        }
+        let bundle = workspace
+            .store
+            .open_verified_bundle(&arg.conversion_id)
+            .await?;
+        let mut file = open_artifact(&bundle, "document.md").await?;
+        let index =
+            indexed_source(&bundle, Some(file.try_clone().await.map_err(io_error)?)).await?;
+        require_structure(&index)?;
+        let mut spans = Vec::with_capacity(arg.selectors.len());
+        let mut total = 0u64;
+        for selector in &arg.selectors {
+            let (source, id) = match selector {
+                StructureSelector::Section { id } => (&index.sections, id),
+                StructureSelector::Block { id } => (&index.blocks, id),
+            };
+            let span = source
+                .iter()
+                .find(|span| &span.id == id)
+                .ok_or_else(|| LoadError::new("selector_not_found", "selector unavailable"))?;
+            total = total
+                .checked_add(span.end - span.start)
+                .filter(|&bytes| bytes <= self.config.mcp.max_read_bytes)
+                .ok_or_else(|| LoadError::new("size_limit", "selected spans exceed read limit"))?;
+            spans.push(span);
+        }
+        let mut results = Vec::with_capacity(spans.len());
+        for (selector, span) in arg.selectors.iter().zip(spans) {
+            let text = read_range(&mut file, span.start, span.end).await?;
+            results.push(json!({"selector":selector,"span":span,"bytes":text.len(),"text":text}));
+        }
+        Ok(output(
+            json!({"conversion_id":arg.conversion_id,"bytes":total,"results":results}),
         ))
     }
     async fn tool_pages(

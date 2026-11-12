@@ -94,12 +94,14 @@ def exercise(base):
 
 def verify_restart(base, document, conversion):
     ready(base)
-    assert "Conversion smoke test" in request(base, "/v1/conversions/" + conversion + "/markdown").decode()
+    markdown = request(base, "/v1/conversions/" + conversion + "/markdown").decode()
+    assert "Conversion smoke test" in markdown
     assert document in request(base, "/v1/history").decode()
     spec = importlib.util.spec_from_file_location("mcp_smoke", Path(__file__).with_name("mcp-smoke.py"))
     smoke = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(smoke)
     smoke.call(base, "read", {"conversion_id": conversion})
+    smoke.verify_sections(base, conversion, markdown)
 
 
 def docker_smoke(image, base):

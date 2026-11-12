@@ -20,7 +20,7 @@ impl ClientHandler for LegacyClient {
 }
 
 #[tokio::test]
-async fn sdk_clients_discover_seven_tools_and_call_for_both_versions() {
+async fn sdk_clients_discover_eight_tools_and_call_for_both_versions() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tempfile::tempdir_in("/tmp").unwrap();
     let mut config = Config::default();
@@ -69,6 +69,17 @@ async fn sdk_clients_discover_seven_tools_and_call_for_both_versions() {
     let cancel = CancellationToken::new();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let markdown = service
+        .call_tool(
+            None,
+            "read",
+            serde_json::json!({"conversion_id":job_id}),
+            &cancel,
+        )
+        .await
+        .unwrap()
+        .text
+        .unwrap();
     let app = http::router(service, cancel.clone());
     let shutdown = cancel.clone();
     let server = tokio::spawn(async move {
@@ -87,7 +98,38 @@ async fn sdk_clients_discover_seven_tools_and_call_for_both_versions() {
         .await
         .unwrap();
     let list = modern.list_tools(None).await.unwrap();
-    assert_eq!(list.tools.len(), 7);
+    assert_eq!(list.tools.len(), 8);
+    let section_tool = list
+        .tools
+        .iter()
+        .find(|t| t.name == "read-section")
+        .unwrap();
+    assert_eq!(
+        section_tool.annotations.as_ref().unwrap().read_only_hint,
+        Some(true)
+    );
+    assert_eq!(
+        section_tool.input_schema["properties"]["selectors"]["maxItems"],
+        500
+    );
+    let inventory = modern
+        .call_tool(
+            CallToolRequestParams::new("list").with_arguments(
+                serde_json::json!({"kind":"blocks","conversion_id":job_id})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    let span = &inventory["items"][0];
+    let section_args =
+        serde_json::json!({"conversion_id":job_id,"selectors":[{"kind":"block","id":span["id"]}]});
+    let expected_text =
+        &markdown[span["start"].as_u64().unwrap() as usize..span["end"].as_u64().unwrap() as usize];
     let output = modern
         .call_tool(CallToolRequestParams::new("list"))
         .await
@@ -95,6 +137,7 @@ async fn sdk_clients_discover_seven_tools_and_call_for_both_versions() {
     assert_eq!(output.is_error, Some(false));
     for (name, args) in [
         ("read", serde_json::json!({"conversion_id":job_id})),
+        ("read-section", section_args.clone()),
         (
             "read-page",
             serde_json::json!({"conversion_id":job_id,"pages":"1"}),
@@ -114,7 +157,26 @@ async fn sdk_clients_discover_seven_tools_and_call_for_both_versions() {
             .await
             .unwrap();
         assert_eq!(result.is_error, Some(false), "{name}: {result:?}");
+        if name == "read-section" {
+            let data = result.structured_content.as_ref().unwrap();
+            assert_eq!(data["results"][0]["text"], expected_text);
+            assert_eq!(data["results"][0]["span"], *span);
+            let text = result.content[0].as_text().unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&text.text).unwrap(),
+                *data
+            );
+        }
     }
+    let error = modern
+        .call_tool(CallToolRequestParams::new("read-section"))
+        .await
+        .unwrap();
+    assert_eq!(error.is_error, Some(true));
+    assert_eq!(
+        error.structured_content.unwrap()["code"],
+        "invalid_arguments"
+    );
     modern.cancel().await.unwrap();
     let legacy = LegacyClient
         .serve(StreamableHttpClientTransport::from_uri(url))
@@ -124,10 +186,11 @@ async fn sdk_clients_discover_seven_tools_and_call_for_both_versions() {
         legacy.peer_info().unwrap().protocol_version,
         ProtocolVersion::V_2025_11_25
     );
-    assert_eq!(legacy.list_tools(None).await.unwrap().tools.len(), 7);
+    assert_eq!(legacy.list_tools(None).await.unwrap().tools.len(), 8);
     for (name, args) in [
         ("list", serde_json::json!({})),
         ("read", serde_json::json!({"conversion_id":job_id})),
+        ("read-section", section_args),
         (
             "read-page",
             serde_json::json!({"conversion_id":job_id,"pages":"1"}),
@@ -147,9 +210,15 @@ async fn sdk_clients_discover_seven_tools_and_call_for_both_versions() {
             .await
             .unwrap();
         assert_eq!(result.is_error, Some(false), "legacy {name}: {result:?}");
+        if name == "read-section" {
+            assert_eq!(
+                result.structured_content.unwrap()["results"][0]["text"],
+                expected_text
+            );
+        }
     }
     let error = legacy
-        .call_tool(CallToolRequestParams::new("read"))
+        .call_tool(CallToolRequestParams::new("read-section"))
         .await
         .unwrap();
     assert_eq!(error.is_error, Some(true));

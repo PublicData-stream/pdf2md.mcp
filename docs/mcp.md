@@ -1,6 +1,6 @@
 # MCP tools
 
-The `serve` process can expose seven read-only tools over Streamable HTTP at
+The `serve` process can expose eight read-only tools over Streamable HTTP at
 `/mcp`. Enable the endpoint explicitly; existing configurations leave it off:
 
 ```toml
@@ -19,7 +19,7 @@ use a compatible MCP SDK rather than construct protocol metadata themselves.
 MCP uses the configured caller mode and `pdf2md:read` scope (or the configured
 read scope). `none_ro` and `none_rw` expose the same shared workspace used by
 the HTTP API. OAuth2/OIDC identifies a workspace by the exact issuer and subject;
-all seven tools, including workspace-wide search, stay inside that workspace.
+all eight tools, including workspace-wide search, stay inside that workspace.
 A conversion ID does not grant access to another user's document.
 
 For OAuth, configure the externally visible resource identifier and permitted
@@ -78,6 +78,10 @@ service restarts invalidate them.
 - `read-page` takes `conversion_id` and `pages`, for example `"1-3,7"`.
   Page numbers refer to the original PDF, starting at 1. Selections are sorted
   and deduplicated. Every selected page must exist in that conversion.
+- `read-section` takes `conversion_id` and a required `selectors` array of
+  1–500 section/block selections. Obtain IDs from
+  `list(kind="sections"|"blocks", conversion_id=...)`; these IDs are scoped to
+  that exact conversion, not to PDF bookmarks from `table`.
 - `table` takes `conversion_id` and returns embedded PDF outlines/bookmarks
   as Markdown. It preserves hierarchy and available page destinations, and
   identifies unresolved destinations. It does not recognize printed contents
@@ -88,11 +92,43 @@ service restarts invalidate them.
 and excluding the generated separator between pages. It does not parse page
 boundaries from document text.
 
-The default text budget is 8 MiB for `read` or a selected `read-page` response.
+The default text budget is 8 MiB for `read`, a selected `read-page` response,
+or the combined selected text in `read-section`.
 Oversized selections fail with a size error: no partial document is returned.
 Use smaller page selections or the authenticated HTTP Markdown download for
 larger documents. Client-side context or response limits can be smaller than
 the server budget.
+
+For example, select a section and a block from the Markdown inventory:
+
+```json
+{
+  "conversion_id": "CONVERSION_ID",
+  "selectors": [
+    {"kind": "section", "id": "s1"},
+    {"kind": "block", "id": "b3"}
+  ]
+}
+```
+
+`read-section` returns JSON in both structured content and the MCP text content:
+`{conversion_id, bytes, results}`. Each result contains the original `selector`,
+the corresponding inventory entry as `span`, its UTF-8 `bytes`, and exact source
+`text`. Byte spans use an inclusive `start` and exclusive `end`; line spans are
+1-based and inclusive. Results preserve request order and source whitespace,
+Markdown syntax, image references, and any generated page markers or separators
+within the selected range. Sections include nested subsections. Overlapping
+selections remain separate results, and repeated text counts toward the combined
+budget. The budget excludes JSON encoding and metadata. A selection exactly at
+the budget succeeds, even when the whole document is larger.
+
+The entire call fails without partial content on an error. Malformed, empty,
+oversized, or duplicate selector arrays return `invalid_arguments`; missing IDs
+or IDs used with the wrong selector kind return `selector_not_found`. An
+unavailable structure index returns `metadata_unavailable`, and selections above
+the read budget return `size_limit`. Bundle and index corruption retain the
+existing integrity errors. Reading a small selection still verifies the index
+against the complete stored Markdown using bounded streaming reads.
 
 ## Line and byte measurements
 
@@ -176,13 +212,14 @@ reported explicitly rather than silently clipping an index or outline.
 
 Existing v1 bundles remain immutable and readable. Whole-file reads, searches,
 and whole-file or line-range measurements work on them. Page reads, outlines,
-and section/block selection return `upgrade_required`; request a new conversion
-through the trusted CLI or HTTP conversion API. There is no automatic backfill.
+and section/block selection (including `read-section`) return `upgrade_required`;
+request a new conversion through the trusted CLI or HTTP conversion API. There
+is no automatic backfill.
 
 ## Verification
 
 Run the documented core Rust checks, including the MCP HTTP/tool integration
-tests. The HTTP container harness exercises the seven tools and restart reads:
+tests. The HTTP container harness exercises the eight tools and restart reads:
 
 ```sh
 python3 scripts/test-http.py IMAGE --minikube

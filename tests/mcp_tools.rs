@@ -411,5 +411,112 @@ async fn small_page_and_structural_measures_work_when_whole_read_exceeds_limit()
         .unwrap()
         .data;
     assert!(measured["results"][0]["value"].as_u64().unwrap() > 0);
+    let selected = fixture
+        .call(
+            "read-section",
+            json!({"conversion_id":id,"selectors":[{"kind":"block","id":block_id}]}),
+        )
+        .await
+        .unwrap();
+    assert!(selected.data["results"][0]["bytes"].as_u64().unwrap() > 0);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn read_section_returns_ordered_exact_spans_and_rejects_invalid_selectors() {
+    let fixture = Fixture::new(|_| {}).await;
+    let id = &fixture.conversion;
+    let whole = fixture
+        .call("read", json!({"conversion_id":id}))
+        .await
+        .unwrap()
+        .text
+        .unwrap();
+    let blocks = fixture
+        .call(
+            "list",
+            json!({"kind":"blocks","conversion_id":id,"limit":500}),
+        )
+        .await
+        .unwrap()
+        .data;
+    let spans = blocks["items"].as_array().unwrap();
+    assert!(spans.len() >= 2);
+    let selectors: Vec<_> = spans
+        .iter()
+        .take(2)
+        .rev()
+        .map(|span| json!({"kind":"block","id":span["id"]}))
+        .collect();
+    let output = fixture
+        .call(
+            "read-section",
+            json!({"conversion_id":id,"selectors":selectors}),
+        )
+        .await
+        .unwrap();
+    assert!(output.text.is_none());
+    assert_eq!(output.data["conversion_id"], *id);
+    assert_eq!(output.data["results"].as_array().unwrap().len(), 2);
+    let mut total = 0usize;
+    for (result, span) in output.data["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(spans.iter().take(2).rev())
+    {
+        let start = span["start"].as_u64().unwrap() as usize;
+        let end = span["end"].as_u64().unwrap() as usize;
+        assert_eq!(result["selector"], json!({"kind":"block","id":span["id"]}));
+        assert_eq!(result["span"], *span);
+        assert_eq!(result["text"], &whole[start..end]);
+        assert_eq!(result["bytes"], end - start);
+        total += end - start;
+    }
+    assert_eq!(output.data["bytes"], total);
+    let block_id = spans[0]["id"].as_str().unwrap();
+    let invalid = [
+        json!({"selectors":[{"kind":"block","id":block_id}]}),
+        json!({"conversion_id":id,"selectors":[]}),
+        json!({"conversion_id":id,"selectors":[{"kind":"block","id":block_id},{"kind":"block","id":block_id}]}),
+        json!({"conversion_id":id,"selectors":[{"kind":"block","id":block_id,"extra":true}]}),
+        json!({"conversion_id":id,"selectors":[{"kind":"other","id":block_id}]}),
+        json!({"conversion_id":id,"selectors":[{"kind":"block"}]}),
+        json!({"conversion_id":id,"selectors":[{"kind":"block","id":block_id}],"extra":true}),
+        json!({"conversion_id":id,"selectors":(0..501).map(|n| json!({"kind":"block","id":format!("b{n}")})).collect::<Vec<_>>()}),
+    ];
+    for args in invalid {
+        assert_eq!(
+            fixture
+                .call("read-section", args.clone())
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "invalid_arguments",
+            "{args}"
+        );
+    }
+    let max_selectors: Vec<_> = (0..500)
+        .map(|n| json!({"kind":"block","id":format!("missing{n}")}))
+        .collect();
+    assert_eq!(
+        fixture
+            .call(
+                "read-section",
+                json!({"conversion_id":id,"selectors":max_selectors})
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+        "selector_not_found"
+    );
+    for selector in [
+        json!({"kind":"section","id":block_id}),
+        json!({"kind":"block","id":"missing"}),
+    ] {
+        assert_eq!(fixture.call("read-section", json!({"conversion_id":id,"selectors":[{"kind":"block","id":block_id},selector]})).await.err().unwrap().code, "selector_not_found");
+    }
     fixture.stop().await;
 }

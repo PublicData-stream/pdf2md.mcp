@@ -592,6 +592,15 @@ async fn legacy_profile_survives_reopen_export_and_requires_upgrade_for_pages() 
         )
         .await;
     assert_eq!(result.err().unwrap().code, "upgrade_required");
+    let result = service
+        .call_tool(
+            None,
+            "read-section",
+            serde_json::json!({"conversion_id":attempt.id,"selectors":[{"kind":"block","id":"b1"}]}),
+            &CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.err().unwrap().code, "upgrade_required");
     let cancel = CancellationToken::new();
     for (id, _, _, text, lines, range) in cases {
         let read = service
@@ -628,4 +637,193 @@ async fn legacy_profile_survives_reopen_export_and_requires_upgrade_for_pages() 
             }
         }
     }
+}
+
+#[tokio::test]
+async fn read_section_handles_nested_cross_page_utf8_and_unavailable_metadata() {
+    use pdf2md_mcp::{
+        config::Config,
+        conversion::{Artifact, ConversionManifest},
+        service::CallerService,
+        workspace::WorkspaceRegistry,
+    };
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use tokio_util::sync::CancellationToken;
+
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let shared = WorkspaceRegistry::open(root.path())
+        .await
+        .unwrap()
+        .resolve_shared(None)
+        .await
+        .unwrap();
+    let input = root.path().join("synthetic.pdf");
+    std::fs::write(&input, b"%PDF-1.4\n%%EOF\n").unwrap();
+    let store = Store::open(&shared, None).await.unwrap();
+    let document = store
+        .accept(&input, "synthetic", "manual", None, "synthetic")
+        .await
+        .unwrap()
+        .document_id
+        .unwrap();
+    let first = "<!-- pdf-page: 1 -->\n\n# 제목\n\n## 자식\n\n가나다\n";
+    let second = "<!-- pdf-page: 2 -->\n\n둘째 쪽\n";
+    let text = format!("{first}\n\n---\n\n{second}\n");
+    let section_start = text.find("# 제목").unwrap();
+    let child_start = text.find("## 자식").unwrap();
+    let block_start = text.find("가나다").unwrap();
+    let block_end = block_start + "가나다\n".len();
+    let section_end = text.len() - 1;
+    let line = |pos: usize| {
+        1 + text.as_bytes()[..pos]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+    };
+    let span = |id: &str,
+                kind: &str,
+                title: Option<&str>,
+                parent: Option<&str>,
+                start: usize,
+                end: usize| {
+        json!({"id":id,"kind":kind,"title":title,"parent_id":parent,"start":start,"end":end,"start_line":line(start),"end_line":line(end-1)})
+    };
+    let parent = span(
+        "s1",
+        "section",
+        Some("제목"),
+        None,
+        section_start,
+        section_end,
+    );
+    let child = span(
+        "s2",
+        "section",
+        Some("자식"),
+        Some("s1"),
+        child_start,
+        section_end,
+    );
+    let block = span("b1", "paragraph", None, None, block_start, block_end);
+    let total = section_end - section_start + block_end - block_start;
+    let mut ids = Vec::new();
+    for (i, available) in [true, false].into_iter().enumerate() {
+        let options = ConversionOptions {
+            pages: Some(vec![i as u32 + 1]),
+        };
+        let attempt = store
+            .request_conversion(&document, &options, false)
+            .await
+            .unwrap();
+        let index = json!({"version":1,"pages":[{"page":1,"start":0,"end":first.len()},{"page":2,"start":first.len()+7,"end":text.len()-1}],"sections":if available {vec![parent.clone(),child.clone()]} else {vec![]},"blocks":if available {vec![block.clone()]} else {vec![]},"structure_status":if available {"available"} else {"unavailable"}});
+        let contents = [
+            ("document.md", text.as_bytes().to_vec()),
+            ("text-index.json", serde_json::to_vec(&index).unwrap()),
+            (
+                "outline.json",
+                serde_json::to_vec(&json!({"version":1,"status":"absent","entries":[]})).unwrap(),
+            ),
+        ];
+        let manifest = ConversionManifest {
+            format_version: 2,
+            document_id: document.clone(),
+            converter: "synthetic/1".into(),
+            options: options.clone(),
+            pages: vec![1, 2],
+            warnings: vec![],
+            artifacts: contents
+                .iter()
+                .map(|(path, bytes)| Artifact {
+                    path: (*path).into(),
+                    sha256: format!("{:x}", Sha256::digest(bytes)),
+                    bytes: bytes.len() as u64,
+                })
+                .collect(),
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let bundle = format!("{:x}", Sha256::digest(&bytes));
+        let path = shared.join("conversions").join(&bundle);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("manifest.json"), bytes).unwrap();
+        for (name, bytes) in contents {
+            std::fs::write(path.join(name), bytes).unwrap();
+        }
+        let profile = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(&document, &manifest.converter, &options)).unwrap()
+            )
+        );
+        ids.push((attempt.id, bundle, profile));
+    }
+    drop(store);
+    let pool = db(&shared).await;
+    for (id, bundle, profile) in &ids {
+        sqlx::query("UPDATE conversion_attempts SET status='succeeded',bundle_id=$1,profile_key=$2 WHERE id=$3").bind(bundle).bind(profile).bind(id).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+    let mut config = Config::default();
+    config.mcp.max_read_bytes = total as u64;
+    let service = CallerService::new(root.path(), config, None).await.unwrap();
+    let cancel = CancellationToken::new();
+    let selectors = json!([{"kind":"block","id":"b1"},{"kind":"section","id":"s1"}]);
+    let output = service
+        .call_tool(
+            None,
+            "read-section",
+            json!({"conversion_id":ids[0].0,"selectors":selectors}),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert!(output.text.is_none());
+    assert_eq!(output.data["bytes"], total);
+    assert_eq!(output.data["results"][0]["span"], block);
+    assert_eq!(
+        output.data["results"][0]["text"],
+        &text[block_start..block_end]
+    );
+    assert_eq!(output.data["results"][1]["span"], parent);
+    assert_eq!(
+        output.data["results"][1]["text"],
+        &text[section_start..section_end]
+    );
+    assert_eq!(service.call_tool(None, "read-section", json!({"conversion_id":ids[0].0,"selectors":[{"kind":"block","id":"b1"},{"kind":"section","id":"s1"},{"kind":"section","id":"s2"}]}), &cancel).await.err().unwrap().code, "size_limit");
+    assert_eq!(
+        service
+            .call_tool(
+                None,
+                "read-section",
+                json!({"conversion_id":ids[1].0,"selectors":[{"kind":"block","id":"b1"}]}),
+                &cancel
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+        "metadata_unavailable"
+    );
+    std::fs::write(
+        shared
+            .join("conversions")
+            .join(&ids[0].1)
+            .join("text-index.json"),
+        b"corrupt",
+    )
+    .unwrap();
+    assert_eq!(
+        service
+            .call_tool(
+                None,
+                "read-section",
+                json!({"conversion_id":ids[0].0,"selectors":[{"kind":"block","id":"b1"}]}),
+                &cancel,
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+        "storage_corrupt"
+    );
 }

@@ -9,7 +9,7 @@ integration tests. It acquires and stores PDF bytes, then converts accepted
 documents to immutable Markdown bundles with `pdf_oxide`. The library has a
 caller service with anonymous RO/RW and OAuth2/OIDC modes and isolated
 workspaces; the HTTP service supports acquisition and conversion jobs. An
-opt-in Streamable HTTP MCP endpoint exposes seven read-only tools. There is no
+opt-in Streamable HTTP MCP endpoint exposes eight read-only tools. There is no
 OCR. See `docs/mcp.md` for tool contracts and metadata compatibility and
 `docs/authentication.md` for caller versus trusted operator boundaries and
 provider verification.

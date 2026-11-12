@@ -112,19 +112,189 @@ jobs:
         run: |
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           python3 scripts/ci/publish.py publish --plan /tmp/pdf2md-release/plan/plan.json --artifacts-dir /tmp/pdf2md-release/images --output-dir /tmp/pdf2md-release/evidence
-      - name: Verify public images and promote stable aliases
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 scripts/ci/publish.py verify --plan /tmp/pdf2md-release/plan/plan.json --output-dir /tmp/pdf2md-release/evidence --anonymous
-          python3 scripts/ci/release.py recheck --plan /tmp/pdf2md-release/plan/plan.json
-          python3 scripts/ci/publish.py aliases --plan /tmp/pdf2md-release/plan/plan.json --output-dir /tmp/pdf2md-release/evidence
+      - name: Inventory AMD64 runtime contents
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: docker-archive:/tmp/pdf2md-release/images/amd64/image.tar
+          syft-version: v1.57.1
+          format: cyclonedx-json
+          output-file: /tmp/pdf2md-release/evidence/runtime-amd64.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Inventory ARM64 runtime contents
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: docker-archive:/tmp/pdf2md-release/images/arm64/image.tar
+          syft-version: v1.57.1
+          format: cyclonedx-json
+          output-file: /tmp/pdf2md-release/evidence/runtime-arm64.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Prepare source inventory and image-promotion provenance
+        run: python3 scripts/ci/release_metadata.py prepare --plan /tmp/pdf2md-release/plan/plan.json --lock /tmp/pdf2md-release/plan/source-Cargo.lock --output-dir /tmp/pdf2md-release/evidence
       - name: Remove registry credentials
         if: always()
         run: docker logout ghcr.io
       - name: Save publication evidence, including partial results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ghcr-publication-candidate
+          path: /tmp/pdf2md-release/evidence
+          if-no-files-found: warn
+          retention-days: 90
+
+  attest:
+    name: Attest published digest (${{ matrix.target }})
+    needs: [resolve, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [amd64, arm64, index]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.trusted_revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ghcr-publication-candidate
+          path: /tmp/pdf2md-release/evidence
+      - name: Bind attestation subject to exact registry manifest bytes
+        id: subject
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/ci/release_metadata.py select --target "$TARGET" --output-dir /tmp/pdf2md-release/evidence
+      - name: Attest image-promotion provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/publicdata-stream/pdf2md.mcp
+          subject-digest: ${{ steps.subject.outputs.digest }}
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: ${{ steps.subject.outputs.predicate }}
+          push-to-registry: false
+          create-storage-record: false
+      - name: Attest runtime and Rust source inventory
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/publicdata-stream/pdf2md.mcp
+          subject-digest: ${{ steps.subject.outputs.digest }}
+          sbom-path: ${{ steps.subject.outputs.sbom }}
+          push-to-registry: false
+          create-storage-record: false
+      - name: Verify signatures, subjects, predicate types, and signer workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST: ${{ steps.subject.outputs.manifest }}
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+        run: |
+          gh attestation verify "$MANIFEST" --bundle "$PROVENANCE_BUNDLE" --repo PublicData-stream/pdf2md.mcp --signer-workflow PublicData-stream/pdf2md.mcp/.github/workflows/publish-images.yml --predicate-type https://slsa.dev/provenance/v1
+          gh attestation verify "$MANIFEST" --bundle "$SBOM_BUNDLE" --repo PublicData-stream/pdf2md.mcp --signer-workflow PublicData-stream/pdf2md.mcp/.github/workflows/publish-images.yml --predicate-type https://cyclonedx.org/bom
+      - name: Record verified attestation references and bundles
+        env:
+          TARGET: ${{ matrix.target }}
+          PROVENANCE_ID: ${{ steps.provenance.outputs.attestation-id }}
+          PROVENANCE_URL: ${{ steps.provenance.outputs.attestation-url }}
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_ID: ${{ steps.sbom.outputs.attestation-id }}
+          SBOM_URL: ${{ steps.sbom.outputs.attestation-url }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+        run: python3 scripts/ci/release_metadata.py record --target "$TARGET" --output-dir /tmp/pdf2md-release/evidence
+      - name: Preserve partial attestation evidence
+        if: failure()
+        env:
+          TARGET: ${{ matrix.target }}
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, pathlib, shutil
+          target = os.environ['TARGET']
+          assert target in {'amd64', 'arm64', 'index'}
+          output = pathlib.Path('/tmp/pdf2md-release/evidence/attestations') / target
+          output.mkdir(parents=True, exist_ok=True)
+          for kind in ('provenance', 'sbom'):
+              source = os.environ.get(kind.upper() + '_BUNDLE')
+              if source and pathlib.Path(source).is_file():
+                  shutil.copyfile(source, output / (kind + '.json'))
+          (output / 'failure.json').write_text(json.dumps({'status': 'failed'}) + '\n')
+          PYTHON
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ghcr-attestation-${{ matrix.target }}
+          path: /tmp/pdf2md-release/evidence/attestations
+          if-no-files-found: warn
+          retention-days: 90
+
+  qualify:
+    name: Verify public access and promote stable aliases
+    needs: [resolve, publish, attest]
+    if: always() && needs.resolve.result == 'success' && needs.publish.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.trusted_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/ci-setup
+        with:
+          docker: 'true'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-plan
+          path: /tmp/pdf2md-release/plan
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ghcr-publication-candidate
+          path: /tmp/pdf2md-release/evidence
+      - name: Require every digest's verified attestations
+        env:
+          ATTEST_RESULT: ${{ needs.attest.result }}
+        run: test "$ATTEST_RESULT" = success
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ghcr-attestation-*
+          merge-multiple: true
+          path: /tmp/pdf2md-release/evidence/attestations
+      - name: Collect verified attestation records
+        run: python3 scripts/ci/release_metadata.py collect --output-dir /tmp/pdf2md-release/evidence
+      - name: Verify anonymous pulls and exact canonical digests
+        run: python3 scripts/ci/publish.py verify --plan /tmp/pdf2md-release/plan/plan.json --output-dir /tmp/pdf2md-release/evidence --anonymous
+      - name: Recheck source and promote eligible stable aliases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci/release.py recheck --plan /tmp/pdf2md-release/plan/plan.json
+          python3 scripts/ci/publish.py aliases --plan /tmp/pdf2md-release/plan/plan.json --output-dir /tmp/pdf2md-release/evidence
+      - name: Record qualification failure
+        if: failure()
+        run: |
+          python3 - <<'PYTHON'
+          import json, pathlib
+          path = pathlib.Path('/tmp/pdf2md-release/evidence/report.json')
+          if path.is_file():
+              report = json.loads(path.read_text())
+              report['qualification_status'] = 'failed'
+              path.write_text(json.dumps(report, indent=2) + '\n')
+          PYTHON
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
         with:
           name: ghcr-publication
           path: /tmp/pdf2md-release/evidence

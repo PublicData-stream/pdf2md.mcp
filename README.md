@@ -18,8 +18,11 @@ verified bundles. The HTTP service provides isolated caller workspaces with
 `none_ro`, `none_rw`,
 and OIDC-backed `oauth2` modes; see [authentication](docs/authentication.md)
 and the [HTTP API](docs/http-api.md). An opt-in MCP endpoint exposes eight read-only retrieval and search tools;
-see [MCP tools](docs/mcp.md). There is no OCR. The
-repository has no supported release policy.
+see [MCP tools](docs/mcp.md). There is no OCR. Runtime container image tags
+and publication evidence are documented in the
+[container release guide](docs/container-releases.md). No stable-release
+security support window or backport commitment is established; see the
+[Security Policy](SECURITY.md).
 
 ## Requirements
 
@@ -242,7 +245,11 @@ runs native AMD64 and ARM64 Rust checks, browser-worker builds and integration
 tests, container builds, and Docker and Kubernetes harnesses. See
 [CI coverage and reproduction](CONTRIBUTING.md#ci-coverage-and-reproduction)
 for required and extended checks and their acceptance boundaries.
+
 ## Container
+
+For published GHCR image tags, architecture variants, provenance, and
+verification, see the [container release guide](docs/container-releases.md).
 
 Build an image containing the CLI, conversion worker, and browser worker:
 

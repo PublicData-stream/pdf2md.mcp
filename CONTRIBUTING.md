@@ -186,6 +186,14 @@ libraries. The fixture image uses the current stable Python release on Debian
 Trixie. Image tests must exercise conversion, browser acquisition, TLS trust,
 ripgrep, and the unprivileged runtime after dependency or base-image changes.
 
+The public runtime image naming, eligibility gates, exact-image promotion,
+attestations, and publication verification are specified in the
+[container release guide](docs/container-releases.md). CI retains runtime image
+artifacts for 30 days so eligible releases can promote the images built and
+tested for their exact source commit. Other native and fixture artifacts use
+their separately configured retention periods; do not assume they share the
+runtime image retention window.
+
 Build the runtime and fixture images in the selected rootless daemon:
 
 ```sh

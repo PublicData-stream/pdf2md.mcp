@@ -250,8 +250,10 @@ Build an image containing the CLI, conversion worker, and browser worker:
 docker build -t pdf2md-mcp .
 ```
 
-The image runs as an unprivileged user, uses `/data` for durable storage, and
-starts the daemon with `run`. Mount a persistent volume at `/data`. The
+The build and runtime stages use Alpine Linux 3.24 and native musl binaries
+for AMD64 and ARM64. The image includes CA certificates and runtime libraries
+for all three executables. It runs as an unprivileged user, uses `/data` for
+durable storage, and starts the daemon with `run`. Mount a persistent volume at `/data`. The
 conversion worker is used by the CLI and daemon for PDF parsing. The browser
 worker is included and used only for `obscura` or `browser` sources. The image
 does not include or manage PostgreSQL. If a build environment intercepts HTTPS, provide

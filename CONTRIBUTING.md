@@ -139,7 +139,7 @@ failures do not cancel other lanes, and the summary rejects failed, cancelled
 or unexpectedly skipped required groups.
 
 CI uses a dedicated rootless Docker daemon with storage under `/tmp`, Minikube
-1.39.0, Kubernetes 1.37.0 and containerd. Local harnesses require the same
+1.39.0, Kubernetes 1.37.2 and containerd. Local harnesses require the same
 rootless Docker storage boundary and create fresh profiles. Keep credentials,
 certificates, Docker volumes, caches, kubeconfigs and test outputs under `/tmp`.
 Before starting Docker, CI starts the runner's user manager and D-Bus socket,
@@ -176,8 +176,15 @@ python3 scripts/ci/check.py images --compose-json /tmp/pdf2md-ci-images.json > /
 set -a
 . /tmp/pdf2md-ci-images.env
 set +a
-export PDF2MD_TEST_KUBERNETES_VERSION=v1.37.0
+export PDF2MD_TEST_KUBERNETES_VERSION=v1.37.2
 ```
+
+The application image uses digest-pinned Alpine build/runtime stages and
+native musl binaries on AMD64 and ARM64. Its build scripts use dynamic musl
+linking so bindgen can load libclang; the runtime includes the required shared
+libraries. The fixture image uses the current stable Python release on Debian
+Trixie. Image tests must exercise conversion, browser acquisition, TLS trust,
+ripgrep, and the unprivileged runtime after dependency or base-image changes.
 
 Build the runtime and fixture images in the selected rootless daemon:
 
@@ -270,8 +277,17 @@ builds, Kubernetes, native ARM64 or hosted Actions acceptance.
 
 Dependabot opens weekly action, Docker/Compose, Cargo and npm update PRs without
 automatic merging. Coordinate Rust image/toolchain changes with documented
-versions. Installer versions/checksums in `scripts/ci/install-tools.sh` receive
-manual review. Native jobs and image builds limit Cargo/CMake parallelism to
+versions. Update the complete Cargo lockfile and the pnpm lockfile when
+refreshing dependencies, and review new major versions for API changes. Exact
+upstream constraints can retain older transitive versions; report those
+constraints instead of forcing incompatible overrides. Keep Obscura and its
+required prerelease transport versions aligned. Select the kicbase tag and
+digest from the chosen Minikube release's source rather than comparing image
+tag numbers. Check public Cargo and npm advisories separately from builds and
+tests; successful tests do not establish an advisory-free dependency graph.
+
+Installer versions/checksums in `scripts/ci/install-tools.sh` receive manual
+review. Native jobs and image builds limit Cargo/CMake parallelism to
 two; the Dockerfile exposes these as build arguments for local overrides.
 The container build locks its shared target cache and removes cached artifacts
 for the two application packages before compilation. Copied source timestamps

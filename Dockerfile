@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
-FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
+FROM rust:1.99.1-alpine3.24@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS build
 
 ARG CARGO_BUILD_JOBS=2
 ARG CMAKE_BUILD_PARALLEL_LEVEL=2
@@ -8,21 +8,24 @@ ENV CARGO_HOME=/usr/local/cargo \
     CARGO_TARGET_DIR=/tmp/rust/target \
     TMPDIR=/tmp
 
+# Bindgen build scripts must load libclang through musl dynamic linking.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+
 WORKDIR /build
 
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends \
-        build-essential \
+RUN apk add --no-cache \
+        build-base \
         ca-certificates \
         clang \
         cmake \
-        libclang-dev \
-        libssl-dev \
+        git \
+        linux-headers \
         llvm-dev \
-        ninja-build \
-        pkg-config \
-        python3 \
-    && rm -rf /var/lib/apt/lists/*
+        clang-dev \
+        openssl-dev \
+        ninja \
+        pkgconf \
+        python3
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -54,25 +57,25 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     python3 -c 'import json,pathlib,shutil,subprocess; m=json.loads(subprocess.check_output(["cargo","metadata","--locked","--offline","--format-version=1"])); [(lambda p: [(lambda f: (pathlib.Path("/out/http",p["name"]).mkdir(parents=True,exist_ok=True),shutil.copy2(f,pathlib.Path("/out/http",p["name"],f.name))))(f) for f in pathlib.Path(p["manifest_path"]).parent.glob("LICENSE*") if f.is_file()])(p) for p in m["packages"] if p["name"] in ("axum","utoipa","zip","rmcp","rmcp-macros","pulldown-cmark","hex")]'
 
-FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
 
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends \
+RUN apk add --no-cache \
         ca-certificates \
-        libgcc-s1 \
+        libgcc \
         libssl3 \
-        libstdc++6 \
+        libstdc++ \
         ripgrep \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --uid 10001 --create-home --home-dir /home/pdf2md \
-        --shell /usr/sbin/nologin pdf2md \
-    && install -d --owner=10001 --group=10001 /data \
-    && install -d /usr/share/licenses/pdf2md-mcp
+        ripgrep-doc \
+    && addgroup -g 10001 pdf2md \
+    && adduser -D -u 10001 -G pdf2md -h /home/pdf2md -s /sbin/nologin pdf2md \
+    && mkdir -p /data /usr/share/licenses/pdf2md-mcp \
+    && chown 10001:10001 /data
 
 COPY --from=build --chown=10001:10001 /out/pdf2md-mcp /usr/local/bin/pdf2md-mcp
 COPY --from=build --chown=10001:10001 /out/pdf2md-convert-worker /usr/local/bin/pdf2md-convert-worker
 COPY --from=build --chown=10001:10001 /out/pdf2md-obscura-worker /usr/local/bin/pdf2md-obscura-worker
 COPY LICENSE /usr/share/licenses/pdf2md-mcp/LICENSE
+COPY licenses/ripgrep/ /usr/share/licenses/pdf2md-mcp/ripgrep/
 COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/pdf2md-mcp/THIRD_PARTY_NOTICES.md
 COPY --from=build /out/obscura/ /usr/share/licenses/pdf2md-mcp/obscura/
 COPY --from=build /out/pdf_oxide/ /usr/share/licenses/pdf2md-mcp/pdf_oxide/

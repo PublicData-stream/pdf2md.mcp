@@ -66,7 +66,11 @@ The MCP endpoint uses the official [Rust MCP SDK](https://github.com/modelcontex
 `Cargo.lock` records the exact versions. The container copies license files
 from these locked crates under `/usr/share/licenses/pdf2md-mcp/http/`.
 
-The runtime image installs Debian's [ripgrep](https://github.com/BurntSushi/ripgrep)
-package (MIT OR Unlicense); its package copyright and license information
-is available under `/usr/share/doc/ripgrep/`. The service invokes ripgrep
-only with server-constructed arguments against verified Markdown input.
+The Alpine runtime installs [ripgrep](https://github.com/BurntSushi/ripgrep)
+(MIT OR Unlicense). The repository includes its upstream 15.1.0
+[`LICENSE-MIT`](https://github.com/BurntSushi/ripgrep/blob/15.1.0/LICENSE-MIT)
+and [`UNLICENSE`](https://github.com/BurntSushi/ripgrep/blob/15.1.0/UNLICENSE)
+under `licenses/ripgrep/`; the image copies them into
+`/usr/share/licenses/pdf2md-mcp/ripgrep/`. The `ripgrep-doc` package provides
+`/usr/share/man/man1/rg.1.gz`. The service invokes ripgrep only with
+server-constructed arguments against verified Markdown input.

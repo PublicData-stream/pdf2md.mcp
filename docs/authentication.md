@@ -195,8 +195,9 @@ Browser grants:
   script-readable cookie and `iss` against the configured issuer, then removes
   the fragment from the address bar.
 
-Pages share a dark-only stylesheet using the GitHub Dark color range (`/oauth/oauth.css`) and a copy-button
-script (`/oauth/page.js`), with no inline scripts or styles. The result pages
+Pages share a dark-only stylesheet (`/oauth/oauth.css`) in the GitHub Dark
+color range and a copy-button script (`/oauth/page.js`), with no inline scripts
+or styles. The result pages
 show the token type, lifetime and granted scopes next to the tokens. Browser
 navigations that send `Accept: text/html` receive an HTML error page from
 `/oauth/login` and `/oauth/callback` with the same status, error code and

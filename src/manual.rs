@@ -33,8 +33,8 @@ fn same(a: &Metadata, b: &Metadata) -> bool {
 fn source_id(relative: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
     format!(
-        "manual:{:x}",
-        Sha256::digest(relative.as_os_str().as_bytes())
+        "manual:{}",
+        hex::encode(Sha256::digest(relative.as_os_str().as_bytes()))
     )
 }
 fn candidate(path: &Path) -> bool {
@@ -176,7 +176,7 @@ fn copy_stable(
         ));
     }
     staged.flush().map_err(io_error)?;
-    Ok((staged, format!("{:x}", hash.finalize())))
+    Ok((staged, hex::encode(hash.finalize())))
 }
 
 // Resolve every component relative to an already-open directory without following links.

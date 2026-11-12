@@ -271,6 +271,7 @@ pub struct Authenticator {
 impl Authenticator {
     pub async fn new(config: AuthConfig) -> Result<Self> {
         config.validate()?;
+        crate::configure_tls();
         let provider = if config.mode == AuthMode::Oauth2 {
             let oidc = config.oidc.expect("validated OIDC configuration");
             let mut builder = reqwest::Client::builder()

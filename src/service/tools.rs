@@ -30,7 +30,7 @@ impl ToolState {
         hash.update(binding.as_bytes());
         hash.update(offset.to_be_bytes());
         hash.update(self.secret.as_bytes());
-        format!("{:x}", hash.finalize())
+        hex::encode(hash.finalize())
     }
     fn encode(&self, workspace: &Path, binding: &str, offset: usize) -> String {
         format!("{offset}.{}", self.signature(workspace, binding, offset))

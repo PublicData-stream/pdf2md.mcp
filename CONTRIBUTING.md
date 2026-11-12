@@ -45,7 +45,7 @@ code for filenames, commands, and identifiers.
 
 ## Development and Validation
 
-Use Rust 1.88 or newer and install ripgrep (`rg`) on `PATH` for the core and
+Use Rust 1.99.1 or newer and install ripgrep (`rg`) on `PATH` for the core and
 MCP search tests (for example, `sudo apt-get install ripgrep` on Ubuntu).
 From the repository root, build the CLI and its
 conversion worker together, and build the separate browser worker with:
@@ -236,7 +236,7 @@ stays in `/tmp/pdf2md-ci/cargo`. The helper verifies the compiler version,
 isolated sysroot and component commands, then selects the runner proxies and
 exact toolchain for subsequent steps. Missing runner tools or failed checks
 fail setup; jobs with `rust: 'false'` do not invoke it. Local development still
-accepts Rust 1.88 or newer; there is no repository toolchain override.
+accepts Rust 1.99.1 or newer; there is no repository toolchain override.
 
 For focused Rust setup validation, run `bash -n scripts/ci/setup-rust.sh`,
 `actionlint`, `python3 scripts/ci/check.py source` and the Python helper tests

@@ -91,6 +91,7 @@ async fn acquire_inner(
         if remaining.is_zero() {
             return Err(LoadError::new("run_timeout", "loading deadline exceeded"));
         }
+        crate::configure_tls();
         let mut builder = Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
@@ -216,7 +217,7 @@ mod tests {
     ) {
         let cert = rcgen::generate_simple_self_signed(vec!["fixture.example".into()]).unwrap();
         let root = reqwest::Certificate::from_der(cert.cert.der()).unwrap();
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert.cert.der().clone()], key.into())

@@ -528,3 +528,21 @@ fn metadata_limits_default_and_reject_out_of_bounds() {
     invalid.max_outline_depth += 1;
     assert!(invalid.validate().is_err());
 }
+
+#[test]
+fn conversion_profile_keys_preserve_existing_sha256_identity() {
+    assert_eq!(
+        pdf2md_mcp::conversion::types::profile_key("abc", &ConversionOptions::default()).unwrap(),
+        "e43b4c62576dce0385617b90889aa5397161ce28f8d89b55188eb806cb61cd20"
+    );
+    assert_eq!(
+        pdf2md_mcp::conversion::types::profile_key(
+            "abc",
+            &ConversionOptions {
+                pages: Some(vec![1, 3])
+            }
+        )
+        .unwrap(),
+        "3bb235454ff2f507a908aa8069f62b6709114529a05171eb6e4fbf5d69b66e54"
+    );
+}

@@ -202,7 +202,7 @@ async fn read_output(
                 file.flush().await.map_err(io_error)?;
                 artifacts.push(Artifact {
                     path,
-                    sha256: format!("{:x}", hash.finalize()),
+                    sha256: hex::encode(hash.finalize()),
                     bytes,
                 });
             }

@@ -308,18 +308,18 @@ async fn postgres_migration_bundle_export_and_namespace_isolation() {
         warnings: vec![],
         artifacts: vec![Artifact {
             path: "document.md".into(),
-            sha256: format!("{:x}", Sha256::digest(content)),
+            sha256: hex::encode(Sha256::digest(content)),
             bytes: content.len() as u64,
         }],
     };
     let json = serde_json::to_vec(&manifest).unwrap();
-    let bundle = format!("{:x}", Sha256::digest(&json));
+    let bundle = hex::encode(Sha256::digest(&json));
     let dir = one.path().join("conversions").join(&bundle);
     std::fs::create_dir(&dir).unwrap();
     std::fs::write(dir.join("manifest.json"), &json).unwrap();
     std::fs::write(dir.join("document.md"), content).unwrap();
     let ns = std::fs::read_to_string(one.path().join("store-id")).unwrap();
-    sqlx::query("UPDATE conversion_attempts SET status='succeeded',bundle_id=$1,profile_key=$2 WHERE namespace=$3 AND id=$4").bind(&bundle).bind(format!("{:x}", Sha256::digest(serde_json::to_vec(&(&document, &manifest.converter, &options)).unwrap()))).bind(ns.trim()).bind(&pending[0].id).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE conversion_attempts SET status='succeeded',bundle_id=$1,profile_key=$2 WHERE namespace=$3 AND id=$4").bind(&bundle).bind(hex::encode(Sha256::digest(serde_json::to_vec(&(&document, &manifest.converter, &options)).unwrap()))).bind(ns.trim()).bind(&pending[0].id).execute(&pool).await.unwrap();
     let output = one.path().join("export");
     Store::export_conversion(one.path(), Some(&url), &pending[0].id, &output)
         .await
@@ -398,12 +398,12 @@ async fn interrupted_publication_removes_orphan_but_preserves_committed_bundle()
             warnings: vec![],
             artifacts: vec![Artifact {
                 path: "document.md".into(),
-                sha256: format!("{:x}", Sha256::digest(content)),
+                sha256: hex::encode(Sha256::digest(content)),
                 bytes: content.len() as u64,
             }],
         };
         let json = serde_json::to_vec(&manifest).unwrap();
-        let id = format!("{:x}", Sha256::digest(&json));
+        let id = hex::encode(Sha256::digest(&json));
         let path = root.path().join("conversions").join(&id);
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("manifest.json"), json).unwrap();
@@ -489,20 +489,19 @@ async fn legacy_profile_survives_reopen_export_and_requires_upgrade_for_pages() 
         warnings: vec![],
         artifacts: vec![Artifact {
             path: "document.md".into(),
-            sha256: format!("{:x}", Sha256::digest(content)),
+            sha256: hex::encode(Sha256::digest(content)),
             bytes: content.len() as u64,
         }],
     };
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    let bundle = format!("{:x}", Sha256::digest(&manifest_bytes));
+    let bundle = hex::encode(Sha256::digest(&manifest_bytes));
     let path = shared.join("conversions").join(&bundle);
     std::fs::create_dir(&path).unwrap();
     std::fs::write(path.join("manifest.json"), &manifest_bytes).unwrap();
     std::fs::write(path.join("document.md"), content).unwrap();
-    let profile = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&(&document, &manifest.converter, &options)).unwrap())
-    );
+    let profile = hex::encode(Sha256::digest(
+        serde_json::to_vec(&(&document, &manifest.converter, &options)).unwrap(),
+    ));
     let fixtures = [
         ("", 0u64, None),
         ("가\n나", 2, Some((2u64, 2u64, 3u64))),
@@ -527,20 +526,19 @@ async fn legacy_profile_survives_reopen_export_and_requires_upgrade_for_pages() 
             warnings: vec![],
             artifacts: vec![Artifact {
                 path: "document.md".into(),
-                sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+                sha256: hex::encode(Sha256::digest(text.as_bytes())),
                 bytes: text.len() as u64,
             }],
         };
         let bytes = serde_json::to_vec(&item).unwrap();
-        let id = format!("{:x}", Sha256::digest(&bytes));
+        let id = hex::encode(Sha256::digest(&bytes));
         let path = shared.join("conversions").join(&id);
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("manifest.json"), bytes).unwrap();
         std::fs::write(path.join("document.md"), text).unwrap();
-        let key = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&(&document, &item.converter, &opts)).unwrap())
-        );
+        let key = hex::encode(Sha256::digest(
+            serde_json::to_vec(&(&document, &item.converter, &opts)).unwrap(),
+        ));
         cases.push((entry.id, id, key, text, lines, range));
     }
     drop(store);
@@ -736,25 +734,22 @@ async fn read_section_handles_nested_cross_page_utf8_and_unavailable_metadata() 
                 .iter()
                 .map(|(path, bytes)| Artifact {
                     path: (*path).into(),
-                    sha256: format!("{:x}", Sha256::digest(bytes)),
+                    sha256: hex::encode(Sha256::digest(bytes)),
                     bytes: bytes.len() as u64,
                 })
                 .collect(),
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let bundle = format!("{:x}", Sha256::digest(&bytes));
+        let bundle = hex::encode(Sha256::digest(&bytes));
         let path = shared.join("conversions").join(&bundle);
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("manifest.json"), bytes).unwrap();
         for (name, bytes) in contents {
             std::fs::write(path.join(name), bytes).unwrap();
         }
-        let profile = format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&(&document, &manifest.converter, &options)).unwrap()
-            )
-        );
+        let profile = hex::encode(Sha256::digest(
+            serde_json::to_vec(&(&document, &manifest.converter, &options)).unwrap(),
+        ));
         ids.push((attempt.id, bundle, profile));
     }
     drop(store);

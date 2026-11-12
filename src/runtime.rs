@@ -353,7 +353,6 @@ json.dump({'status':'ok','acquired':{'bytes':len(b),'final_url':j['url']}},sys.s
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             cancel.cancel();
-            panic!("daemon did not register both manual and scheduled work");
         };
         let (result, ()) = tokio::time::timeout(Duration::from_secs(15), async {
             tokio::join!(
@@ -367,6 +366,16 @@ json.dump({'status':'ok','acquired':{'bytes':len(b),'final_url':j['url']}},sys.s
         .await
         .unwrap();
         result.unwrap();
+        let seen = seen.into_inner().unwrap();
+        assert!(
+            seen.iter().any(|source| source.starts_with("manual:"))
+                && seen
+                    .iter()
+                    .filter(|source| source.as_str() == "scheduled")
+                    .count()
+                    >= 2,
+            "daemon did not register both manual and scheduled work: {seen:?}"
+        );
         let history = store.history(None).await.unwrap();
         assert!(!history.iter().any(|o| o.source_id == "on-demand"));
         assert!(store.next_due("scheduled").await.unwrap().is_some());

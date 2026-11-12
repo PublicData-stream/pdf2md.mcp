@@ -38,8 +38,10 @@ impl Drop for Fixture {
 impl Fixture {
     async fn new(method: TokenValidation) -> Self {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
-        let CertifiedKey { cert, key_pair } =
-            generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let CertifiedKey {
+            cert,
+            signing_key: key_pair,
+        } = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let ca = dir.path().join("ca.pem");
         std::fs::write(&ca, cert.pem()).unwrap();
         let secret = dir.path().join("secret");

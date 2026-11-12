@@ -3,7 +3,7 @@ name = "pdf2md-mcp"
 version = "0.1.0"
 edition = "2024"
 default-run = "pdf2md-mcp"
-rust-version = "1.88"
+rust-version = "1.99.1"
 license = "AGPL-3.0-only"
 description = "Operator-controlled PDF acquisition, history, and Markdown conversion"
 
@@ -18,35 +18,36 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 futures-util = "0.3"
+hex = "0.4"
 httpdate = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 libc = "0.2"
 notify = "8"
 pdf_oxide = "=0.3.78"
-pulldown-cmark = { version = "=0.13.4", default-features = false }
-rand = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "gzip", "brotli", "deflate"] }
+pulldown-cmark = { version = "=0.13.6", default-features = false }
+rand = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "form", "json", "stream", "gzip", "brotli", "deflate"] }
 rmcp = { version = "=3.9.0", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "postgres", "any"] }
+sha2 = "0.11"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite", "postgres", "any"] }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
-toml = "0.8"
+toml = "1.2"
 url = { version = "2", features = ["serde"] }
-utoipa = "5"
+utoipa = "6"
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 rmcp = { version = "=3.9.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
-rcgen = "0.13"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.14"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 [lints.rust]

@@ -37,7 +37,6 @@ fn row(row: sqlx::any::AnyRow) -> Result<ConversionAttempt> {
         bundle_id: row.try_get("bundle_id").map_err(db_error)?,
     })
 }
-const COLS: &str = "id,document_id,profile_key,options,status,automatic,created_at,finished_at,error_code,bundle_id";
 pub(crate) async fn insert(
     tx: &mut Transaction<'_, Any>,
     ns: &str,
@@ -141,7 +140,7 @@ fn open_verified_artifact(
         hash.update(&buffer[..n]);
     }
     check()?;
-    if count != artifact.bytes || format!("{:x}", hash.finalize()) != artifact.sha256 {
+    if count != artifact.bytes || hex::encode(hash.finalize()) != artifact.sha256 {
         return Err(corrupt());
     }
     file.seek(SeekFrom::Start(0)).map_err(io_error)?;
@@ -149,8 +148,8 @@ fn open_verified_artifact(
 }
 impl Store {
     async fn conversion_attempt(&self, id: &str) -> Result<ConversionAttempt> {
-        let q = format!("SELECT {COLS} FROM conversion_attempts WHERE namespace=$1 AND id=$2");
-        let r = sqlx::query(&q)
+        let q = "SELECT id,document_id,profile_key,options,status,automatic,created_at,finished_at,error_code,bundle_id FROM conversion_attempts WHERE namespace=$1 AND id=$2";
+        let r = sqlx::query(q)
             .bind(&self.namespace)
             .bind(id)
             .fetch_optional(&self.pool)
@@ -167,11 +166,9 @@ impl Store {
     ) -> Result<ConversionAttempt> {
         self.open_document(document_id).await?;
         let key = profile_key(document_id, options)?;
-        let q = format!(
-            "SELECT {COLS} FROM conversion_attempts WHERE namespace=$1 AND profile_key=$2 AND (status IN ('pending','running') OR (status='succeeded' AND $3=0)) ORDER BY created_at DESC,id DESC LIMIT 1"
-        );
+        let q = "SELECT id,document_id,profile_key,options,status,automatic,created_at,finished_at,error_code,bundle_id FROM conversion_attempts WHERE namespace=$1 AND profile_key=$2 AND (status IN ('pending','running') OR (status='succeeded' AND $3=0)) ORDER BY created_at DESC,id DESC LIMIT 1";
         let mut tx = self.pool.begin().await.map_err(db_error)?;
-        if let Some(r) = sqlx::query(&q)
+        if let Some(r) = sqlx::query(q)
             .bind(&self.namespace)
             .bind(&key)
             .bind(i32::from(force))
@@ -239,10 +236,8 @@ impl Store {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ConversionAttempt>> {
-        let q = format!(
-            "SELECT {COLS} FROM conversion_attempts WHERE namespace=$1 AND ($2 IS NULL OR document_id=$2) ORDER BY created_at,id LIMIT $3 OFFSET $4"
-        );
-        sqlx::query(&q)
+        let q = "SELECT id,document_id,profile_key,options,status,automatic,created_at,finished_at,error_code,bundle_id FROM conversion_attempts WHERE namespace=$1 AND ($2 IS NULL OR document_id=$2) ORDER BY created_at,id LIMIT $3 OFFSET $4";
+        sqlx::query(q)
             .bind(&self.namespace)
             .bind(document)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
@@ -255,10 +250,8 @@ impl Store {
             .collect()
     }
     pub async fn pending_conversions(&self) -> Result<Vec<ConversionAttempt>> {
-        let q = format!(
-            "SELECT {COLS} FROM conversion_attempts WHERE namespace=$1 AND status='pending' ORDER BY created_at,id LIMIT 32"
-        );
-        sqlx::query(&q)
+        let q = "SELECT id,document_id,profile_key,options,status,automatic,created_at,finished_at,error_code,bundle_id FROM conversion_attempts WHERE namespace=$1 AND status='pending' ORDER BY created_at,id LIMIT 32";
+        sqlx::query(q)
             .bind(&self.namespace)
             .fetch_all(&self.pool)
             .await
@@ -271,10 +264,8 @@ impl Store {
         &self,
         attempt_id: &str,
     ) -> Result<Option<ConversionAttempt>> {
-        let q = format!(
-            "SELECT {COLS} FROM conversion_attempts WHERE namespace=$1 AND automatic=1 AND document_id=(SELECT document_id FROM observations WHERE namespace=$1 AND attempt_id=$2) ORDER BY created_at,id LIMIT 1"
-        );
-        sqlx::query(&q)
+        let q = "SELECT id,document_id,profile_key,options,status,automatic,created_at,finished_at,error_code,bundle_id FROM conversion_attempts WHERE namespace=$1 AND automatic=1 AND document_id=(SELECT document_id FROM observations WHERE namespace=$1 AND attempt_id=$2) ORDER BY created_at,id LIMIT 1";
+        sqlx::query(q)
             .bind(&self.namespace)
             .bind(attempt_id)
             .fetch_optional(&self.pool)
@@ -284,10 +275,8 @@ impl Store {
             .transpose()
     }
     pub(crate) async fn verify_conversion_bundles(&self) -> Result<()> {
-        let q = format!(
-            "SELECT {COLS} FROM conversion_attempts WHERE namespace=$1 AND status='succeeded'"
-        );
-        let entries = sqlx::query(&q)
+        let q = "SELECT id,document_id,profile_key,options,status,automatic,created_at,finished_at,error_code,bundle_id FROM conversion_attempts WHERE namespace=$1 AND status='succeeded'";
+        let entries = sqlx::query(q)
             .bind(&self.namespace)
             .fetch_all(&self.pool)
             .await
@@ -399,7 +388,7 @@ impl Store {
                 if bytes.len() > 16 * 1024 * 1024 || total > limits.max_output_bytes {
                     return self.finish_error(id, "output_limit", false).await;
                 }
-                let bundle = format!("{:x}", Sha256::digest(&bytes));
+                let bundle = hex::encode(Sha256::digest(&bytes));
                 publish_bundle(&self.root, tmp.path(), &bundle, &bytes, &manifest)?;
                 let mut tx = self.pool.begin().await.map_err(db_error)?;
                 sqlx::query("UPDATE conversion_attempts SET status='succeeded',finished_at=$1,bundle_id=$2 WHERE namespace=$3 AND id=$4 AND status='running'").bind(now()).bind(bundle).bind(&self.namespace).bind(id).execute(&mut *tx).await.map_err(db_error)?;
@@ -465,7 +454,7 @@ fn verify_bundle_contents(
         .take(16 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
-    if bytes.len() > 16 * 1024 * 1024 || format!("{:x}", Sha256::digest(&bytes)) != id {
+    if bytes.len() > 16 * 1024 * 1024 || hex::encode(Sha256::digest(&bytes)) != id {
         return Err(corrupt());
     }
     let manifest: ConversionManifest = serde_json::from_slice(&bytes).map_err(|_| corrupt())?;
@@ -499,7 +488,7 @@ fn verify_bundle_contents(
                 n = n.checked_add(k as u64).ok_or_else(corrupt)?;
                 h.update(&b[..k]);
             }
-            if n != a.bytes || format!("{:x}", h.finalize()) != a.sha256 {
+            if n != a.bytes || hex::encode(h.finalize()) != a.sha256 {
                 return Err(corrupt());
             }
         }
@@ -594,7 +583,7 @@ fn publish_bundle(
             h.update(&b[..k]);
             out.write_all(&b[..k]).map_err(io_error)?;
         }
-        if n != a.bytes || format!("{:x}", h.finalize()) != a.sha256 {
+        if n != a.bytes || hex::encode(h.finalize()) != a.sha256 {
             return Err(corrupt());
         }
         let mut permissions = out.metadata().map_err(io_error)?.permissions();
@@ -722,15 +711,11 @@ impl Store {
             return Ok(Vec::new());
         }
         let q = if document_id.is_some() {
-            format!(
-                "SELECT {COLS} FROM conversion_attempts WHERE namespace=$1 AND document_id=$2 ORDER BY created_at,id"
-            )
+            "SELECT id,document_id,profile_key,options,status,automatic,created_at,finished_at,error_code,bundle_id FROM conversion_attempts WHERE namespace=$1 AND document_id=$2 ORDER BY created_at,id"
         } else {
-            format!(
-                "SELECT {COLS} FROM conversion_attempts WHERE namespace=$1 ORDER BY created_at,id"
-            )
+            "SELECT id,document_id,profile_key,options,status,automatic,created_at,finished_at,error_code,bundle_id FROM conversion_attempts WHERE namespace=$1 ORDER BY created_at,id"
         };
-        let mut query = sqlx::query(&q).bind(ns);
+        let mut query = sqlx::query(q).bind(ns);
         if let Some(id) = document_id {
             query = query.bind(id);
         }
@@ -755,10 +740,8 @@ impl Store {
                 "conversion unavailable",
             ));
         }
-        let q = format!(
-            "SELECT {COLS} FROM conversion_attempts WHERE namespace=$1 AND id=$2 AND status='succeeded'"
-        );
-        let entry = sqlx::query(&q)
+        let q = "SELECT id,document_id,profile_key,options,status,automatic,created_at,finished_at,error_code,bundle_id FROM conversion_attempts WHERE namespace=$1 AND id=$2 AND status='succeeded'";
+        let entry = sqlx::query(q)
             .bind(ns)
             .bind(id)
             .fetch_optional(&pool)
@@ -803,13 +786,13 @@ impl Store {
                 hash.update(&buffer[..n]);
                 out.write_all(&buffer[..n]).map_err(io_error)?;
             }
-            if count != a.bytes || format!("{:x}", hash.finalize()) != a.sha256 {
+            if count != a.bytes || hex::encode(hash.finalize()) != a.sha256 {
                 return Err(corrupt());
             }
             out.sync_all().map_err(io_error)?;
         }
         let manifest_bytes = serde_json::to_vec(&manifest).map_err(|_| corrupt())?;
-        if format!("{:x}", Sha256::digest(&manifest_bytes)) != *bundle {
+        if hex::encode(Sha256::digest(&manifest_bytes)) != *bundle {
             return Err(corrupt());
         }
         let mut manifest_file = OpenOptions::new()
@@ -858,7 +841,7 @@ mod artifact_tests {
         std::fs::write(bundle.join("document.md"), content).unwrap();
         let artifact = crate::conversion::Artifact {
             path: "document.md".into(),
-            sha256: format!("{:x}", Sha256::digest(content)),
+            sha256: hex::encode(Sha256::digest(content)),
             bytes: content.len() as u64,
         };
         let cancel = CancellationToken::new();

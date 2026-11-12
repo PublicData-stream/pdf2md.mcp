@@ -17,3 +17,11 @@ pub mod workspace;
 
 #[cfg(test)]
 mod browser_tests;
+
+// reqwest's provider-free Rustls backend requires explicit initialization.
+// Respect a provider already installed by an embedding application.
+fn configure_tls() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}

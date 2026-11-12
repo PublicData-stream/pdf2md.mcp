@@ -23,7 +23,7 @@ repository has no supported release policy.
 
 ## Requirements
 
-- Rust 1.88 or newer (edition 2024); CI and the container build use Rust 1.99.1.
+- Rust 1.99.1 or newer (edition 2024); CI and the container build use Rust 1.99.1.
 - Linux for the Obscura worker and its process memory monitoring. Direct HTTPS
   acquisition and storage also target the supported Linux deployment.
 - The `pdf2md-obscura-worker` binary when a source uses `obscura` or `browser`

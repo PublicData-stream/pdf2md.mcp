@@ -764,7 +764,7 @@ fn digest_file_controlled(
         count = count.checked_add(n as u64).ok_or_else(corrupt)?;
     }
     Ok((
-        format!("{:x}", hash.finalize()),
+        hex::encode(hash.finalize()),
         count,
         prefix.windows(5).any(|w| w == b"%PDF-"),
     ))

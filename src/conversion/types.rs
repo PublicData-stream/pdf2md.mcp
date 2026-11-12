@@ -221,7 +221,7 @@ pub(crate) fn profile_key_for(
     options.validate()?;
     let value = serde_json::to_vec(&(document_id, converter, options))
         .map_err(|_| LoadError::new("conversion_options", "invalid conversion options"))?;
-    Ok(format!("{:x}", Sha256::digest(value)))
+    Ok(hex::encode(Sha256::digest(value)))
 }
 
 /// Only application-generated relative asset names are accepted across IPC and storage.

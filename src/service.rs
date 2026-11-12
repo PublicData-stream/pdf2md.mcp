@@ -949,7 +949,7 @@ fn snapshot_definitions(
             source.id.clone(),
             PublishedDefinition {
                 source: source_copy,
-                fingerprint: format!("{:x}", hash.finalize()),
+                fingerprint: hex::encode(hash.finalize()),
             },
         );
     }

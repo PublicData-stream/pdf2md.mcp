@@ -107,7 +107,7 @@ pub struct Source {
 impl Source {
     pub fn one_off(url: String, mode: Mode) -> Self {
         use sha2::{Digest, Sha256};
-        let id = format!("url:{:x}", Sha256::digest(url.as_bytes()));
+        let id = format!("url:{}", hex::encode(Sha256::digest(url.as_bytes())));
         Self {
             id,
             url,

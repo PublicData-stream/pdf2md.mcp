@@ -78,7 +78,6 @@ fn row(r: sqlx::any::AnyRow) -> Result<Job> {
         command: serde_json::from_str(&command).map_err(|_| corrupt())?,
     })
 }
-const COLS: &str = "id,kind,command,status,created_at,started_at,finished_at,document_id,observation_id,conversion_id,error_code,(SELECT parent_id FROM api_job_retries links WHERE links.namespace=api_jobs.namespace AND links.job_id=api_jobs.id) AS retry_of";
 pub(crate) async fn insert_job(
     tx: &mut Transaction<'_, Any>,
     ns: &str,
@@ -144,10 +143,8 @@ impl Store {
         }
         let mut tx = self.pool.begin().await.map_err(db_error)?;
         if let Some(key) = key {
-            let q = format!(
-                "SELECT {COLS} FROM api_jobs WHERE namespace=$1 AND id=(SELECT job_id FROM api_idempotency WHERE namespace=$1 AND key=$2)"
-            );
-            if let Some(r) = sqlx::query(&q)
+            let q = "SELECT id,kind,command,status,created_at,started_at,finished_at,document_id,observation_id,conversion_id,error_code,(SELECT parent_id FROM api_job_retries links WHERE links.namespace=api_jobs.namespace AND links.job_id=api_jobs.id) AS retry_of FROM api_jobs WHERE namespace=$1 AND id=(SELECT job_id FROM api_idempotency WHERE namespace=$1 AND key=$2)";
+            if let Some(r) = sqlx::query(q)
                 .bind(&self.namespace)
                 .bind(key)
                 .fetch_optional(&mut *tx)
@@ -273,10 +270,8 @@ impl Store {
         }
     }
     pub async fn job_for_key(&self, key: &str) -> Result<Option<Job>> {
-        let q = format!(
-            "SELECT {COLS} FROM api_jobs WHERE namespace=$1 AND id=(SELECT job_id FROM api_idempotency WHERE namespace=$1 AND key=$2)"
-        );
-        sqlx::query(&q)
+        let q = "SELECT id,kind,command,status,created_at,started_at,finished_at,document_id,observation_id,conversion_id,error_code,(SELECT parent_id FROM api_job_retries links WHERE links.namespace=api_jobs.namespace AND links.job_id=api_jobs.id) AS retry_of FROM api_jobs WHERE namespace=$1 AND id=(SELECT job_id FROM api_idempotency WHERE namespace=$1 AND key=$2)";
+        sqlx::query(q)
             .bind(&self.namespace)
             .bind(key)
             .fetch_optional(&self.pool)
@@ -323,10 +318,8 @@ impl Store {
         ))
     }
     pub async fn queued_jobs(&self, limit: usize) -> Result<Vec<Job>> {
-        let q = format!(
-            "SELECT {COLS} FROM api_jobs WHERE namespace=$1 AND status='queued' ORDER BY created_at,id LIMIT $2"
-        );
-        sqlx::query(&q)
+        let q = "SELECT id,kind,command,status,created_at,started_at,finished_at,document_id,observation_id,conversion_id,error_code,(SELECT parent_id FROM api_job_retries links WHERE links.namespace=api_jobs.namespace AND links.job_id=api_jobs.id) AS retry_of FROM api_jobs WHERE namespace=$1 AND status='queued' ORDER BY created_at,id LIMIT $2";
+        sqlx::query(q)
             .bind(&self.namespace)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .fetch_all(&self.pool)
@@ -337,8 +330,8 @@ impl Store {
             .collect()
     }
     pub async fn jobs(&self) -> Result<Vec<Job>> {
-        let q = format!("SELECT {COLS} FROM api_jobs WHERE namespace=$1 ORDER BY created_at,id");
-        sqlx::query(&q)
+        let q = "SELECT id,kind,command,status,created_at,started_at,finished_at,document_id,observation_id,conversion_id,error_code,(SELECT parent_id FROM api_job_retries links WHERE links.namespace=api_jobs.namespace AND links.job_id=api_jobs.id) AS retry_of FROM api_jobs WHERE namespace=$1 ORDER BY created_at,id";
+        sqlx::query(q)
             .bind(&self.namespace)
             .fetch_all(&self.pool)
             .await
@@ -348,10 +341,8 @@ impl Store {
             .collect()
     }
     pub async fn jobs_page(&self, limit: usize, offset: usize) -> Result<Vec<Job>> {
-        let q = format!(
-            "SELECT {COLS} FROM api_jobs WHERE namespace=$1 ORDER BY created_at,id LIMIT $2 OFFSET $3"
-        );
-        sqlx::query(&q)
+        let q = "SELECT id,kind,command,status,created_at,started_at,finished_at,document_id,observation_id,conversion_id,error_code,(SELECT parent_id FROM api_job_retries links WHERE links.namespace=api_jobs.namespace AND links.job_id=api_jobs.id) AS retry_of FROM api_jobs WHERE namespace=$1 ORDER BY created_at,id LIMIT $2 OFFSET $3";
+        sqlx::query(q)
             .bind(&self.namespace)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .bind(i64::try_from(offset).unwrap_or(i64::MAX))
@@ -363,15 +354,12 @@ impl Store {
             .collect()
     }
     pub async fn queued_jobs_by_kind(&self, conversion: bool, limit: usize) -> Result<Vec<Job>> {
-        let kind = if conversion {
-            "kind='convert'"
+        let q = if conversion {
+            "SELECT id,kind,command,status,created_at,started_at,finished_at,document_id,observation_id,conversion_id,error_code,(SELECT parent_id FROM api_job_retries links WHERE links.namespace=api_jobs.namespace AND links.job_id=api_jobs.id) AS retry_of FROM api_jobs WHERE namespace=$1 AND status='queued' AND kind='convert' ORDER BY created_at,id LIMIT $2"
         } else {
-            "kind<>'convert'"
+            "SELECT id,kind,command,status,created_at,started_at,finished_at,document_id,observation_id,conversion_id,error_code,(SELECT parent_id FROM api_job_retries links WHERE links.namespace=api_jobs.namespace AND links.job_id=api_jobs.id) AS retry_of FROM api_jobs WHERE namespace=$1 AND status='queued' AND kind<>'convert' ORDER BY created_at,id LIMIT $2"
         };
-        let q = format!(
-            "SELECT {COLS} FROM api_jobs WHERE namespace=$1 AND status='queued' AND {kind} ORDER BY created_at,id LIMIT $2"
-        );
-        sqlx::query(&q)
+        sqlx::query(q)
             .bind(&self.namespace)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .fetch_all(&self.pool)
@@ -389,8 +377,8 @@ impl Store {
         Ok(())
     }
     pub async fn job(&self, id: &str) -> Result<Job> {
-        let q = format!("SELECT {COLS} FROM api_jobs WHERE namespace=$1 AND id=$2");
-        row(sqlx::query(&q)
+        let q = "SELECT id,kind,command,status,created_at,started_at,finished_at,document_id,observation_id,conversion_id,error_code,(SELECT parent_id FROM api_job_retries links WHERE links.namespace=api_jobs.namespace AND links.job_id=api_jobs.id) AS retry_of FROM api_jobs WHERE namespace=$1 AND id=$2";
+        row(sqlx::query(q)
             .bind(&self.namespace)
             .bind(id)
             .fetch_optional(&self.pool)

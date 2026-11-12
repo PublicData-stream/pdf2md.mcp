@@ -696,7 +696,7 @@ async fn dispatcher_progresses_fairly_beyond_the_workspace_cache_bound() {
     );
     let command = JobCommand::FetchSource {
         source_id: "published".into(),
-        fingerprint: format!("{:x}", fingerprint.finalize()),
+        fingerprint: hex::encode(fingerprint.finalize()),
     };
     let registry = WorkspaceRegistry::open(root.path()).await.unwrap();
     let mut paths = Vec::new();

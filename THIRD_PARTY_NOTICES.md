@@ -2,11 +2,17 @@
 
 ## jsonwebtoken
 
-The core library uses [`jsonwebtoken` 10.4.0](https://crates.io/crates/jsonwebtoken/10.4.0)
+The core library uses [`jsonwebtoken` 11.1.0](https://crates.io/crates/jsonwebtoken/11.1.0)
 for OAuth access-token signature verification. It is distributed under the
-[MIT License](https://github.com/Keats/jsonwebtoken/blob/v10.4.0/LICENSE).
+[MIT License](https://github.com/Keats/jsonwebtoken/blob/v11.1.0/LICENSE).
 Cargo.lock records its RustCrypto dependency graph. This note does not replace
 the complete dependency license review needed before distribution.
+
+## Hexadecimal identifiers
+
+The application uses [`hex` 0.4.3](https://crates.io/crates/hex/0.4.3)
+(MIT OR Apache-2.0) to encode SHA-256 identifiers. Its license files are copied
+into the shared `/usr/share/licenses/pdf2md-mcp/http/hex/` dependency directory.
 
 ## Obscura
 

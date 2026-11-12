@@ -63,7 +63,7 @@ class Client:
             NoRedirect(),
         )
 
-    def request(self, path, body=None, form=False, auth=None):
+    def request(self, path, body=None, form=False, auth=None, *, timeout=5):
         url = path if path.startswith("http") else self.issuer + path
         headers = {"Accept": "application/json"}
         if body is not None:
@@ -73,7 +73,7 @@ class Client:
             headers["Authorization"] = "Basic " + base64.b64encode((auth[0] + ":" + auth[1]).encode()).decode()
         request = urllib.request.Request(url, data=body, headers=headers)
         try:
-            response = self.opener.open(request, timeout=5)
+            response = self.opener.open(request, timeout=timeout)
         except urllib.error.HTTPError as error:
             response = error
         payload = response.read(256 * 1024)

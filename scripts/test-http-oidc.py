@@ -114,7 +114,7 @@ def resources(root, image, source_mode="live"):
     def pvc(name):
         return {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": name}, "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}}
     deployment = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "oidc-api"}, "spec": {"replicas": 1, "strategy": {"type": "Recreate"}, "selector": {"matchLabels": {"app": "oidc-api"}}, "template": {"metadata": {"labels": {"app": "oidc-api"}, "annotations": {"test-mode": "introspection"}}, "spec": {"securityContext": {"runAsNonRoot": True, "runAsUser": 10001, "runAsGroup": 10001, "fsGroup": 10001}, "containers": [
-        {"name": "provider", "image": provider.IMAGE, "ports": [{"containerPort": 9091}], "volumeMounts": [{"name": "provider-config", "mountPath": "/config", "readOnly": True}, {"name": "provider-state", "mountPath": "/state"}]},
+        {"name": "provider", "image": provider.IMAGE, "ports": [{"containerPort": 9091}], "readinessProbe": {"httpGet": {"scheme": "HTTPS", "path": "/api/health", "port": 9091}, "periodSeconds": 5, "timeoutSeconds": 3}, "volumeMounts": [{"name": "provider-config", "mountPath": "/config", "readOnly": True}, {"name": "provider-state", "mountPath": "/state"}]},
         {"name": "api", "image": image, "imagePullPolicy": "Never", "args": ["--data-dir", "/data", "--config", "/etc/pdf2md/config.toml", "serve", "--listen", "0.0.0.0:8080"], "ports": [{"containerPort": 8080}], "readinessProbe": {"httpGet": {"path": "/readyz", "port": 8080}}, "volumeMounts": [{"name": "data", "mountPath": "/data"}, {"name": "api-config", "mountPath": "/etc/pdf2md", "readOnly": True}, {"name": "provider-config", "mountPath": "/config", "readOnly": True}]}
     ], "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "data"}}, {"name": "provider-state", "persistentVolumeClaim": {"claimName": "provider-state"}}, {"name": "provider-config", "secret": {"secretName": "provider-config"}}, {"name": "api-config", "configMap": {"name": "api-config"}}]}}}}
     # ConfigMap and Secret projections are symlinks; API configuration readers
@@ -157,13 +157,13 @@ def resources(root, image, source_mode="live"):
     return path
 
 
-def api(base, method, path, token=None, data=None, content_type=None):
+def api(base, method, path, token=None, data=None, content_type=None, *, timeout=30):
     headers = {}
     if token: headers["Authorization"] = "Bearer " + token
     if content_type: headers["Content-Type"] = content_type
     request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
     try:
-        response = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=30)
+        response = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=timeout)
     except urllib.error.HTTPError as error:
         response = error
     return response.status, response.read()
@@ -186,17 +186,98 @@ def poll(base, token, job, timeout=180):
     raise RuntimeError("job did not reach a terminal state")
 
 
-def ready(base, control):
-    deadline = time.monotonic() + 150
-    while time.monotonic() < deadline:
+class Startup:
+    """Only fixed categories and numeric/boolean status enter diagnostics."""
+    def __init__(self, phase="initial"):
+        self.phase = phase
+        self.stage = "cluster"
+        self.provider = "not_checked"
+        self.api = "not_checked"
+        self.forward_exit_code = None
+
+    def check_forward(self, forward):
+        code = forward.poll()
+        if code is not None:
+            self.forward_exit_code = code
+            raise RuntimeError(f"OIDC port-forward exited (exit code {code})")
+
+    def diagnose(self, kube):
+        """Collect before deletion, without exposing logs, spec, or messages."""
+        value = {"phase": self.phase, "stage": self.stage,
+                 "provider": self.provider, "api": self.api,
+                 "forward_exit_code": self.forward_exit_code}
         try:
-            status, _, discovery = control.request("/.well-known/openid-configuration")
-            if status == 200 and discovery.get("issuer") == ISSUER and api(base, "GET", "/readyz")[0] == 200:
-                return
-        except (OSError, urllib.error.URLError):
-            pass
-        time.sleep(0.5)
-    raise RuntimeError("provider and HTTP service did not become ready")
+            pods = json.loads(kube("get", "pods", "-l", "app=oidc-api", "-o", "json", timeout=10))["items"]
+            containers = []
+            for pod in pods:
+                for field in ("initContainerStatuses", "containerStatuses"):
+                    for container in pod.get("status", {}).get(field, []):
+                        if container.get("name") not in {"provider", "api", "https-fixture", "stage-api-config", "fixture-local-route"}:
+                            continue
+                        state = container.get("state", {})
+                        row = {"name": container["name"], "ready": container.get("ready") is True,
+                               "state": next((name for name in ("waiting", "running", "terminated") if name in state), "unknown")}
+                        if type(container.get("restartCount")) is int:
+                            row["restarts"] = container["restartCount"]
+                        for name in ("exitCode", "signal"):
+                            number = state.get("terminated", {}).get(name)
+                            if type(number) is int:
+                                row[name] = number
+                        containers.append(row)
+            value["containers"] = containers
+        except Exception:
+            value["containers_status"] = "unavailable"
+        try:
+            directory = Path(os.environ.get("PDF2MD_CI_DIAGNOSTICS_DIR", "/tmp/pdf2md-ci/diagnostics"))
+            if not directory.resolve().is_relative_to("/tmp"):
+                raise ValueError("diagnostics must remain under /tmp")
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "oidc-startup.json").write_text(json.dumps(value, indent=2) + "\n")
+        except Exception:
+            print("OIDC sanitized startup diagnostics could not be written", file=sys.stderr, flush=True)
+
+
+def connection_failure(error):
+    reason = getattr(error, "reason", error)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return "tls_verification_failure"
+    if isinstance(reason, TimeoutError):
+        return "timeout"
+    return "connection_failure"
+
+
+def ready(base, control, forward, startup, *, timeout=150):
+    startup.stage = "readiness"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        startup.check_forward(forward)
+        startup.provider = startup.api = "not_checked"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            status, _, discovery = control.request("/.well-known/openid-configuration", timeout=min(5, remaining))
+            startup.provider = ("unexpected_http_status" if status != 200 else
+                                "invalid_discovery" if not isinstance(discovery, dict) else
+                                "issuer_mismatch" if discovery.get("issuer") != ISSUER else "ready")
+        except (OSError, urllib.error.URLError) as error:
+            startup.provider = connection_failure(error)
+        except (ValueError, UnicodeError):
+            startup.provider = "invalid_discovery"
+        startup.check_forward(forward)
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                status, _ = api(base, "GET", "/readyz", timeout=min(5, remaining))
+                startup.api = "ready" if status == 200 else "unexpected_http_status"
+            except (OSError, urllib.error.URLError) as error:
+                startup.api = connection_failure(error)
+        startup.check_forward(forward)
+        if time.monotonic() < deadline and startup.provider == startup.api == "ready":
+            print("PASS CA-verified OIDC discovery, issuer and forwarded HTTP readiness", flush=True)
+            return
+        time.sleep(max(0, min(0.5, deadline - time.monotonic())))
+    raise RuntimeError(f"OIDC readiness timeout (provider={startup.provider}, api={startup.api})")
 
 
 def run_test(base, control, password, secret, source_mode="live"):
@@ -346,9 +427,11 @@ def main():
         base = f"http://127.0.0.1:{port}"
         forwards = []
         started = False
+        startup = Startup()
         def start_forward():
             proc = subprocess.Popen([*mk, "kubectl", "--", "--cache-dir", str(root / "kube-cache"), "port-forward", "deployment/oidc-api", f"{port}:8080", "9091:9091"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             forwards.append(proc)
+            return proc
         def stop_forward():
             while forwards:
                 proc = forwards.pop()
@@ -363,21 +446,28 @@ def main():
             invoke([*mk, "image", "load", image], env=env, timeout=600)
             if args.source_mode == "fixture":
                 invoke([*mk, "image", "load", os.environ["PDF2MD_FIXTURE_IMAGE"]], env=env, timeout=600)
+            startup.stage = "rollout"
             kube("apply", "-f", str(resources(root, image, args.source_mode)))
             rollout()
-            start_forward()
+            startup.stage = "forward"
+            forward = start_forward()
             control = provider.Client(ISSUER, root / "ca.crt")
             control.cert = root / "ca.crt"
-            ready(base, control)
+            ready(base, control, forward, startup)
+            startup.stage = "acceptance"
             document, job, browser_passed = run_test(base, control, password, secret, args.source_mode)
             stop_forward()
+            startup = Startup("jwt")
+            startup.stage = "rollout"
             cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-config"}, "data": {"config.toml": config("jwt", args.source_mode)}}
             (root / "jwt-config.json").write_text(json.dumps(cm))
             kube("apply", "-f", str(root / "jwt-config.json"))
             kube("rollout", "restart", "deployment/oidc-api")
             rollout()
-            start_forward()
-            ready(base, control)
+            startup.stage = "forward"
+            forward = start_forward()
+            ready(base, control, forward, startup)
+            startup.stage = "acceptance"
             alice = provider.Client(ISSUER, root / "ca.crt").tokens("alice", password, "pdf2md-jwt", secret, SCOPE)
             bob = provider.Client(ISSUER, root / "ca.crt").tokens("bob", password, "pdf2md-jwt", secret, SCOPE)
             jwt = alice["access_token"]
@@ -405,6 +495,10 @@ def main():
             print("PASS expired JWT rejected over HTTP and MCP", flush=True)
             if not browser_passed:
                 raise RuntimeError("configured browser-source acceptance did not pass")
+        except BaseException:
+            # Keep primary errors/cancellation intact and collect before deletion.
+            startup.diagnose(kube)
+            raise
         finally:
             actions = [stop_forward]
             if started:

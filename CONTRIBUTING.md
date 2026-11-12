@@ -197,6 +197,35 @@ existing Cargo build paths. Required CI invokes
 `python3 scripts/test-http-oidc.py IMAGE --source-mode fixture`; `--source-mode live`
 retains external-source acceptance.
 
+The OIDC Kubernetes harness gates both the initial deployment and JWT rollout
+on the provider's HTTPS `/api/health` readiness probe. This Kubernetes probe
+checks listener readiness; host-side discovery still verifies the test CA and
+exact issuer. Readiness checks provider discovery and the forwarded API
+independently with a 150-second polling deadline. Each request's socket
+inactivity timeout is capped at five seconds and the remaining polling budget;
+this is not a hard wall-clock limit on streaming responses. An exited
+port-forward fails immediately, without automatic restarts.
+
+Before deleting a failed OIDC cluster, the harness writes `oidc-startup.json`
+to `PDF2MD_CI_DIAGNOSTICS_DIR` (default `/tmp/pdf2md-ci/diagnostics`). This
+directory must remain under `/tmp`. The report contains the initial/JWT phase,
+startup stage, fixed endpoint-result categories, numeric forwarding exit status,
+and allowlisted container readiness, restart and termination status. It excludes
+raw logs, response bodies, configuration, credentials and arbitrary error text.
+Unavailable diagnostics do not replace the original failure or prevent cleanup.
+The existing CI failure-artifact upload includes this report.
+
+For local readiness acceptance, build the current runtime and fixture images
+using the commands above, then run the following command three times in sequence;
+each invocation creates and deletes a fresh cluster and exercises both rollouts:
+
+```sh
+python3 scripts/test-http-oidc.py "$CI_IMAGE" --source-mode fixture
+```
+
+Run the Python helper tests before these checks. Three successful local runs
+establish repeatability on that host, not hosted CI or native ARM64 acceptance.
+
 External actions use full commit SHAs with version comments. Container images
 use digests; the shared test-image catalog is `scripts/ci/compose.yml`.
 Rust-enabled CI jobs use the official rustup and executable proxies already

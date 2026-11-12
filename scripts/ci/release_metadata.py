@@ -14,7 +14,7 @@ from urllib.parse import quote
 REPOSITORY = "PublicData-stream/pdf2md.mcp"
 IMAGE = "ghcr.io/publicdata-stream/pdf2md.mcp"
 SOURCE = "https://github.com/" + REPOSITORY
-BUILD_TYPE = SOURCE + "/blob/main/docs/container-releases.md#image-promotion"
+PROMOTION_PREDICATE_TYPE = SOURCE + "/blob/main/docs/container-releases.md#image-promotion-v1"
 SHA256 = r"sha256:[0-9a-f]{64}"
 ARCHES = ("amd64", "arm64")
 
@@ -135,7 +135,7 @@ def platform_sbom(plan, row, arch, runtime, lock, lock_digest):
     }
 
 
-def provenance(plan, report, target):
+def promotion(plan, report, target):
     dependencies = [{"uri": "git+" + SOURCE + ".git@" + plan["revision"],
                      "digest": {"gitCommit": plan["revision"]}}]
     for arch in ARCHES if target == "index" else (target,):
@@ -145,26 +145,19 @@ def provenance(plan, report, target):
                              + "/artifacts/" + str(artifact_id),
                              "digest": {"sha256": row["archive_sha256"]}})
     return {
-        "buildDefinition": {
-            "buildType": BUILD_TYPE,
-            "externalParameters": {
-                "operation": "promote-tested-images", "tag": plan["tag"],
-                "revision": plan["revision"], "tagObjectSha": plan["tag_object_sha"],
-                "target": target, "ci": plan["ci"],
-                "platformConfigDigests": {arch: report["platforms"][arch]["config_digest"] for arch in ARCHES},
-            },
-            "internalParameters": {
-                "publicationImplementationRevision": plan["trusted_revision"],
-                "publicationWorkflowRef": os.environ.get("GITHUB_WORKFLOW_REF", "local"),
-                "publicationWorkflowSha": os.environ.get("GITHUB_WORKFLOW_SHA", "local"),
-            },
-            "resolvedDependencies": dependencies,
-        },
-        "runDetails": {
-            "builder": {"id": "https://github.com/" + os.environ.get(
-                "GITHUB_WORKFLOW_REF", REPOSITORY + "/.github/workflows/publish-images.yml@local")},
-            "metadata": {"invocationId": SOURCE + "/actions/runs/" + os.environ.get("GITHUB_RUN_ID", "local")
-                         + "/attempts/" + os.environ.get("GITHUB_RUN_ATTEMPT", "1")},
+        "operation": "promote-tested-images",
+        "source": {"tag": plan["tag"], "revision": plan["revision"],
+                   "tagObjectSha": plan["tag_object_sha"]},
+        "target": target,
+        "ci": plan["ci"],
+        "inputs": dependencies,
+        "platformConfigDigests": {arch: report["platforms"][arch]["config_digest"] for arch in ARCHES},
+        "publication": {
+            "implementationRevision": plan["trusted_revision"],
+            "workflowRef": os.environ.get("GITHUB_WORKFLOW_REF", "local"),
+            "workflowSha": os.environ.get("GITHUB_WORKFLOW_SHA", "local"),
+            "invocationId": SOURCE + "/actions/runs/" + os.environ.get("GITHUB_RUN_ID", "local")
+                            + "/attempts/" + os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
         },
     }
 
@@ -201,7 +194,8 @@ def prepare(args):
         index["dependencies"].extend(sboms[arch]["dependencies"])
     write_json(output / "sbom-index.cdx.json", index)
     for target in (*ARCHES, "index"):
-        write_json(output / ("provenance-" + target + ".json"), provenance(plan, report, target))
+        # Retain artifact names consumed by existing release tooling.
+        write_json(output / ("provenance-" + target + ".json"), promotion(plan, report, target))
     write_json(output / "plan.json", plan)
 
 
@@ -215,6 +209,7 @@ def select(args):
     if "sha256:" + hashlib.sha256(manifest.read_bytes()).hexdigest() != digest:
         raise ValueError("manifest bytes do not match attestation subject digest")
     values = {"digest": digest, "manifest": str(manifest),
+              "predicate_type": PROMOTION_PREDICATE_TYPE,
               "sbom": str(base / ("sbom-" + target + ".cdx.json")),
               "predicate": str(base / ("provenance-" + target + ".json"))}
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as stream:

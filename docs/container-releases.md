@@ -1,13 +1,13 @@
 # Container Releases
 
-## Image promotion
+## Image promotion v1
 
 The configured runtime image name is
 `ghcr.io/publicdata-stream/pdf2md.mcp`.
 Publication promotes the exact AMD64 and ARM64 images built and checked by the
 canonical GitHub Actions workflow. It does not rebuild the application after
-those checks. This guide defines the public image-promotion contract referenced
-by the SLSA provenance `buildType`.
+those checks. This section defines the versioned promotion predicate type
+`https://github.com/PublicData-stream/pdf2md.mcp/blob/main/docs/container-releases.md#image-promotion-v1`.
 
 ## Eligible source tags
 
@@ -32,7 +32,10 @@ Stable and beta publication is triggered by publishing the corresponding
 GitHub Release. Build-candidate publication is triggered only when a matching
 tag is newly created. An existing eligible tag, including a historical tag,
 can be retried with **Actions → Publish runtime images → Run workflow** from
-`main`, supplying its exact name in `release_tag`.
+`main`, supplying its exact name in `release_tag`. To retry
+`0.1.0-build.3d979305` after the workflow repair reaches `main`, start a fresh
+manual dispatch from the repaired `main`; rerunning the old publication run
+uses its old workflow revision.
 
 ## Exact tested-image gate
 
@@ -83,21 +86,35 @@ should use a digest reference, such as
 `ghcr.io/publicdata-stream/pdf2md.mcp@sha256:...`. Workflow checks protect
 canonical tags during promotion, but GHCR does not enforce their immutability.
 
-## Provenance and software inventories
+## Promotion attestations and software inventories
 
-The GitHub-hosted workflow creates SLSA v1 provenance for each platform image
-and the multi-platform index, and CycloneDX SBOM attestations for the platform
-images and aggregate index through GitHub's API-backed attestation service,
-with registry push disabled. Provenance describes image promotion, not an
-independent build: it records the source tag and commit, CI run and attempt,
-image-archive checksums, platform configuration digests, the trusted
-publication implementation, and the actual publication workflow identity.
-Platform and index digests are attested; configuration digests are recorded as
-provenance fields, not attestation subjects. Signed attestation bundles are
-retained as GitHub Actions workflow artifacts. `ghcr-publication-candidate`
-contains the uploaded-image report and inventories, the three
-`ghcr-attestation-*` artifacts contain signed bundles, and `ghcr-publication`
-records final qualification and alias results. Evidence retention is 90 days;
+The GitHub-hosted workflow creates a signed image-promotion attestation and a
+CycloneDX SBOM attestation for each platform image and the multi-platform index
+through GitHub's API-backed attestation service, with registry push disabled.
+The promotion predicate has these fields:
+
+- `operation`: `promote-tested-images`.
+- `source`: the release `tag`, source `revision`, and `tagObjectSha`.
+- `target`: `amd64`, `arm64`, or `index`.
+- `ci`: the selected producing CI run, attempt, and artifact information.
+- `inputs`: the source Git URI and commit digest, and the relevant CI image
+  archive URI and SHA-256 checksum for each platform represented by the target.
+- `platformConfigDigests`: the configuration digests for both architectures.
+- `publication`: `implementationRevision`, `workflowRef`, `workflowSha`, and
+  `invocationId` for the publication workflow.
+
+The platform manifest and index digests are attestation subjects; configuration
+digests are predicate fields. This is a promotion attestation, not SLSA build
+provenance. Its signed claims describe the publication workflow's checks and
+inputs; signature verification does not independently verify the producing CI
+run or rebuild the images.
+
+Signed bundles are retained as GitHub Actions workflow artifacts.
+`ghcr-publication-candidate` contains the uploaded-image report and inventories,
+the three `ghcr-attestation-*` artifacts contain signed bundles, and
+`ghcr-publication` records final qualification and alias results. For
+compatibility, promotion predicate and bundle filenames retain `provenance`,
+and publication report keys retain `provenance`. Evidence retention is 90 days;
 partial reports remain available when a later phase fails.
 
 Each platform SBOM combines the runtime image scan with a separately labelled
@@ -106,15 +123,15 @@ including optional and development packages; it is not a claim that every
 listed package is linked into the runtime executable. The aggregate index SBOM
 combines the platform SBOMs.
 
-Verify a published image's SLSA provenance against the repository and expected
-predicate type with GitHub CLI:
+Verify a published image's promotion attestation against the repository,
+expected signer workflow, subject digest, and predicate type with GitHub CLI:
 
 ```sh
 gh attestation verify \
   oci://ghcr.io/publicdata-stream/pdf2md.mcp@sha256:DIGEST \
   --repo PublicData-stream/pdf2md.mcp \
   --signer-workflow PublicData-stream/pdf2md.mcp/.github/workflows/publish-images.yml \
-  --predicate-type https://slsa.dev/provenance/v1
+  --predicate-type https://github.com/PublicData-stream/pdf2md.mcp/blob/main/docs/container-releases.md#image-promotion-v1
 ```
 
 Use `https://cyclonedx.org/bom` as the predicate type to verify its CycloneDX

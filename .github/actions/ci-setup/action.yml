@@ -48,7 +48,9 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install --yes --no-install-recommends build-essential clang cmake libclang-dev libssl-dev llvm-dev ninja-build pkg-config python3 openssl
+        sudo apt-get install --yes --no-install-recommends build-essential clang cmake libclang-dev libssl-dev llvm-dev ninja-build pkg-config python3 openssl ripgrep
+        rg --version
+        printf '%s\n' 'pdf2md-ci-ripgrep-probe' | rg --no-config --fixed-strings --quiet 'pdf2md-ci-ripgrep-probe'
     - name: Install Rust
       if: inputs.rust == 'true'
       shell: bash

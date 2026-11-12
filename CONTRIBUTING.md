@@ -45,7 +45,9 @@ code for filenames, commands, and identifiers.
 
 ## Development and Validation
 
-Use Rust 1.88 or newer. From the repository root, build the CLI and its
+Use Rust 1.88 or newer and install ripgrep (`rg`) on `PATH` for the core and
+MCP search tests (for example, `sudo apt-get install ripgrep` on Ubuntu).
+From the repository root, build the CLI and its
 conversion worker together, and build the separate browser worker with:
 
 ```sh
@@ -121,6 +123,10 @@ conversion/HTTP/OIDC Minikube harnesses. Native executables and images are built
 once per architecture and shared within the run. Consumers verify commit,
 architecture and checksums. Image configuration IDs identify local images;
 they are not published registry digests or independent provenance.
+
+Rust-enabled CI jobs install Ubuntu's ripgrep package and verify its version
+and a real stdin search before compilation. Missing or unusable ripgrep fails
+dependency setup; MCP HTTP tests exercise search without skipping it.
 
 Daily runs at 03:17 UTC also run large/slow browser cases and live RFC
 acquisition through OIDC Kubernetes. Manual dispatch includes these only when

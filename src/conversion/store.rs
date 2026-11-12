@@ -76,6 +76,7 @@ pub(crate) async fn enqueue_automatic(
     }
     Ok(())
 }
+#[derive(Clone)]
 pub(crate) struct VerifiedBundle {
     root: PathBuf,
     id: String,
@@ -87,15 +88,37 @@ impl VerifiedBundle {
     }
     pub(crate) fn open_artifact(&self, index: usize) -> Result<std::fs::File> {
         let artifact = self.manifest.artifacts.get(index).ok_or_else(corrupt)?;
-        open_verified_artifact(&self.root, &self.id, artifact)
+        open_verified_artifact(&self.root, &self.id, artifact, None)
+    }
+    pub(crate) fn open_artifact_bounded(
+        &self,
+        index: usize,
+        cancel: &CancellationToken,
+        deadline: std::time::Instant,
+    ) -> Result<std::fs::File> {
+        let artifact = self.manifest.artifacts.get(index).ok_or_else(corrupt)?;
+        open_verified_artifact(&self.root, &self.id, artifact, Some((cancel, deadline)))
     }
 }
 fn open_verified_artifact(
     root: &Path,
     bundle: &str,
     artifact: &crate::conversion::Artifact,
+    control: Option<(&CancellationToken, std::time::Instant)>,
 ) -> Result<std::fs::File> {
     use std::io::{Seek, SeekFrom};
+    let check = || -> Result<()> {
+        if let Some((cancel, deadline)) = control {
+            if cancel.is_cancelled() {
+                return Err(LoadError::new("cancelled", "operation cancelled"));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(LoadError::new("search_timeout", "search timed out"));
+            }
+        }
+        Ok(())
+    };
+    check()?;
     if !crate::conversion::valid_artifact_path(&artifact.path) {
         return Err(corrupt());
     }
@@ -109,6 +132,7 @@ fn open_verified_artifact(
     let mut count = 0u64;
     let mut buffer = [0; 65536];
     loop {
+        check()?;
         let n = file.read(&mut buffer).map_err(io_error)?;
         if n == 0 {
             break;
@@ -116,6 +140,7 @@ fn open_verified_artifact(
         count = count.checked_add(n as u64).ok_or_else(corrupt)?;
         hash.update(&buffer[..n]);
     }
+    check()?;
     if count != artifact.bytes || format!("{:x}", hash.finalize()) != artifact.sha256 {
         return Err(corrupt());
     }
@@ -333,6 +358,13 @@ impl Store {
             return self.conversion_attempt(id).await;
         }
         let attempt = self.conversion_attempt(id).await?;
+        // Queued attempts created with an older profile cannot be published under
+        // the new converter identity. Keep the historical attempt immutable.
+        if attempt.profile_key != profile_key(&attempt.document_id, &attempt.options)? {
+            return self
+                .finish_error(id, "conversion_profile_changed", false)
+                .await;
+        }
         let input = self.open_document(&attempt.document_id).await?;
         let tmp = tempfile::Builder::new()
             .prefix("pdf2md-conversion-")
@@ -350,9 +382,9 @@ impl Store {
         match result {
             Ok((summary, artifacts)) => {
                 let manifest = ConversionManifest {
-                    format_version: 1,
+                    format_version: 2,
                     document_id: attempt.document_id.clone(),
-                    converter: "pdf_oxide/0.3.78;profile/1".into(),
+                    converter: crate::conversion::CONVERTER.into(),
                     options: attempt.options.clone(),
                     pages: summary.pages,
                     warnings: summary.warnings,
@@ -437,9 +469,9 @@ fn verify_bundle_contents(
         return Err(corrupt());
     }
     let manifest: ConversionManifest = serde_json::from_slice(&bytes).map_err(|_| corrupt())?;
-    if manifest.format_version != 1
+    if ![1, 2].contains(&manifest.format_version)
         || !valid_hash(&manifest.document_id)
-        || manifest.artifacts.len() > crate::conversion::MAX_ARTIFACTS + 1
+        || manifest.artifacts.len() > crate::conversion::MAX_ARTIFACTS + 3
     {
         return Err(corrupt());
     }
@@ -472,7 +504,12 @@ fn verify_bundle_contents(
             }
         }
     }
-    if !names.contains("document.md") {
+    if !names.contains("document.md")
+        || (manifest.format_version == 2
+            && (!names.contains("text-index.json") || !names.contains("outline.json")))
+        || (manifest.format_version == 1
+            && (names.contains("text-index.json") || names.contains("outline.json")))
+    {
         return Err(corrupt());
     }
     Ok(manifest)
@@ -805,5 +842,43 @@ impl Store {
         }
         sync_dir(parent)?;
         Ok(manifest)
+    }
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_artifact_verification_honors_cancel_and_deadline() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let bundle = root.path().join("conversions").join("test");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let content = b"verified text";
+        std::fs::write(bundle.join("document.md"), content).unwrap();
+        let artifact = crate::conversion::Artifact {
+            path: "document.md".into(),
+            sha256: format!("{:x}", Sha256::digest(content)),
+            bytes: content.len() as u64,
+        };
+        let cancel = CancellationToken::new();
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert!(
+            open_verified_artifact(root.path(), "test", &artifact, Some((&cancel, future))).is_ok()
+        );
+        let expired = std::time::Instant::now();
+        assert_eq!(
+            open_verified_artifact(root.path(), "test", &artifact, Some((&cancel, expired)))
+                .unwrap_err()
+                .code,
+            "search_timeout"
+        );
+        cancel.cancel();
+        assert_eq!(
+            open_verified_artifact(root.path(), "test", &artifact, Some((&cancel, future)))
+                .unwrap_err()
+                .code,
+            "cancelled"
+        );
     }
 }

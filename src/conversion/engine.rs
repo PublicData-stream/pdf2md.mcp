@@ -1,5 +1,8 @@
 //! In-memory PDF conversion. The caller owns all persistence.
-use super::types::{ConversionLimits, ConversionOptions, WorkerSummary};
+use super::{
+    index::{self, Outline, OutlineEntry, PageSpan},
+    types::{ConversionLimits, ConversionOptions, WorkerSummary},
+};
 use crate::error::{LoadError, Result};
 use pdf_oxide::{
     PdfDocument,
@@ -89,6 +92,65 @@ pub fn convert(
         }
         Some(_) => return Err(failure("invalid_pages", "page selection is invalid")),
     };
+    fn convert_outline(
+        items: Vec<pdf_oxide::outline::OutlineItem>,
+        depth: usize,
+        count: &mut usize,
+        limits: &ConversionLimits,
+    ) -> Option<Vec<OutlineEntry>> {
+        if depth > limits.max_outline_depth && !items.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for item in items {
+            *count += 1;
+            if *count > limits.max_outline_entries {
+                return None;
+            }
+            let page = match item.dest {
+                Some(pdf_oxide::outline::Destination::PageIndex(p)) => {
+                    u32::try_from(p).ok().and_then(|p| p.checked_add(1))
+                }
+                _ => None,
+            };
+            out.push(OutlineEntry {
+                title: item.title,
+                page,
+                children: convert_outline(item.children, depth + 1, count, limits)?,
+            });
+        }
+        Some(out)
+    }
+    let mut outline = match doc.get_outline() {
+        Ok(None) => Outline {
+            version: 1,
+            status: "absent".into(),
+            entries: vec![],
+        },
+        Ok(Some(items)) => match convert_outline(items, 1, &mut 0, limits) {
+            Some(entries) => Outline {
+                version: 1,
+                status: "available".into(),
+                entries,
+            },
+            None => Outline {
+                version: 1,
+                status: "unavailable".into(),
+                entries: vec![],
+            },
+        },
+        Err(_) => Outline {
+            version: 1,
+            status: "unavailable".into(),
+            entries: vec![],
+        },
+    };
+    if serde_json::to_vec(&outline).map_or(true, |v| v.len() > limits.max_outline_bytes) {
+        outline.status = "unavailable".into();
+        outline.entries.clear();
+    }
+    let mut spans = Vec::new();
+    let mut contents = Vec::new();
     let mut total = 0u64;
     let mut markdown = String::new();
     let mut assets = 0usize;
@@ -101,6 +163,7 @@ pub fn convert(
         if !markdown.is_empty() {
             markdown.push_str("\n\n---\n\n");
         }
+        let page_start = markdown.len();
         // Markdown's empty-page classifier can decode images itself, so preflight
         // before asking upstream to convert the page.
         let handles = doc
@@ -116,6 +179,7 @@ pub fn convert(
             preflight_image(handle, limits)?;
         }
         markdown.push_str(&format!("<!-- pdf-page: {page} -->\n\n"));
+        let content_start = markdown.len();
         let text = doc
             .to_markdown((page - 1) as usize, &pdf_options)
             .map_err(|_| failure("conversion_failed", "page conversion failed"))?;
@@ -161,6 +225,12 @@ pub fn convert(
             }
             emit(&path, &png)?;
         }
+        spans.push(PageSpan {
+            page,
+            start: page_start as u64,
+            end: markdown.len() as u64,
+        });
+        contents.push((content_start, markdown.len()));
     }
     markdown.push('\n');
     if total
@@ -169,7 +239,29 @@ pub fn convert(
     {
         return Err(failure("output_limit", "conversion exceeds output limit"));
     }
+    let index = index::build_index(
+        &markdown,
+        spans,
+        &contents,
+        limits.max_index_entries,
+        limits.max_index_bytes,
+    );
+    let index_bytes = serde_json::to_vec(&index)
+        .map_err(|_| failure("output_limit", "metadata encoding failed"))?;
+    let outline_bytes = serde_json::to_vec(&outline)
+        .map_err(|_| failure("output_limit", "metadata encoding failed"))?;
+    if index_bytes.len() > limits.max_index_bytes
+        || total
+            .checked_add(markdown.len() as u64)
+            .and_then(|n| n.checked_add(index_bytes.len() as u64))
+            .and_then(|n| n.checked_add(outline_bytes.len() as u64))
+            .is_none_or(|n| n > limits.max_output_bytes)
+    {
+        return Err(failure("output_limit", "conversion exceeds output limit"));
+    }
     emit("document.md", markdown.as_bytes())?;
+    emit("text-index.json", &index_bytes)?;
+    emit("outline.json", &outline_bytes)?;
     // Do not expose upstream text, which can contain document content. Classification is explicit.
     if !doc.structured_warnings().is_empty() {
         warnings.push("parser_reported_warnings".to_string());

@@ -123,3 +123,16 @@ pub fn encrypted_pdf() -> Vec<u8> {
         "/Encrypt 5 0 R /ID [<01020304><01020304>]",
     )
 }
+
+pub fn outline_pdf() -> Vec<u8> {
+    build_pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 6 0 R >>".to_vec(),
+        b"<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>".to_vec(),
+        b"<< /Title (Chapter) /Parent 4 0 R /Dest [3 0 R /Fit] /First 7 0 R /Last 7 0 R >>"
+            .to_vec(),
+        b"<< /Length 0 >>\nstream\n\nendstream".to_vec(),
+        b"<< /Title (Section) /Parent 5 0 R /Dest [3 0 R /Fit] >>".to_vec(),
+    ])
+}

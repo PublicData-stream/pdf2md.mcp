@@ -26,6 +26,19 @@ fn selected_pages_produce_text_and_corresponding_png_assets() {
     )
     .unwrap();
     assert_eq!(summary.pages, vec![1]);
+    let index: pdf2md_mcp::conversion::index::TextIndex = serde_json::from_slice(
+        &output
+            .iter()
+            .find(|(p, _)| p == "text-index.json")
+            .unwrap()
+            .1,
+    )
+    .unwrap();
+    let outline: pdf2md_mcp::conversion::index::Outline =
+        serde_json::from_slice(&output.iter().find(|(p, _)| p == "outline.json").unwrap().1)
+            .unwrap();
+    assert_eq!(outline.status, "absent");
+    assert_eq!(index.pages[0].page, 1);
     let (path, png) = output.iter().find(|(p, _)| p.ends_with(".png")).unwrap();
     assert_eq!(path, "assets/page1_1.png");
     assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
@@ -38,6 +51,7 @@ fn selected_pages_produce_text_and_corresponding_png_assets() {
             .clone(),
     )
     .unwrap();
+    pdf2md_mcp::conversion::index::validate_index(&index, &markdown, &[1]).unwrap();
     assert_eq!(
         markdown,
         "<!-- pdf-page: 1 -->\n\nFirst page\n\n![Image 1 from page 1](assets/page1_1.png)\n"
@@ -428,4 +442,89 @@ fn accepts_jpeg_with_matching_bounded_dimensions() {
     )
     .unwrap();
     assert!(has_png);
+}
+
+#[test]
+fn pdf_bookmarks_are_exported_as_outline() {
+    let mut output = Vec::new();
+    engine::convert(
+        conversion_pdf::outline_pdf(),
+        &ConversionOptions::default(),
+        &ConversionLimits::default(),
+        |path, bytes| {
+            output.push((path.to_string(), bytes.to_vec()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    let outline: pdf2md_mcp::conversion::index::Outline = serde_json::from_slice(
+        &output
+            .iter()
+            .find(|(path, _)| path == "outline.json")
+            .unwrap()
+            .1,
+    )
+    .unwrap();
+    assert_eq!(outline.status, "available");
+    assert_eq!(outline.entries.len(), 1);
+    assert_eq!(outline.entries[0].title, "Chapter");
+}
+
+#[test]
+fn configured_metadata_limits_preserve_pages_and_report_overflow() {
+    let limits = ConversionLimits {
+        max_index_entries: 1,
+        max_outline_depth: 1,
+        ..Default::default()
+    };
+    let mut output = Vec::new();
+    engine::convert(
+        sample_pdf(),
+        &ConversionOptions::default(),
+        &limits,
+        |path, data| {
+            output.push((path.to_owned(), data.to_vec()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    let index: pdf2md_mcp::conversion::index::TextIndex = serde_json::from_slice(
+        &output
+            .iter()
+            .find(|(p, _)| p == "text-index.json")
+            .unwrap()
+            .1,
+    )
+    .unwrap();
+    assert_eq!(index.structure_status, "unavailable");
+    assert!(index.sections.is_empty() && index.blocks.is_empty());
+    assert_eq!(index.pages.len(), 2);
+    output.clear();
+    engine::convert(
+        conversion_pdf::outline_pdf(),
+        &ConversionOptions::default(),
+        &limits,
+        |path, data| {
+            output.push((path.to_owned(), data.to_vec()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    let outline: pdf2md_mcp::conversion::index::Outline =
+        serde_json::from_slice(&output.iter().find(|(p, _)| p == "outline.json").unwrap().1)
+            .unwrap();
+    assert_eq!(outline.status, "unavailable");
+    assert!(outline.entries.is_empty());
+}
+
+#[test]
+fn metadata_limits_default_and_reject_out_of_bounds() {
+    let defaults: ConversionLimits = serde_json::from_str("{}").unwrap();
+    defaults.validate().unwrap();
+    let mut invalid = defaults.clone();
+    invalid.max_index_bytes = 4095;
+    assert!(invalid.validate().is_err());
+    invalid = defaults;
+    invalid.max_outline_depth += 1;
+    assert!(invalid.validate().is_err());
 }

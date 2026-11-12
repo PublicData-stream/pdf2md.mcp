@@ -2,7 +2,7 @@ use crate::error::{LoadError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const CONVERTER: &str = "pdf_oxide/0.3.78;profile/1";
+pub const CONVERTER: &str = "pdf_oxide/0.3.78;profile/2";
 pub const MAX_ARTIFACTS: usize = 100_000;
 pub const MAX_HEADER_BYTES: usize = 1024 * 1024;
 
@@ -70,6 +70,11 @@ pub struct ConversionLimits {
     pub max_address_space_mib: u64,
     pub max_image_pixels: u64,
     pub max_output_bytes: u64,
+    pub max_index_bytes: usize,
+    pub max_index_entries: usize,
+    pub max_outline_bytes: usize,
+    pub max_outline_entries: usize,
+    pub max_outline_depth: usize,
     pub concurrency: usize,
 }
 
@@ -82,6 +87,11 @@ impl Default for ConversionLimits {
             max_address_space_mib: 8192,
             max_image_pixels: 32_000_000,
             max_output_bytes: 1024 * 1024 * 1024,
+            max_index_bytes: super::index::MAX_INDEX_BYTES,
+            max_index_entries: super::index::MAX_ENTRIES,
+            max_outline_bytes: super::index::MAX_OUTLINE_BYTES,
+            max_outline_entries: super::index::MAX_OUTLINE_ENTRIES,
+            max_outline_depth: super::index::MAX_OUTLINE_DEPTH,
             concurrency: 1,
         }
     }
@@ -102,6 +112,11 @@ impl ConversionLimits {
             || self.max_image_pixels == 0
             || self.max_output_bytes < 4096
             || self.max_output_bytes > i64::MAX as u64
+            || !(4096..=super::index::MAX_INDEX_BYTES).contains(&self.max_index_bytes)
+            || !(1..=super::index::MAX_ENTRIES).contains(&self.max_index_entries)
+            || !(256..=super::index::MAX_OUTLINE_BYTES).contains(&self.max_outline_bytes)
+            || !(1..=super::index::MAX_OUTLINE_ENTRIES).contains(&self.max_outline_entries)
+            || !(1..=super::index::MAX_OUTLINE_DEPTH).contains(&self.max_outline_depth)
             || self.concurrency == 0
             || self.concurrency > 32
         {
@@ -211,7 +226,7 @@ pub(crate) fn profile_key_for(
 
 /// Only application-generated relative asset names are accepted across IPC and storage.
 pub fn valid_artifact_path(path: &str) -> bool {
-    if path == "document.md" {
+    if matches!(path, "document.md" | "text-index.json" | "outline.json") {
         return true;
     }
     let Some(name) = path.strip_prefix("assets/page") else {

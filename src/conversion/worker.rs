@@ -20,7 +20,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const HEADER: usize = 1024 * 1024;
-const MAX_FRAMES: usize = 100_001;
+const MAX_FRAMES: usize = 100_003;
 
 #[cfg(unix)]
 struct ProcessGroupGuard(Option<i32>);
@@ -101,7 +101,7 @@ pub fn child_main() -> Result<()> {
 }
 
 fn valid_path(path: &str) -> bool {
-    if path == "document.md" {
+    if matches!(path, "document.md" | "text-index.json" | "outline.json") {
         return true;
     }
     let Some(rest) = path
@@ -150,6 +150,11 @@ async fn read_output(
                 if !valid_path(&path) || !seen.insert(path.clone()) || seen.len() > MAX_FRAMES {
                     return Err(err("worker_protocol"));
                 }
+                if (path == "text-index.json" && bytes > limits.max_index_bytes as u64)
+                    || (path == "outline.json" && bytes > limits.max_outline_bytes as u64)
+                {
+                    return Err(err("worker_protocol"));
+                }
                 total = total
                     .checked_add(bytes)
                     .ok_or_else(|| err("output_limit"))?;
@@ -157,7 +162,7 @@ async fn read_output(
                 if total > limits.max_output_bytes {
                     return Err(err("output_limit"));
                 }
-                if path != "document.md" {
+                if path.starts_with("assets/") {
                     let dir = staging.join("assets");
                     match tokio::fs::create_dir(&dir).await {
                         Ok(()) => {}
@@ -203,6 +208,8 @@ async fn read_output(
             }
             WorkerFrame::Complete { pages, warnings } => {
                 if !seen.contains("document.md")
+                    || !seen.contains("text-index.json")
+                    || !seen.contains("outline.json")
                     || pages.is_empty()
                     || (options.pages.is_none()
                         && pages.iter().enumerate().any(|(i, p)| *p as usize != i + 1))
@@ -213,15 +220,12 @@ async fn read_output(
                         .pages
                         .as_ref()
                         .is_some_and(|expected| expected != &pages)
-                    || seen
-                        .iter()
-                        .filter(|p| p.as_str() != "document.md")
-                        .any(|p| {
-                            p.strip_prefix("assets/page")
-                                .and_then(|x| x.split_once('_'))
-                                .and_then(|(n, _)| n.parse::<u32>().ok())
-                                .is_none_or(|n| pages.binary_search(&n).is_err())
-                        })
+                    || seen.iter().filter(|p| p.starts_with("assets/")).any(|p| {
+                        p.strip_prefix("assets/page")
+                            .and_then(|x| x.split_once('_'))
+                            .and_then(|(n, _)| n.parse::<u32>().ok())
+                            .is_none_or(|n| pages.binary_search(&n).is_err())
+                    })
                     || warnings.len() > limits.max_pages as usize + 1
                     || warnings.iter().any(|s| {
                         s != "parser_reported_warnings"
@@ -242,6 +246,46 @@ async fn read_output(
                 {
                     return Err(err("worker_protocol"));
                 }
+                let markdown = tokio::fs::read_to_string(staging.join("document.md"))
+                    .await
+                    .map_err(|_| err("worker_protocol"))?;
+                let index_bytes = tokio::fs::read(staging.join("text-index.json"))
+                    .await
+                    .map_err(|_| err("worker_protocol"))?;
+                let outline_bytes = tokio::fs::read(staging.join("outline.json"))
+                    .await
+                    .map_err(|_| err("worker_protocol"))?;
+                let index: super::index::TextIndex =
+                    serde_json::from_slice(&index_bytes).map_err(|_| err("worker_protocol"))?;
+                let outline: super::index::Outline =
+                    serde_json::from_slice(&outline_bytes).map_err(|_| err("worker_protocol"))?;
+                if index.sections.len() + index.blocks.len() > limits.max_index_entries {
+                    return Err(err("worker_protocol"));
+                }
+                fn outline_within_limits(
+                    entries: &[super::index::OutlineEntry],
+                    depth: usize,
+                    count: &mut usize,
+                    limits: &ConversionLimits,
+                ) -> bool {
+                    if !entries.is_empty() && depth > limits.max_outline_depth {
+                        return false;
+                    }
+                    for entry in entries {
+                        *count += 1;
+                        if *count > limits.max_outline_entries
+                            || !outline_within_limits(&entry.children, depth + 1, count, limits)
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                }
+                if !outline_within_limits(&outline.entries, 1, &mut 0, limits) {
+                    return Err(err("worker_protocol"));
+                }
+                super::index::validate_index(&index, &markdown, &pages)?;
+                super::index::validate_outline(&outline)?;
                 return Ok((WorkerSummary { pages, warnings }, artifacts));
             }
             WorkerFrame::Error { code } => {

@@ -188,16 +188,22 @@ Browser grants:
 - `/oauth/callback` requires the matching cookie and single-use `state`, then
   checks the [RFC 9207](https://www.rfc-editor.org/rfc/rfc9207) `iss`
   parameter. It is mandatory when the provider advertises it, as Casdoor does.
-  The code is redeemed with its verifier, and a minimal page shows the access
+  The code is redeemed with its verifier, and a result page shows the access
   and refresh tokens. ID tokens are never displayed.
 - `/oauth/implicit` reads the token from the URL fragment in the browser, so
   the server never receives it. The page script checks `state` against a
   script-readable cookie and `iss` against the configured issuer, then removes
   the fragment from the address bar.
 
-Pages use minimal markup, `Cache-Control: no-store`, `Referrer-Policy:
-no-referrer` and a content security policy that allows only same-origin
-scripts.
+Pages share a dark-only stylesheet (`/oauth/oauth.css`) and a copy-button
+script (`/oauth/page.js`), with no inline scripts or styles. The result pages
+show the token type, lifetime and granted scopes next to the tokens. Browser
+navigations that send `Accept: text/html` receive an HTML error page from
+`/oauth/login` and `/oauth/callback` with the same status, error code and
+request ID as the JSON error; other clients keep the JSON body. Provider error
+descriptions are never shown. Responses use `Cache-Control: no-store`,
+`Referrer-Policy: no-referrer` and a content security policy that allows only
+same-origin scripts and styles.
 
 `POST /oauth/device` starts device authorization and returns `device_code`,
 `user_code`, `verification_uri`, `expires_in` and `interval`. Show the user the

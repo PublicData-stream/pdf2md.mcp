@@ -1,8 +1,11 @@
 //! Browser and token-broker routes for the optional registered OAuth client.
 //!
-//! Pages use minimal functional markup. Responses are `no-store` and use the
-//! service's restrictive content security policy and `no-referrer` policy.
-use super::{ApiError, ApiJson, invalid};
+//! Pages share `/oauth/oauth.css` and `/oauth/page.js` and render without
+//! inline scripts or styles. Responses are `no-store` and use the service's
+//! restrictive content security policy and `no-referrer` policy. Browser
+//! navigations (`Accept: text/html`) to `/oauth/login` and `/oauth/callback`
+//! receive an HTML error page; other clients keep the JSON error body.
+use super::{ApiError, ApiJson, BrowserPage, invalid};
 use crate::{
     error::LoadError,
     oauth::{GrantType, OAuthClient, TokenResponse, authorization_error},
@@ -37,7 +40,10 @@ struct OAuthState {
 pub(super) fn router(client: Arc<OAuthClient>) -> Router {
     let mut router = Router::new();
     if client.enabled(GrantType::AuthorizationCode) || client.enabled(GrantType::Implicit) {
-        router = router.route("/oauth/login", get(login));
+        router = router
+            .route("/oauth/login", get(login))
+            .route("/oauth/oauth.css", get(page_css))
+            .route("/oauth/page.js", get(page_js));
     }
     if client.enabled(GrantType::AuthorizationCode) {
         router = router.route("/oauth/callback", get(callback));
@@ -106,9 +112,15 @@ struct LoginQuery {
 /// Start a browser grant: Authorization Code with PKCE (default) or Implicit.
 async fn login(
     State(state): State<OAuthState>,
+    headers: HeaderMap,
     Query(query): Query<LoginQuery>,
-) -> Result<Response, ApiError> {
+) -> Response {
     let grant = query.grant.unwrap_or(GrantType::AuthorizationCode);
+    let result = start_login(&state, grant).await;
+    browser_result(&headers, grant, result)
+}
+
+async fn start_login(state: &OAuthState, grant: GrantType) -> Result<Response, ApiError> {
     if !matches!(grant, GrantType::AuthorizationCode | GrantType::Implicit) {
         return Err(invalid("invalid_request", "unsupported browser grant"));
     }
@@ -160,6 +172,15 @@ async fn callback(
     State(state): State<OAuthState>,
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
+) -> Response {
+    let result = finish_code(&state, &headers, query).await;
+    browser_result(&headers, GrantType::AuthorizationCode, result)
+}
+
+async fn finish_code(
+    state: &OAuthState,
+    headers: &HeaderMap,
+    query: CallbackQuery,
 ) -> Result<Response, ApiError> {
     let returned = query
         .state
@@ -167,7 +188,7 @@ async fn callback(
         .ok_or_else(|| invalid("oauth_state_mismatch", "unknown or expired sign-in"))?;
     // The state must match this browser's cookie, preventing login CSRF and
     // code injection into another user agent's session.
-    if cookie_value(&headers, CODE_COOKIE) != Some(returned) {
+    if cookie_value(headers, CODE_COOKIE) != Some(returned) {
         return Err(invalid(
             "oauth_state_mismatch",
             "unknown or expired sign-in",
@@ -192,7 +213,8 @@ async fn callback(
         .as_deref()
         .ok_or_else(|| invalid("oauth_error", "missing authorization code"))?;
     let tokens = state.client.exchange_code(code, &verifier).await?;
-    let mut response = token_page("Authorization Code", &tokens).into_response();
+    let refreshable = state.client.enabled(GrantType::RefreshToken);
+    let mut response = token_page(&tokens, refreshable).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         cookie(
@@ -207,37 +229,323 @@ async fn callback(
     Ok(response)
 }
 
-fn token_page(flow: &str, tokens: &TokenResponse) -> Html<String> {
-    let refresh = tokens
-        .refresh_token
-        .as_deref()
-        .map(|value| {
-            format!(
-                "<label>Refresh token <textarea id=\"refresh-token\" readonly rows=\"3\">{}</textarea></label>",
-                escape(value)
-            )
-        })
-        .unwrap_or_default();
-    Html(format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>pdf2md sign-in</title></head><body><main><h1>Signed in</h1><p>Grant: {flow}. Token type: {}. Expires in: {} seconds. Scope: {}.</p><label>Access token <textarea id=\"access-token\" readonly rows=\"6\">{}</textarea></label>{refresh}<p>Send the access token as a Bearer credential. <a href=\"/docs\">API console</a></p></main></body></html>\n",
+const CODE_FLOW: &str = "Authorization Code · PKCE";
+const IMPLICIT_FLOW: &str = "Implicit";
+
+fn flow_label(grant: GrantType) -> &'static str {
+    match grant {
+        GrantType::Implicit => IMPLICIT_FLOW,
+        _ => CODE_FLOW,
+    }
+}
+
+fn login_href(grant: GrantType) -> &'static str {
+    match grant {
+        GrantType::Implicit => "/oauth/login?grant=implicit",
+        _ => "/oauth/login",
+    }
+}
+
+/// Status of a page, which selects the header icon and colors.
+#[derive(Clone, Copy)]
+enum PageState {
+    Success,
+    Pending,
+    Error,
+}
+
+impl PageState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Pending => "pending",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// One OAuth browser page. Values in `head` and `body` must already be
+/// escaped; `title` and `message` are escaped here.
+struct Page<'a> {
+    flow: &'a str,
+    state: PageState,
+    title: &'a str,
+    message: &'a str,
+    head: String,
+    body: String,
+    scripts: &'a [&'a str],
+}
+
+impl Page<'_> {
+    fn render(&self) -> String {
+        let scripts: String = self
+            .scripts
+            .iter()
+            .map(|src| format!("<script src=\"{src}\"></script>"))
+            .collect();
+        format!(
+            "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><meta name=\"color-scheme\" content=\"dark\">{head}<title>{title} · pdf2md</title><link rel=\"stylesheet\" href=\"/oauth/oauth.css\"></head><body><header class=\"brand\"><span class=\"mark\" aria-hidden=\"true\">P</span><strong>pdf2md</strong><span>Sign-in</span></header><main id=\"page\" data-state=\"{state}\"><span class=\"flow\">{flow}</span><div class=\"status\"><span class=\"icon\" aria-hidden=\"true\"></span><div><h1 id=\"title\">{title}</h1><p id=\"status\" aria-live=\"polite\">{message}</p></div></div>{body}</main><footer>This page is never cached. Close it when you are done.</footer>{scripts}</body></html>\n",
+            head = self.head,
+            title = escape(self.title),
+            state = self.state.as_str(),
+            flow = escape(self.flow),
+            message = escape(self.message),
+            body = self.body,
+        )
+    }
+}
+
+/// Human-readable lifetime, e.g. `1 hour (3600 s)`.
+fn duration(seconds: Option<u64>) -> String {
+    let Some(seconds) = seconds else {
+        return "Unknown".into();
+    };
+    let plural = |n: u64, unit: &str| format!("{n} {unit}{}", if n == 1 { "" } else { "s" });
+    let (hours, minutes) = (seconds / 3600, seconds % 3600 / 60);
+    let mut parts = Vec::new();
+    if hours > 0 {
+        parts.push(plural(hours, "hour"));
+    }
+    if minutes > 0 {
+        parts.push(plural(minutes, "minute"));
+    }
+    if parts.is_empty() {
+        return plural(seconds, "second");
+    }
+    format!("{} ({seconds} s)", parts.join(" "))
+}
+
+fn scope_chips(scope: &str) -> String {
+    let chips: String = scope
+        .split_whitespace()
+        .map(|item| format!("<span class=\"chip\">{}</span>", escape(item)))
+        .collect();
+    if chips.is_empty() {
+        "<span class=\"none\">None granted</span>".into()
+    } else {
+        format!("<span class=\"chips\">{chips}</span>")
+    }
+}
+
+fn token_field(id: &str, label: &str, hint: &str, rows: u8, value: &str) -> String {
+    format!(
+        "<div class=\"field\"><div class=\"field-head\"><label for=\"{id}\">{label}<small>{hint}</small></label><button type=\"button\" class=\"copy secondary\" data-copy=\"{id}\" hidden>Copy</button></div><textarea id=\"{id}\" readonly rows=\"{rows}\" spellcheck=\"false\">{}</textarea></div>",
+        escape(value)
+    )
+}
+
+const TOKEN_NOTE: &str = "<p class=\"note\"><strong>Treat these tokens like passwords.</strong> pdf2md does not keep them, so copy what you need now. Do not paste them into chats, tickets or shared documents.</p>";
+
+fn usage(refresh: bool) -> String {
+    let refresh = if refresh {
+        "<p>Before the access token expires, exchange the refresh token at <code>POST /oauth/token</code> with <code>{\"grant_type\": \"refresh_token\", \"refresh_token\": \"...\"}</code> and keep the new refresh token it returns.</p>"
+    } else {
+        ""
+    };
+    format!(
+        "<div class=\"usage\"><p>Send the access token as a Bearer credential:</p><pre>Authorization: Bearer &lt;access token&gt;</pre>{refresh}</div>"
+    )
+}
+
+/// Page actions. After a successful sign-in the API console comes first;
+/// after a failure, starting again does.
+fn actions(grant: GrantType, signed_in: bool) -> String {
+    let login = login_href(grant);
+    if signed_in {
+        format!(
+            "<nav class=\"actions\"><a class=\"button\" href=\"/docs\">Open API console</a><a class=\"button secondary\" href=\"{login}\">Sign in again</a></nav>"
+        )
+    } else {
+        format!(
+            "<nav class=\"actions\"><a class=\"button\" href=\"{login}\">Start sign-in again</a><a class=\"button secondary\" href=\"/docs\">Open API console</a></nav>"
+        )
+    }
+}
+
+/// Authorization Code result page. ID tokens are never displayed.
+fn token_page(tokens: &TokenResponse, refreshable: bool) -> Html<String> {
+    let refresh = tokens.refresh_token.as_deref();
+    let mut body = format!(
+        "<dl class=\"details\"><dt>Token type</dt><dd>{}</dd><dt>Expires in</dt><dd>{}</dd><dt>Scope</dt><dd>{}</dd></dl>",
         escape(&tokens.token_type),
-        tokens
-            .expires_in
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "unknown".into()),
-        escape(tokens.scope.as_deref().unwrap_or("")),
-        escape(&tokens.access_token),
-    ))
+        duration(tokens.expires_in),
+        scope_chips(tokens.scope.as_deref().unwrap_or("")),
+    );
+    body.push_str(&token_field(
+        "access-token",
+        "Access token",
+        "Bearer credential for the API and MCP endpoint",
+        6,
+        &tokens.access_token,
+    ));
+    if let Some(refresh) = refresh {
+        body.push_str(&token_field(
+            "refresh-token",
+            "Refresh token",
+            "Obtains new access tokens",
+            3,
+            refresh,
+        ));
+    }
+    body.push_str(TOKEN_NOTE);
+    body.push_str(&usage(refreshable && refresh.is_some()));
+    body.push_str(&actions(GrantType::AuthorizationCode, true));
+    Html(
+        Page {
+            flow: CODE_FLOW,
+            state: PageState::Success,
+            title: "Signed in",
+            message: "Your tokens are ready. Copy them before you close this page.",
+            head: String::new(),
+            body,
+            scripts: &["/oauth/page.js"],
+        }
+        .render(),
+    )
 }
 
 /// Implicit redirect page. The access token stays in the URL fragment and is
 /// read by the page script; the server never receives it.
 async fn implicit_page(State(state): State<OAuthState>) -> Result<Html<String>, ApiError> {
     let require_iss = state.client.check_response_issuer(None).await.is_err();
-    Ok(Html(format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"pdf2md-issuer\" content=\"{}\"><meta name=\"pdf2md-require-iss\" content=\"{require_iss}\"><title>pdf2md sign-in</title></head><body><main><h1>Implicit sign-in</h1><p id=\"status\" aria-live=\"polite\">Reading the authorization response.</p><label>Access token <textarea id=\"access-token\" readonly rows=\"6\"></textarea></label><p><a href=\"/oauth/login?grant=implicit\">Sign in again</a> · <a href=\"/docs\">API console</a></p></main><script src=\"/oauth/implicit.js\"></script></body></html>\n",
-        escape(state.client.issuer()),
-    )))
+    let mut body = String::from(
+        "<noscript><p class=\"note\"><strong>JavaScript is required.</strong> The Implicit grant returns the token to this page's script, so it cannot finish without JavaScript.</p></noscript><section id=\"result\" hidden><dl class=\"details\"><dt>Token type</dt><dd>Bearer</dd><dt>Expires in</dt><dd id=\"expires\">Unknown</dd><dt>Scope</dt><dd id=\"scope\"><span class=\"none\">None granted</span></dd></dl>",
+    );
+    body.push_str(&token_field(
+        "access-token",
+        "Access token",
+        "Bearer credential for the API and MCP endpoint",
+        6,
+        "",
+    ));
+    body.push_str(TOKEN_NOTE);
+    body.push_str(&usage(false));
+    body.push_str("</section>");
+    body.push_str(&actions(GrantType::Implicit, true));
+    Ok(Html(
+        Page {
+            flow: IMPLICIT_FLOW,
+            state: PageState::Pending,
+            title: "Completing sign-in",
+            message: "Checking the authorization response from your provider.",
+            head: format!(
+                "<meta name=\"pdf2md-issuer\" content=\"{}\"><meta name=\"pdf2md-require-iss\" content=\"{require_iss}\">",
+                escape(state.client.issuer())
+            ),
+            body,
+            scripts: &["/oauth/page.js", "/oauth/implicit.js"],
+        }
+        .render(),
+    ))
+}
+
+/// Title and explanation for a sign-in failure. Messages are fixed public
+/// text; provider error descriptions are never shown.
+fn error_text(code: &str) -> (&'static str, Option<&'static str>) {
+    match code {
+        "oauth_state_mismatch" => (
+            "Sign-in expired",
+            Some(
+                "This sign-in is unknown, was already used, is older than ten minutes, or was started in another browser. Start again.",
+            ),
+        ),
+        "oauth_issuer_mismatch" => (
+            "Unexpected provider response",
+            Some(
+                "The authorization response did not come from the configured provider, so it was rejected.",
+            ),
+        ),
+        "oauth_access_denied" => (
+            "Access denied",
+            Some("Authorization was denied by you or the provider."),
+        ),
+        "oauth_grant_disabled" => ("Sign-in method unavailable", None),
+        "service_busy" => (
+            "Too many sign-ins in progress",
+            Some("Wait a moment, then start again."),
+        ),
+        _ => ("Sign-in failed", None),
+    }
+}
+
+/// Render `error` as an HTML page with the JSON response's status, request ID
+/// and retry headers.
+fn error_page(grant: GrantType, error: ApiError) -> Response {
+    let code = error.0.code.clone();
+    let message = error.0.message.clone();
+    let json = error.into_response();
+    let (title, explanation) = error_text(&code);
+    let request_id = json
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let body = format!(
+        "<dl class=\"error-code\"><dt>Error code</dt><dd>{}</dd><dt>Request ID</dt><dd>{}</dd></dl>{}",
+        escape(&code),
+        escape(&request_id),
+        actions(grant, false),
+    );
+    let page = Page {
+        flow: flow_label(grant),
+        state: PageState::Error,
+        title,
+        message: explanation.unwrap_or(&message),
+        head: String::new(),
+        body,
+        scripts: &[],
+    }
+    .render();
+    let mut response = (json.status(), Html(page)).into_response();
+    for name in [
+        header::HeaderName::from_static("x-request-id"),
+        header::RETRY_AFTER,
+    ] {
+        if let Some(value) = json.headers().get(&name) {
+            response.headers_mut().insert(name, value.clone());
+        }
+    }
+    response.extensions_mut().insert(BrowserPage);
+    response
+}
+
+fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.contains("text/html"))
+}
+
+/// Browser navigations receive HTML errors; API clients keep JSON errors.
+fn browser_result(
+    headers: &HeaderMap,
+    grant: GrantType,
+    result: Result<Response, ApiError>,
+) -> Response {
+    match result {
+        Ok(response) => response,
+        Err(error) if wants_html(headers) => error_page(grant, error),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn page_css() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("oauth.css"),
+    )
+}
+
+async fn page_js() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("oauth-page.js"),
+    )
 }
 
 async fn implicit_js() -> impl IntoResponse {

@@ -56,6 +56,8 @@ pub fn router(service: Arc<CallerService>, cancel: CancellationToken) -> Router 
         .enabled
         .then(|| crate::mcp::router(app.service.clone(), app.cancel.clone()));
     let oauth = app.service.oauth_client();
+    let bearer = app.service.config().auth.mode == AuthMode::Oauth2;
+    let headers = move |request: Request, next: Next| response_headers(bearer, request, next);
     let rest = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
@@ -83,13 +85,13 @@ pub fn router(service: Arc<CallerService>, cancel: CancellationToken) -> Router 
         .route("/v1/conversions/{id}/assets/{name}", get(asset))
         .route("/v1/conversions/{id}/bundle.zip", get(bundle))
         .layer(DefaultBodyLimit::max(max))
-        .layer(middleware::from_fn(response_headers))
+        .layer(middleware::from_fn(headers))
         .with_state(app);
     let rest = match oauth {
         Some(client) => rest.merge(
             oauth::router(client)
                 .layer(DefaultBodyLimit::max(JSON_LIMIT))
-                .layer(middleware::from_fn(response_headers)),
+                .layer(middleware::from_fn(headers)),
         ),
         None => rest,
     };
@@ -172,7 +174,28 @@ fn invalid(code: &str, message: &str) -> ApiError {
     LoadError::new(code, message).into()
 }
 
-async fn response_headers(request: Request, next: Next) -> Response {
+/// RFC 6750 section 3.1 challenge for a response to a request that carried
+/// Bearer credentials. Requests without credentials get the bare scheme.
+fn bearer_error(status: StatusCode) -> Option<HeaderValue> {
+    match status {
+        StatusCode::UNAUTHORIZED => {
+            Some(HeaderValue::from_static("Bearer error=\"invalid_token\""))
+        }
+        StatusCode::FORBIDDEN => Some(HeaderValue::from_static(
+            "Bearer error=\"insufficient_scope\"",
+        )),
+        _ => None,
+    }
+}
+
+async fn response_headers(bearer: bool, request: Request, next: Next) -> Response {
+    let presented = bearer
+        && request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split_ascii_whitespace().next())
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer"));
     let mut response = next.run(request).await;
     // Normalize framework-generated rejection responses as well as application errors.
     if response.status().is_client_error()
@@ -195,7 +218,11 @@ async fn response_headers(request: Request, next: Next) -> Response {
         *replacement.status_mut() = status;
         response = replacement;
     }
+    let challenge = presented.then(|| bearer_error(response.status())).flatten();
     let headers = response.headers_mut();
+    if let Some(challenge) = challenge {
+        headers.insert(header::WWW_AUTHENTICATE, challenge);
+    }
     if !headers.contains_key("x-request-id") {
         headers.insert(
             "x-request-id",

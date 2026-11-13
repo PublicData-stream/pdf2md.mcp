@@ -47,10 +47,6 @@ main { width: 100%; max-width: 640px; background: var(--surface); border: 1px so
 [data-state="success"] .icon::before { content: "\2713"; }
 [data-state="error"] .icon { background: var(--bad-bg); color: var(--bad); }
 [data-state="error"] .icon::before { content: "!"; }
-[data-state="pending"] .icon { background: var(--info-bg); }
-[data-state="pending"] .icon::before { content: ""; width: 1.1rem; height: 1.1rem; border-radius: 50%; border: 2.5px solid var(--accent); border-right-color: transparent; animation: spin .8s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) { [data-state="pending"] .icon::before { animation: none; } }
 
 /* Token details. */
 .details { display: grid; grid-template-columns: max-content 1fr; gap: .45rem 1.25rem; margin: 1.75rem 0 0; padding: 1rem 1.25rem; background: var(--surface-2); border-radius: 8px; font-size: .92rem; }

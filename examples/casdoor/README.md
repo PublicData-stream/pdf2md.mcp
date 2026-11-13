@@ -24,7 +24,7 @@ custom scopes from a Casdoor
 
 | Application | Grants | Purpose |
 | --- | --- | --- |
-| `pdf2md-web` | Authorization Code, Implicit, Refresh Token, Device Authorization | Introspection client and registered client of the service |
+| `pdf2md-web` | Authorization Code, Refresh Token, Device Authorization | Introspection client and registered client of the service |
 | `pdf2md-short` | Authorization Code | 72-second access tokens for the JWT expiry check |
 | `pdf2md-machine` | Client Credentials | Application identity |
 
@@ -37,10 +37,11 @@ The opt-in Rust test `tests/live_casdoor.rs` checks:
 
 - Authorization Code with PKCE through `/oauth/login` and `/oauth/callback`,
   including the cookie-bound state and the RFC 9207 `iss` parameter.
-- Implicit through `/oauth/login?grant=implicit`.
-- Device Authorization through `/oauth/device` and `/oauth/token`, including
+- That the result page shows no refresh token, and that no HTTP route redeems
+  a device code or refresh token.
+- Device Authorization through the library client, including
   `authorization_pending` before a second user approves the code.
-- Refresh Token through `/oauth/token`, including rejection of a rotated
+- Refresh Token through the library client, including rejection of a rotated
   refresh token.
 - Client Credentials through the library client, as a separate workspace.
 - Both validators with the `casdoor` token profile, configured scopes,
@@ -65,8 +66,8 @@ introspection endpoint reports refresh tokens as active `Bearer` tokens, and
 its JWTs use the generic `JWT` header type, so the profile requires the signed
 `tokenType` claim `access-token`. Configure the same resource URI as the
 audience and request it as the RFC 8707 `resource`. Casdoor 4.27.1 binds
-Implicit and Client Credentials tokens to the client ID instead; list those
-dedicated client IDs in `additional_audiences`. Register clients explicitly;
+Client Credentials tokens to the client ID instead; list those dedicated
+client IDs in `additional_audiences`. Register clients explicitly;
 this integration does not depend on Dynamic Client Registration.
 
 References:

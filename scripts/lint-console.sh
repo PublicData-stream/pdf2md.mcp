@@ -8,8 +8,7 @@ trap 'rm -rf -- "$workspace"' EXIT
 mkdir -p "$workspace/project/src/http" "$workspace/tmp"
 cp -- "$repo_root/package.json" "$repo_root/pnpm-lock.yaml" \
   "$repo_root/eslint.config.mjs" "$workspace/project/"
-cp -- "$repo_root/src/http/docs.js" "$repo_root/src/http/oauth-implicit.js" \
-  "$workspace/project/src/http/"
+cp -- "$repo_root/src/http/docs.js" "$workspace/project/src/http/"
 
 export TMPDIR="$workspace/tmp"
 export XDG_CACHE_HOME="$workspace/cache"

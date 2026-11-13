@@ -231,7 +231,7 @@ async fn sdk_clients_discover_eight_tools_and_call_for_both_versions() {
 async fn oauth_challenges_and_metadata_and_origins_are_enforced() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
     let mut config = Config {
-        auth: serde_json::from_value(serde_json::json!({"mode":"oauth2","oidc":{"issuer":"https://auth.example.com","audience":"existing-audience","validation":"jwt"}})).unwrap(),
+        auth: serde_json::from_value(serde_json::json!({"mode":"oauth2","oidc":{"issuer":"https://auth.example.com","audience":"https://pdf.example.com/mcp","validation":"jwt"}})).unwrap(),
         ..Config::default()
     };
     config.mcp.enabled = true;
@@ -254,11 +254,63 @@ async fn oauth_challenges_and_metadata_and_origins_are_enforced() {
     let challenge = response.headers()["www-authenticate"].to_str().unwrap();
     assert!(challenge.contains("https://pdf.example.com/.well-known/oauth-protected-resource/mcp"));
     assert!(challenge.contains("pdf2md:read"));
+    assert!(
+        !challenge.contains("error="),
+        "a request without credentials names no error"
+    );
     let response = client
-        .get(format!("{url}/.well-known/oauth-protected-resource/mcp"))
+        .post(format!("{url}/mcp"))
+        .header("authorization", "Bearer not-a-token")
         .send()
         .await
         .unwrap();
+    assert_eq!(response.status(), 401);
+    let challenge = response.headers()["www-authenticate"].to_str().unwrap();
+    assert!(challenge.contains("resource_metadata=") && challenge.contains("invalid_token"));
+    // The REST API follows RFC 6750 for presented credentials as well.
+    let response = client
+        .get(format!("{url}/v1/history"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    assert_eq!(response.headers()["www-authenticate"], "Bearer");
+    let response = client
+        .get(format!("{url}/v1/history"))
+        .header("authorization", "Bearer not-a-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    assert_eq!(
+        response.headers()["www-authenticate"],
+        "Bearer error=\"invalid_token\""
+    );
+    // Metadata is readable by browser-based clients on any origin.
+    let preflight = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{url}/.well-known/oauth-protected-resource/mcp"),
+        )
+        .header("origin", "https://other.example.com")
+        .header("access-control-request-method", "GET")
+        .header("access-control-request-headers", "mcp-protocol-version")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), 204);
+    assert_eq!(preflight.headers()["access-control-allow-origin"], "*");
+    assert_eq!(
+        preflight.headers()["access-control-allow-headers"],
+        "mcp-protocol-version"
+    );
+    let response = client
+        .get(format!("{url}/.well-known/oauth-protected-resource/mcp"))
+        .header("origin", "https://other.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["access-control-allow-origin"], "*");
     let metadata: serde_json::Value =
         serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
     assert_eq!(metadata["resource"], "https://pdf.example.com/mcp");
@@ -301,7 +353,7 @@ async fn oauth_challenges_and_metadata_and_origins_are_enforced() {
 }
 
 #[test]
-fn mcp_config_rejects_missing_resource_and_unbounded_limits() {
+fn mcp_config_rejects_missing_or_unaccepted_resource_and_unbounded_limits() {
     let mut config = Config::default();
     config.mcp.enabled = true;
     config.mcp.search_max_limit = usize::MAX;
@@ -309,7 +361,15 @@ fn mcp_config_rejects_missing_resource_and_unbounded_limits() {
     config.mcp.search_max_limit = 1000;
     config.auth = serde_json::from_value(serde_json::json!({"mode":"oauth2","oidc":{"issuer":"https://auth.example.com","audience":"existing-audience","validation":"jwt"}})).unwrap();
     assert!(config.validate().is_err());
+    // The advertised resource must be an audience the validator accepts.
     config.mcp.resource_url = Some("https://pdf.example.com/mcp".into());
+    assert!(config.validate().is_err());
+    let oidc = config.auth.oidc.as_mut().unwrap();
+    oidc.additional_audiences = vec!["https://pdf.example.com/mcp".into()];
+    assert!(config.validate().is_ok());
+    let oidc = config.auth.oidc.as_mut().unwrap();
+    oidc.additional_audiences.clear();
+    oidc.audience = "https://pdf.example.com/mcp".into();
     assert!(config.validate().is_ok());
 }
 

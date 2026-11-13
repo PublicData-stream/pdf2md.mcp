@@ -1414,3 +1414,46 @@ async fn casdoor_introspection_rejects_refresh_tokens_before_and_after_provider_
         assert!(fixture.config.validate().is_err());
     }
 }
+
+#[tokio::test]
+async fn small_clock_skew_is_tolerated_for_issue_time_but_never_for_expiry() {
+    let now = chrono::Utc::now().timestamp();
+    let jwt = Fixture::new(TokenValidation::Jwt).await;
+    let auth = Authenticator::new(jwt.config.clone()).await.unwrap();
+    // A token issued by a provider whose clock is a few seconds ahead.
+    let fresh = token(&jwt.issuer, "first", |claims| {
+        claims["iat"] = json!(now + 5);
+        claims["nbf"] = json!(now + 5);
+    });
+    auth.authenticate(Some(&fresh), false).await.unwrap();
+    for (field, value) in [
+        ("nbf", json!(now + 100)),
+        ("iat", json!(now + 100)),
+        ("exp", json!(now - 2)),
+    ] {
+        let bad = token(&jwt.issuer, "first", |claims| claims[field] = value);
+        assert_eq!(
+            auth.authenticate(Some(&bad), false).await.unwrap_err().code,
+            "auth_invalid",
+            "field {field}"
+        );
+    }
+
+    let remote = Fixture::new(TokenValidation::Introspection).await;
+    let auth = Authenticator::new(remote.config.clone()).await.unwrap();
+    let mut response = claims(&remote.issuer);
+    response["iat"] = json!(now + 5);
+    response["nbf"] = json!(now + 5);
+    *remote.introspection.lock().unwrap() = response;
+    auth.authenticate(Some("opaque"), false).await.unwrap();
+    let mut response = claims(&remote.issuer);
+    response["exp"] = json!(now - 2);
+    *remote.introspection.lock().unwrap() = response;
+    assert_eq!(
+        auth.authenticate(Some("opaque"), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+}

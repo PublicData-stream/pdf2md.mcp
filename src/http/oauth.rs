@@ -1,21 +1,24 @@
-//! Browser and token-broker routes for the optional registered OAuth client.
+//! Browser sign-in routes for the optional registered OAuth client.
+//!
+//! Only the interactive Authorization Code grant (with PKCE) is served over
+//! HTTP, and the result page shows an access token only. Refresh tokens are never returned, and no
+//! route accepts a caller-supplied grant (device code or refresh token) to
+//! redeem with the registered client's credentials: those grants run from the
+//! trusted CLI, or directly between the caller's own client and the provider.
 //!
 //! Pages share `/oauth/oauth.css` and `/oauth/page.js` and render without
 //! inline scripts or styles. Responses are `no-store` and use the service's
 //! restrictive content security policy and `no-referrer` policy. Browser
 //! navigations (`Accept: text/html`) to `/oauth/login` and `/oauth/callback`
 //! receive an HTML error page; other clients keep the JSON error body.
-use super::{ApiError, ApiJson, BrowserPage, invalid};
-use crate::{
-    error::LoadError,
-    oauth::{GrantType, OAuthClient, TokenResponse, authorization_error},
-};
+use super::{ApiError, BrowserPage, invalid};
+use crate::oauth::{GrantType, OAuthClient, TokenResponse, authorization_error};
 use axum::{
-    Json, Router,
+    Router,
     extract::{Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, header},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::get,
 };
 use serde::Deserialize;
 use std::{
@@ -25,10 +28,11 @@ use std::{
 };
 
 const PENDING_TTL: Duration = Duration::from_secs(600);
-const MAX_PENDING: usize = 1024;
+/// Pending Authorization Code sign-ins kept in memory. When the table is
+/// full the oldest entry is replaced, so unauthenticated requests to
+/// `/oauth/login` cannot lock other users out until entries expire.
+const MAX_PENDING: usize = 8192;
 const CODE_COOKIE: &str = "pdf2md_oauth_state";
-const IMPLICIT_COOKIE: &str = "pdf2md_implicit_state";
-const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 #[derive(Clone)]
 struct OAuthState {
@@ -37,32 +41,20 @@ struct OAuthState {
     pending: Arc<Mutex<HashMap<String, (String, Instant)>>>,
 }
 
+/// Routes exist only when the Authorization Code grant is enabled.
 pub(super) fn router(client: Arc<OAuthClient>) -> Router {
-    let mut router = Router::new();
-    if client.enabled(GrantType::AuthorizationCode) || client.enabled(GrantType::Implicit) {
-        router = router
-            .route("/oauth/login", get(login))
-            .route("/oauth/oauth.css", get(page_css))
-            .route("/oauth/page.js", get(page_js));
+    if !client.enabled(GrantType::AuthorizationCode) {
+        return Router::new();
     }
-    if client.enabled(GrantType::AuthorizationCode) {
-        router = router.route("/oauth/callback", get(callback));
-    }
-    if client.enabled(GrantType::Implicit) {
-        router = router
-            .route("/oauth/implicit", get(implicit_page))
-            .route("/oauth/implicit.js", get(implicit_js));
-    }
-    if client.enabled(GrantType::DeviceCode) {
-        router = router.route("/oauth/device", post(device));
-    }
-    if client.enabled(GrantType::DeviceCode) || client.enabled(GrantType::RefreshToken) {
-        router = router.route("/oauth/token", post(token));
-    }
-    router.with_state(OAuthState {
-        client,
-        pending: Arc::new(Mutex::new(HashMap::new())),
-    })
+    Router::new()
+        .route("/oauth/login", get(login))
+        .route("/oauth/callback", get(callback))
+        .route("/oauth/oauth.css", get(page_css))
+        .route("/oauth/page.js", get(page_js))
+        .with_state(OAuthState {
+            client,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        })
 }
 
 fn escape(value: &str) -> String {
@@ -74,18 +66,11 @@ fn escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn cookie(
-    name: &str,
-    value: &str,
-    path: &str,
-    http_only: bool,
-    secure: bool,
-    max_age: u64,
-) -> HeaderValue {
-    let mut cookie = format!("{name}={value}; Path={path}; Max-Age={max_age}; SameSite=Lax");
-    if http_only {
-        cookie.push_str("; HttpOnly");
-    }
+/// The `state` cookie that binds a sign-in to this browser. It is never
+/// readable by scripts.
+fn state_cookie(value: &str, secure: bool, max_age: u64) -> HeaderValue {
+    let mut cookie =
+        format!("{CODE_COOKIE}={value}; Path=/oauth; Max-Age={max_age}; SameSite=Lax; HttpOnly");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -103,59 +88,49 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .map(|(_, value)| value)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LoginQuery {
-    grant: Option<GrantType>,
+/// Start the Authorization Code grant with PKCE.
+async fn login(State(state): State<OAuthState>, headers: HeaderMap) -> Response {
+    let result = start_login(&state).await;
+    browser_result(&headers, result)
 }
 
-/// Start a browser grant: Authorization Code with PKCE (default) or Implicit.
-async fn login(
-    State(state): State<OAuthState>,
-    headers: HeaderMap,
-    Query(query): Query<LoginQuery>,
-) -> Response {
-    let grant = query.grant.unwrap_or(GrantType::AuthorizationCode);
-    let result = start_login(&state, grant).await;
-    browser_result(&headers, grant, result)
-}
-
-async fn start_login(state: &OAuthState, grant: GrantType) -> Result<Response, ApiError> {
-    if !matches!(grant, GrantType::AuthorizationCode | GrantType::Implicit) {
-        return Err(invalid("invalid_request", "unsupported browser grant"));
-    }
-    let request = state.client.authorization_request(grant).await?;
-    let secure = state.client.secure_redirects();
-    let set_cookie = if let Some(verifier) = request.code_verifier {
+async fn start_login(state: &OAuthState) -> Result<Response, ApiError> {
+    let request = state.client.authorization_request().await?;
+    {
         let mut pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|_, (_, created)| created.elapsed() < PENDING_TTL);
-        if pending.len() >= MAX_PENDING {
-            return Err(LoadError::transient("service_busy", "too many pending sign-ins").into());
-        }
-        pending.insert(request.state.clone(), (verifier, Instant::now()));
-        cookie(
-            CODE_COOKIE,
-            &request.state,
-            "/oauth",
-            true,
-            secure,
-            PENDING_TTL.as_secs(),
-        )
-    } else {
-        cookie(
-            IMPLICIT_COOKIE,
-            &request.state,
-            "/oauth/implicit",
-            false,
-            secure,
-            PENDING_TTL.as_secs(),
-        )
-    };
+        insert_pending(&mut pending, request.state.clone(), request.code_verifier);
+    }
     let mut response = Redirect::to(request.url.as_str()).into_response();
-    response
-        .headers_mut()
-        .insert(header::SET_COOKIE, set_cookie);
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        state_cookie(
+            &request.state,
+            state.client.secure_redirects(),
+            PENDING_TTL.as_secs(),
+        ),
+    );
     Ok(response)
+}
+
+/// Record a pending sign-in, dropping expired entries and, at capacity, the
+/// oldest one.
+fn insert_pending(
+    pending: &mut HashMap<String, (String, Instant)>,
+    state: String,
+    verifier: String,
+) {
+    pending.retain(|_, (_, created)| created.elapsed() < PENDING_TTL);
+    while pending.len() >= MAX_PENDING {
+        let Some(oldest) = pending
+            .iter()
+            .min_by_key(|(_, (_, created))| *created)
+            .map(|(state, _)| state.clone())
+        else {
+            break;
+        };
+        pending.remove(&oldest);
+    }
+    pending.insert(state, (verifier, Instant::now()));
 }
 
 #[derive(Deserialize)]
@@ -174,7 +149,7 @@ async fn callback(
     Query(query): Query<CallbackQuery>,
 ) -> Response {
     let result = finish_code(&state, &headers, query).await;
-    browser_result(&headers, GrantType::AuthorizationCode, result)
+    browser_result(&headers, result)
 }
 
 async fn finish_code(
@@ -213,44 +188,20 @@ async fn finish_code(
         .as_deref()
         .ok_or_else(|| invalid("oauth_error", "missing authorization code"))?;
     let tokens = state.client.exchange_code(code, &verifier).await?;
-    let refreshable = state.client.enabled(GrantType::RefreshToken);
-    let mut response = token_page(&tokens, refreshable).into_response();
+    let mut response = token_page(&tokens).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        cookie(
-            CODE_COOKIE,
-            "",
-            "/oauth",
-            true,
-            state.client.secure_redirects(),
-            0,
-        ),
+        state_cookie("", state.client.secure_redirects(), 0),
     );
     Ok(response)
 }
 
 const CODE_FLOW: &str = "Authorization Code · PKCE";
-const IMPLICIT_FLOW: &str = "Implicit";
-
-fn flow_label(grant: GrantType) -> &'static str {
-    match grant {
-        GrantType::Implicit => IMPLICIT_FLOW,
-        _ => CODE_FLOW,
-    }
-}
-
-fn login_href(grant: GrantType) -> &'static str {
-    match grant {
-        GrantType::Implicit => "/oauth/login?grant=implicit",
-        _ => "/oauth/login",
-    }
-}
 
 /// Status of a page, which selects the header icon and colors.
 #[derive(Clone, Copy)]
 enum PageState {
     Success,
-    Pending,
     Error,
 }
 
@@ -258,20 +209,17 @@ impl PageState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
-            Self::Pending => "pending",
             Self::Error => "error",
         }
     }
 }
 
-/// One OAuth browser page. Values in `head` and `body` must already be
-/// escaped; `title` and `message` are escaped here.
+/// One OAuth browser page. `body` must already be escaped; `title` and
+/// `message` are escaped here.
 struct Page<'a> {
-    flow: &'a str,
     state: PageState,
     title: &'a str,
     message: &'a str,
-    head: String,
     body: String,
     scripts: &'a [&'a str],
 }
@@ -284,11 +232,10 @@ impl Page<'_> {
             .map(|src| format!("<script src=\"{src}\"></script>"))
             .collect();
         format!(
-            "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><meta name=\"color-scheme\" content=\"dark\">{head}<title>{title} · pdf2md</title><link rel=\"stylesheet\" href=\"/oauth/oauth.css\"></head><body><header class=\"brand\"><span class=\"mark\" aria-hidden=\"true\">P</span><strong>pdf2md</strong><span>Sign-in</span></header><main id=\"page\" data-state=\"{state}\"><span class=\"flow\">{flow}</span><div class=\"status\"><span class=\"icon\" aria-hidden=\"true\"></span><div><h1 id=\"title\">{title}</h1><p id=\"status\" aria-live=\"polite\">{message}</p></div></div>{body}</main><footer>This page is never cached. Close it when you are done.</footer>{scripts}</body></html>\n",
-            head = self.head,
+            "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex\"><meta name=\"color-scheme\" content=\"dark\"><title>{title} · pdf2md</title><link rel=\"stylesheet\" href=\"/oauth/oauth.css\"></head><body><header class=\"brand\"><span class=\"mark\" aria-hidden=\"true\">P</span><strong>pdf2md</strong><span>Sign-in</span></header><main id=\"page\" data-state=\"{state}\"><span class=\"flow\">{flow}</span><div class=\"status\"><span class=\"icon\" aria-hidden=\"true\"></span><div><h1 id=\"title\">{title}</h1><p id=\"status\" aria-live=\"polite\">{message}</p></div></div>{body}</main><footer>This page is never cached. Close it when you are done.</footer>{scripts}</body></html>\n",
             title = escape(self.title),
             state = self.state.as_str(),
-            flow = escape(self.flow),
+            flow = escape(CODE_FLOW),
             message = escape(self.message),
             body = self.body,
         )
@@ -334,37 +281,24 @@ fn token_field(id: &str, label: &str, hint: &str, rows: u8, value: &str) -> Stri
     )
 }
 
-const TOKEN_NOTE: &str = "<p class=\"note\"><strong>Treat these tokens like passwords.</strong> pdf2md does not keep them, so copy what you need now. Do not paste them into chats, tickets or shared documents.</p>";
+const TOKEN_NOTE: &str = "<p class=\"note\"><strong>Treat this token like a password.</strong> pdf2md does not keep it, so copy it now. Do not paste it into chats, tickets or shared documents.</p>";
 
-fn usage(refresh: bool) -> String {
-    let refresh = if refresh {
-        "<p>Before the access token expires, exchange the refresh token at <code>POST /oauth/token</code> with <code>{\"grant_type\": \"refresh_token\", \"refresh_token\": \"...\"}</code> and keep the new refresh token it returns.</p>"
-    } else {
-        ""
-    };
-    format!(
-        "<div class=\"usage\"><p>Send the access token as a Bearer credential:</p><pre>Authorization: Bearer &lt;access token&gt;</pre>{refresh}</div>"
-    )
-}
+const USAGE: &str = "<div class=\"usage\"><p>Send the access token as a Bearer credential:</p><pre>Authorization: Bearer &lt;access token&gt;</pre><p>Sign in again when it expires. Refresh tokens are not shown here.</p></div>";
 
 /// Page actions. After a successful sign-in the API console comes first;
 /// after a failure, starting again does.
-fn actions(grant: GrantType, signed_in: bool) -> String {
-    let login = login_href(grant);
+fn actions(signed_in: bool) -> &'static str {
     if signed_in {
-        format!(
-            "<nav class=\"actions\"><a class=\"button\" href=\"/docs\">Open API console</a><a class=\"button secondary\" href=\"{login}\">Sign in again</a></nav>"
-        )
+        "<nav class=\"actions\"><a class=\"button\" href=\"/docs\">Open API console</a><a class=\"button secondary\" href=\"/oauth/login\">Sign in again</a></nav>"
     } else {
-        format!(
-            "<nav class=\"actions\"><a class=\"button\" href=\"{login}\">Start sign-in again</a><a class=\"button secondary\" href=\"/docs\">Open API console</a></nav>"
-        )
+        "<nav class=\"actions\"><a class=\"button\" href=\"/oauth/login\">Start sign-in again</a><a class=\"button secondary\" href=\"/docs\">Open API console</a></nav>"
     }
 }
 
-/// Authorization Code result page. ID tokens are never displayed.
-fn token_page(tokens: &TokenResponse, refreshable: bool) -> Html<String> {
-    let refresh = tokens.refresh_token.as_deref();
+/// Authorization Code result page. Only the access token is displayed: ID
+/// tokens are not credentials for this service, and a refresh token issued to
+/// the registered client stays out of the browser.
+fn token_page(tokens: &TokenResponse) -> Html<String> {
     let mut body = format!(
         "<dl class=\"details\"><dt>Token type</dt><dd>{}</dd><dt>Expires in</dt><dd>{}</dd><dt>Scope</dt><dd>{}</dd></dl>",
         escape(&tokens.token_type),
@@ -378,65 +312,19 @@ fn token_page(tokens: &TokenResponse, refreshable: bool) -> Html<String> {
         6,
         &tokens.access_token,
     ));
-    if let Some(refresh) = refresh {
-        body.push_str(&token_field(
-            "refresh-token",
-            "Refresh token",
-            "Obtains new access tokens",
-            3,
-            refresh,
-        ));
-    }
     body.push_str(TOKEN_NOTE);
-    body.push_str(&usage(refreshable && refresh.is_some()));
-    body.push_str(&actions(GrantType::AuthorizationCode, true));
+    body.push_str(USAGE);
+    body.push_str(actions(true));
     Html(
         Page {
-            flow: CODE_FLOW,
             state: PageState::Success,
             title: "Signed in",
-            message: "Your tokens are ready. Copy them before you close this page.",
-            head: String::new(),
+            message: "Your access token is ready. Copy it before you close this page.",
             body,
             scripts: &["/oauth/page.js"],
         }
         .render(),
     )
-}
-
-/// Implicit redirect page. The access token stays in the URL fragment and is
-/// read by the page script; the server never receives it.
-async fn implicit_page(State(state): State<OAuthState>) -> Result<Html<String>, ApiError> {
-    let require_iss = state.client.check_response_issuer(None).await.is_err();
-    let mut body = String::from(
-        "<noscript><p class=\"note\"><strong>JavaScript is required.</strong> The Implicit grant returns the token to this page's script, so it cannot finish without JavaScript.</p></noscript><section id=\"result\" hidden><dl class=\"details\"><dt>Token type</dt><dd>Bearer</dd><dt>Expires in</dt><dd id=\"expires\">Unknown</dd><dt>Scope</dt><dd id=\"scope\"><span class=\"none\">None granted</span></dd></dl>",
-    );
-    body.push_str(&token_field(
-        "access-token",
-        "Access token",
-        "Bearer credential for the API and MCP endpoint",
-        6,
-        "",
-    ));
-    body.push_str(TOKEN_NOTE);
-    body.push_str(&usage(false));
-    body.push_str("</section>");
-    body.push_str(&actions(GrantType::Implicit, true));
-    Ok(Html(
-        Page {
-            flow: IMPLICIT_FLOW,
-            state: PageState::Pending,
-            title: "Completing sign-in",
-            message: "Checking the authorization response from your provider.",
-            head: format!(
-                "<meta name=\"pdf2md-issuer\" content=\"{}\"><meta name=\"pdf2md-require-iss\" content=\"{require_iss}\">",
-                escape(state.client.issuer())
-            ),
-            body,
-            scripts: &["/oauth/page.js", "/oauth/implicit.js"],
-        }
-        .render(),
-    ))
 }
 
 /// Title and explanation for a sign-in failure. Messages are fixed public
@@ -459,18 +347,13 @@ fn error_text(code: &str) -> (&'static str, Option<&'static str>) {
             "Access denied",
             Some("Authorization was denied by you or the provider."),
         ),
-        "oauth_grant_disabled" => ("Sign-in method unavailable", None),
-        "service_busy" => (
-            "Too many sign-ins in progress",
-            Some("Wait a moment, then start again."),
-        ),
         _ => ("Sign-in failed", None),
     }
 }
 
 /// Render `error` as an HTML page with the JSON response's status, request ID
 /// and retry headers.
-fn error_page(grant: GrantType, error: ApiError) -> Response {
+fn error_page(error: ApiError) -> Response {
     let code = error.0.code.clone();
     let message = error.0.message.clone();
     let json = error.into_response();
@@ -485,14 +368,12 @@ fn error_page(grant: GrantType, error: ApiError) -> Response {
         "<dl class=\"error-code\"><dt>Error code</dt><dd>{}</dd><dt>Request ID</dt><dd>{}</dd></dl>{}",
         escape(&code),
         escape(&request_id),
-        actions(grant, false),
+        actions(false),
     );
     let page = Page {
-        flow: flow_label(grant),
         state: PageState::Error,
         title,
         message: explanation.unwrap_or(&message),
-        head: String::new(),
         body,
         scripts: &[],
     }
@@ -519,14 +400,10 @@ fn wants_html(headers: &HeaderMap) -> bool {
 }
 
 /// Browser navigations receive HTML errors; API clients keep JSON errors.
-fn browser_result(
-    headers: &HeaderMap,
-    grant: GrantType,
-    result: Result<Response, ApiError>,
-) -> Response {
+fn browser_result(headers: &HeaderMap, result: Result<Response, ApiError>) -> Response {
     match result {
         Ok(response) => response,
-        Err(error) if wants_html(headers) => error_page(grant, error),
+        Err(error) if wants_html(headers) => error_page(error),
         Err(error) => error.into_response(),
     }
 }
@@ -548,45 +425,23 @@ async fn page_js() -> impl IntoResponse {
     )
 }
 
-async fn implicit_js() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        include_str!("oauth-implicit.js"),
-    )
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Start RFC 8628 device authorization for a CLI or device caller.
-async fn device(State(state): State<OAuthState>) -> Result<Response, ApiError> {
-    let device = state.client.device_authorization().await?;
-    Ok((StatusCode::OK, Json(device)).into_response())
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TokenInput {
-    grant_type: String,
-    device_code: Option<String>,
-    refresh_token: Option<String>,
-}
-
-/// Token broker for device-code polling and refresh-token exchange with the
-/// registered client's credentials. Authorization Code redemption happens only
-/// through the callback, and Client Credentials is never brokered.
-async fn token(
-    State(state): State<OAuthState>,
-    ApiJson(input): ApiJson<TokenInput>,
-) -> Result<Response, ApiError> {
-    let tokens = match (
-        input.grant_type.as_str(),
-        input.device_code.as_deref(),
-        input.refresh_token.as_deref(),
-    ) {
-        (DEVICE_CODE_GRANT, Some(code), None) => state.client.poll_device(code).await?,
-        ("refresh_token", None, Some(refresh)) => state.client.refresh(refresh).await?,
-        _ => return Err(invalid("invalid_request", "unsupported token request")),
-    };
-    Ok((StatusCode::OK, Json(tokens)).into_response())
+    #[test]
+    fn full_pending_table_replaces_the_oldest_sign_in() {
+        let mut pending = HashMap::new();
+        let earlier = Instant::now() - Duration::from_secs(1);
+        pending.insert("oldest".to_owned(), ("verifier".to_owned(), earlier));
+        for index in 1..MAX_PENDING {
+            insert_pending(&mut pending, format!("state-{index}"), "verifier".into());
+        }
+        assert_eq!(pending.len(), MAX_PENDING);
+        assert!(pending.contains_key("oldest"));
+        insert_pending(&mut pending, "newest".into(), "verifier".into());
+        assert_eq!(pending.len(), MAX_PENDING);
+        assert!(pending.contains_key("newest"));
+        assert!(!pending.contains_key("oldest"));
+    }
 }

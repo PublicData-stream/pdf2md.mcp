@@ -33,17 +33,22 @@ allowed_origins = ["https://client.example.com"]
 ```
 
 The endpoint accepts bearer access tokens through the HTTP Authorization
-header. Configure the provider to issue access tokens for the existing
-`auth.oidc.audience`, and ensure that clients requesting the advertised resource
-receive that audience. The service preserves the configured token validator;
-it does not issue tokens or register OAuth clients. Use provider-side client
-registration with Authorization Code and PKCE where appropriate. Tokens obtained
-through the service's optional
+header. MCP clients request tokens for the advertised resource
+([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707.html)), so `resource_url`
+must equal `auth.oidc.audience` or appear in `additional_audiences`;
+configuration is rejected otherwise. The service preserves the configured
+token validator; it does not issue, store or refresh tokens, and it does not
+register OAuth clients. Register each MCP client with the provider, as a public
+client using Authorization Code and PKCE where it cannot keep a secret; the
+client obtains and refreshes its tokens directly with the provider. Tokens
+obtained through the service's optional
 [registered client](authentication.md#obtaining-access-tokens) are accepted
 like any other access token.
 
 OAuth protected-resource metadata advertises the configured issuer and read
-scope. Authentication challenges link to that metadata. Keep the public URL
+scope, and is readable from any browser origin (`Access-Control-Allow-Origin:
+*`). Authentication challenges link to that metadata and add
+`error="invalid_token"` when the request carried credentials. Keep the public URL
 consistent with ingress routing; it is not inferred from Host or forwarded
 headers. Supplied Origin headers must match `allowed_origins`; clients without
 an Origin header can connect. An empty allowlist rejects every supplied origin.

@@ -15,6 +15,20 @@ operate_scope = "pdf2md:operate"
 # Casdoor binds Client Credentials tokens to the client ID.
 # additional_audiences = ["pdf2md-machine"]
 
+# Optional: authenticate introspection with a signed assertion
+# (private_key_jwt) instead of client_secret. Casdoor expects a registered
+# redirect URI of the application as issuer.
+# [auth.oidc.client_assertion]
+# key = { file = "introspection-key.pem" }
+# algorithm = "ES256"
+# issuer = "https://pdf.example.com/oauth/callback"
+
+# Optional: accept DPoP-bound access tokens (RFC 9449). Casdoor reports the
+# binding through introspection only.
+# [auth.oidc.dpop]
+# public_url = "https://pdf.example.com"
+# required = false
+
 # API and MCP clients register their own application with the provider and
 # obtain tokens there. Optional: browser sign-in for the bundled API console,
 # with a separate public application. Register

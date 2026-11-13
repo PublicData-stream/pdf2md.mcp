@@ -834,3 +834,188 @@ async fn real_casdoor_grants_through_the_registered_client() {
     cancel.cancel();
     server.abort();
 }
+
+#[path = "common/dpop_proof.rs"]
+mod dpop_proof;
+
+/// Resource-server configuration whose provider calls are authenticated with
+/// a signed assertion instead of a shared secret.
+fn assertion_auth_config(
+    fixture: &Value,
+    validation: &str,
+    dpop: Option<Value>,
+    client: Option<Value>,
+) -> AuthConfig {
+    serde_json::from_value(serde_json::json!({
+        "mode": "oauth2",
+        "oidc": {
+            "issuer": fixture["issuer"], "audience": fixture["audience"],
+            "validation": validation, "token_profile": "casdoor",
+            "additional_audiences": [fixture["machine_client_id"], fixture["assertion_client_id"]],
+            "client_id": fixture["assertion_client_id"],
+            "client_assertion": assertion(fixture),
+            "ca_file": fixture["ca_file"],
+            "dpop": dpop
+        },
+        "client": client
+    }))
+    .unwrap()
+}
+/// Casdoor 4.27.1 accepts an assertion whose issuer is a registered redirect
+/// URI of the application.
+fn assertion(fixture: &Value) -> Value {
+    serde_json::json!({
+        "key": {"file": fixture["assertion_key_file"]},
+        "algorithm": "RS256",
+        "issuer": fixture["assertion_issuer"],
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires disposable real Casdoor; run scripts/test-casdoor.py"]
+async fn real_casdoor_accepts_signed_client_assertions_and_binds_tokens_to_dpop_keys() {
+    use dpop_proof::ProofKey;
+    use pdf2md_mcp::oauth::OAuthClient;
+    use reqwest::StatusCode;
+    let fixture_path = std::env::var("PDF2MD_LIVE_CASDOOR_FIXTURE").expect("live fixture required");
+    let fixture: Value = serde_json::from_slice(&std::fs::read(fixture_path).unwrap()).unwrap();
+    if !std::env::var("PDF2MD_LIVE_CASDOOR_PHASE")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return;
+    }
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let client = serde_json::json!({
+        "client_id": fixture["assertion_client_id"], "client_assertion": assertion(&fixture),
+        "grant_types": ["client_credentials"],
+        "scopes": ["pdf2md:read", "pdf2md:write"],
+    });
+    // Introspection is authenticated with a signed assertion, and reports the
+    // key a DPoP-bound token belongs to.
+    let auth = assertion_auth_config(
+        &fixture,
+        "introspection",
+        Some(serde_json::json!({"public_url": base})),
+        Some(client),
+    );
+    let service = std::sync::Arc::new(
+        CallerService::new(
+            root.path(),
+            Config {
+                auth: auth.clone(),
+                ..Config::default()
+            },
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let cancel = CancellationToken::new();
+    let router = pdf2md_mcp::http::router(service, cancel.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let api = reqwest::Client::builder().no_proxy().build().unwrap();
+    let history_url = format!("{base}/v1/history");
+
+    // private_key_jwt: Client Credentials without a shared secret.
+    let signed = OAuthClient::new(&auth)
+        .unwrap()
+        .unwrap()
+        .client_credentials()
+        .await
+        .unwrap()
+        .access_token;
+    let signed_subject =
+        match Authenticator::new(assertion_auth_config(&fixture, "jwt", None, None))
+            .await
+            .unwrap()
+            .authenticate(Some(&signed), true)
+            .await
+            .unwrap()
+        {
+            Identity::User { subject, .. } => subject,
+            Identity::Shared => panic!("OAuth must not become anonymous"),
+        };
+    assert_ne!(
+        signed_subject,
+        subject(&fixture, token(&fixture, "alice")).await
+    );
+    assert_eq!(
+        api.get(&history_url)
+            .bearer_auth(&signed)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    // A user token passes the same assertion-authenticated introspection.
+    assert_eq!(
+        api.get(&history_url)
+            .bearer_auth(token(&fixture, "alice"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    // DPoP: the provider binds a token to the key that signed the token
+    // request's proof (RFC 9449 section 5).
+    let key = ProofKey::es256();
+    let endpoint = format!(
+        "{}/api/login/oauth/access_token",
+        fixture["issuer"].as_str().unwrap()
+    );
+    let mut claims = ProofKey::claims("POST", &endpoint, "");
+    claims.as_object_mut().unwrap().remove("ath");
+    let secret = std::fs::read_to_string(fixture["secret_file"].as_str().unwrap()).unwrap();
+    let issued: Value = provider_client(&fixture)
+        .post(&endpoint)
+        .basic_auth(
+            fixture["machine_client_id"].as_str().unwrap(),
+            Some(secret.trim()),
+        )
+        .header("DPoP", key.sign(&key.header(), &claims))
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("scope", "pdf2md:read pdf2md:write"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(issued["token_type"], "DPoP");
+    let bound = issued["access_token"].as_str().expect("DPoP-bound token");
+    let present = |scheme: &'static str, proof: Option<String>| {
+        let mut request = api
+            .get(&history_url)
+            .header("authorization", format!("{scheme} {bound}"));
+        if let Some(proof) = proof {
+            request = request.header("dpop", proof);
+        }
+        async move { request.send().await.unwrap().status() }
+    };
+    let proof = key.proof("GET", &history_url, bound);
+    assert_eq!(present("DPoP", Some(proof.clone())).await, StatusCode::OK);
+    // A proof is accepted once.
+    assert_eq!(present("DPoP", Some(proof)).await, StatusCode::UNAUTHORIZED);
+    // The bound token is of no use without its key.
+    assert_eq!(present("Bearer", None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(present("DPoP", None).await, StatusCode::UNAUTHORIZED);
+    let other = ProofKey::es256().proof("GET", &history_url, bound);
+    assert_eq!(present("DPoP", Some(other)).await, StatusCode::UNAUTHORIZED);
+    // A proof for another token does not carry over.
+    let stale = key.proof("GET", &history_url, &signed);
+    assert_eq!(present("DPoP", Some(stale)).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        present("DPoP", Some(key.proof("GET", &history_url, bound))).await,
+        StatusCode::OK
+    );
+    cancel.cancel();
+    server.abort();
+}

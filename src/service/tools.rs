@@ -109,13 +109,14 @@ struct SectionArgs {
 }
 
 impl CallerService {
-    pub async fn call_tool(
+    pub async fn call_tool<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         name: &str,
         arguments: Value,
         cancel: &CancellationToken,
     ) -> Result<ToolOutput> {
+        let token: Credentials<'c> = token.into();
         let workspace = self.authorize(token, false, false).await?;
         let _download_permit = self
             .downloads

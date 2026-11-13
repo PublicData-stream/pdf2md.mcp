@@ -19,6 +19,9 @@ use tokio_rustls::TlsAcceptor;
 
 #[path = "common/conversion_pdf.rs"]
 mod conversion_pdf;
+#[path = "common/dpop_proof.rs"]
+mod dpop_proof;
+use dpop_proof::ProofKey;
 
 struct Fixture {
     config: AuthConfig,
@@ -75,11 +78,13 @@ impl Fixture {
                     env: None,
                     file: Some(secret),
                 }),
+                client_assertion: None,
                 read_scope: "pdf2md:read".into(),
                 write_scope: "pdf2md:write".into(),
                 operate_scope: "pdf2md:operate".into(),
                 allowed_endpoint_origins: vec![],
                 ca_file: Some(ca),
+                dpop: None,
             }),
             client: None,
         };
@@ -1094,35 +1099,7 @@ async fn oauth_and_both_anonymous_modes_preserve_and_hide_each_others_data() {
 }
 
 // Deliberately public, generated synthetic RSA key, used only for token fixtures.
-const TEST_KEY: &str = r"-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCR+oBfnzNj2oZO
-pGvuxJ+GKVs4eg9pJUK9h0ARTPbHKc/fdg09DOskxOHkDh2c97Ifk0Q0PFOxObRq
-aRc23tKgEvijPvQ3QB5vcQSXXYtpVX5PpGyDuA391patQynkWopixfjE+VlxRh8d
-XQCVVBhjvoYERvgwz8umSY3DG/0NVS0/F/RaZqGYGTipqSwrnbUXqLswbhh2OOGe
-BWPQeGPszZk462flyn10ZhRnSNMjP3lWb7+DO2WHQtLR/gjzIqQQGHDi44XwZBe0
-+MN0tkEbKLYOvz668LDKB877dE/EdtSBsPpcNLxh4urTaGvngH5YZIKxMm0LiXGf
-SwVDKCiXAgMBAAECggEARIY+tKRaz0jJOylbsR2DdMr9EynZChZ/mdBfdr+WKC+s
-cM1NsZba2svA7fjiVcjASKosngijkNHxqvHh/9PhM1s0dA0dPsJOhymaaiNzSeLk
-BCa++aXwi3OsD3EzvQnzZCJigLQ8FDxCZto9Z9uuB0RsTJ2z69XfVxO4BBqjUxov
-FG0FRMwwjxhrZQyG6arRGvnG+5mHocL3J+7LRpH/38tFoVEJmIzpenDRigPGvBCc
-cvpOScFN1gxlcREgECu7VkenDusW3jk8gCYkbSqpvdxtwSF46Xu+J3xRHHv+JqCD
-qPuPXIsKCwUDDj3tEiuoeX6e7aZwh0FwtUJepNuMgQKBgQDJ/i4LNU+0kD5TQjfw
-NqFfb36ZbTuqWFBCt9SqlpI6ih3MAxII0KpNPDL4mVqrvEdyPx5fCVbPFWcbekUk
-Y2m1iehqkHjAM8thdlraBpTPh0ZuoO/u3yXJtra0AbvpuUlSho74c4aKp6nvw6Q4
-bkDqNzfpQI5FK7+lbzv8FfcAkQKBgQC5Ak10OwM+J15SCUcgz5dsNavUba6PCtB7
-IFL7J1ktMsu3Z0GQiCPdvjjM9dy0vATnrD+O+ceh7wbs2pSAj324fBxGcSe4YNO8
-7GmdguiRS2col+wv2LEK7jdN1ExMU0kdpUMoOEeenvgwhknZRMi6EM4hk3rdCK4S
-Kj3NkX8qpwKBgAwIWDXStyzKauwKxcpJdtN4kNIS77r2B9HxoXmH/q3+DEha5ngf
-9gUj0OV+PSh9zsO/fs+qfsFXRQ0d+4Bva5yk2nN+p7LLYxIrOr5CJhs2s7tjWuef
-42BgwgF3GPqTTwrbeSjTuPAJjNX7kYzLBJLvNyVt8wurz37LYYdix5QBAoGBALUB
-irP39KE/tSlACIYSdEybaiTotosegoCkTGuKwNXWx7cFYAE/IRAWxs3IkgmFlqrv
-PDPvLyDAkh7zb60kNlVjn+pPVRQwL5i8GEzRwiY9Bo2RrbPWJsjR7evIlGlsZrGJ
-ed4EyhVn5Nzc1a2rfVOFk5cICoHstxnwmAzil+8rAoGBAKo2yueiGRlCWFvia0Ut
-5MBcj0/d1dfPxte/YEnhE0nn+DjnLht+wRKUM/5Mb2lqJnfLid91Xv1/tes+M+Ub
-DVepBUkjbzT6wZT3N6HFYuA1vBw8FvsefEI3hJzKx705zeNXOYgdKOSgHc+CMHI+
-rom0AYO7AXhfR2+90ihrHdD7
------END PRIVATE KEY-----
-";
+const TEST_KEY: &str = include_str!("common/synthetic-rsa-key.pem");
 const TEST_MODULUS: &str = "kfqAX58zY9qGTqRr7sSfhilbOHoPaSVCvYdAEUz2xynP33YNPQzrJMTh5A4dnPeyH5NENDxTsTm0amkXNt7SoBL4oz70N0Aeb3EEl12LaVV-T6Rsg7gN_daWrUMp5FqKYsX4xPlZcUYfHV0AlVQYY76GBEb4MM_LpkmNwxv9DVUtPxf0WmahmBk4qaksK521F6i7MG4YdjjhngVj0Hhj7M2ZOOtn5cp9dGYUZ0jTIz95Vm-_gztlh0LS0f4I8yKkEBhw4uOF8GQXtPjDdLZBGyi2Dr8-uvCwygfO-3RPxHbUgbD6XDS8YeLq02hr54B-WGSCsTJtC4lxn0sFQygolw";
 
 #[tokio::test]
@@ -1456,4 +1433,414 @@ async fn small_clock_skew_is_tolerated_for_issue_time_but_never_for_expiry() {
             .code,
         "auth_invalid"
     );
+}
+
+/// Enable DPoP for a fixture; `public_url` is where callers reach the service.
+fn with_dpop(fixture: &Fixture, public_url: &str, required: bool) -> AuthConfig {
+    let mut config = fixture.config.clone();
+    config.oidc.as_mut().unwrap().dpop =
+        Some(serde_json::from_value(json!({"public_url":public_url,"required":required})).unwrap());
+    config
+}
+const DPOP_URL: &str = "https://pdf.example.com/v1/history";
+
+#[tokio::test]
+async fn dpop_bound_tokens_need_a_fresh_proof_from_the_bound_key() {
+    use pdf2md_mcp::auth::Credentials;
+    let fixture = Fixture::new(TokenValidation::Jwt).await;
+    let auth = Authenticator::new(with_dpop(&fixture, "https://pdf.example.com", false))
+        .await
+        .unwrap();
+    let key = ProofKey::es256();
+    let bound = token(&fixture.issuer, "first", |claims| {
+        claims["cnf"] = json!({"jkt":key.thumbprint()})
+    });
+    let unbound = token(&fixture.issuer, "first", |_| {});
+    let verify = |key: &ProofKey, token: &str| {
+        auth.verify_dpop(
+            &key.proof("GET", DPOP_URL, token),
+            "GET",
+            "/v1/history",
+            token,
+        )
+        .unwrap()
+    };
+
+    // The bound key's proof authorizes the request, for several operations.
+    let proven = verify(&key, &bound);
+    for _ in 0..2 {
+        auth.authorize_credentials(Credentials::dpop(&bound, &proven), true, false)
+            .await
+            .unwrap();
+    }
+    // The same proof in a second request is a replay.
+    let proof = key.proof("GET", DPOP_URL, &bound);
+    let first = auth
+        .verify_dpop(&proof, "GET", "/v1/history", &bound)
+        .unwrap();
+    let second = auth
+        .verify_dpop(&proof, "GET", "/v1/history", &bound)
+        .unwrap();
+    auth.authorize_credentials(Credentials::dpop(&bound, &first), false, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        auth.authorize_credentials(Credentials::dpop(&bound, &second), false, false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_dpop_invalid"
+    );
+
+    // A bound token is never a Bearer token (RFC 9449 section 7.2).
+    assert_eq!(
+        auth.authenticate(Some(&bound), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    // A proof from another key does not satisfy the binding.
+    let other = ProofKey::es256();
+    let stolen = verify(&other, &bound);
+    assert_eq!(
+        auth.authorize_credentials(Credentials::dpop(&bound, &stolen), false, false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    // An unbound token cannot be upgraded by attaching a proof.
+    let attached = verify(&key, &unbound);
+    assert_eq!(
+        auth.authorize_credentials(Credentials::dpop(&unbound, &attached), false, false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    // Unbound Bearer tokens stay valid unless binding is required.
+    auth.authenticate(Some(&unbound), false).await.unwrap();
+    let strict = Authenticator::new(with_dpop(&fixture, "https://pdf.example.com", true))
+        .await
+        .unwrap();
+    assert_eq!(
+        strict
+            .authenticate(Some(&unbound), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    let proven = strict
+        .verify_dpop(
+            &key.proof("GET", DPOP_URL, &bound),
+            "GET",
+            "/v1/history",
+            &bound,
+        )
+        .unwrap();
+    strict
+        .authorize_credentials(Credentials::dpop(&bound, &proven), false, false)
+        .await
+        .unwrap();
+
+    // Without DPoP configuration no proof can be verified, and a bound token
+    // is still refused as a Bearer token.
+    let plain = Authenticator::new(fixture.config.clone()).await.unwrap();
+    assert_eq!(
+        plain
+            .verify_dpop(
+                &key.proof("GET", DPOP_URL, &bound),
+                "GET",
+                "/v1/history",
+                &bound
+            )
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    assert_eq!(
+        plain
+            .authenticate(Some(&bound), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    plain.authenticate(Some(&unbound), false).await.unwrap();
+}
+
+#[tokio::test]
+async fn introspection_reports_the_dpop_binding_that_the_proof_must_match() {
+    use pdf2md_mcp::auth::Credentials;
+    let fixture = Fixture::new(TokenValidation::Introspection).await;
+    let auth = Authenticator::new(with_dpop(&fixture, "https://pdf.example.com", false))
+        .await
+        .unwrap();
+    let key = ProofKey::ed25519();
+    let proven = |token: &str| {
+        auth.verify_dpop(
+            &key.proof("GET", DPOP_URL, token),
+            "GET",
+            "/v1/history",
+            token,
+        )
+        .unwrap()
+    };
+    let set = |update: &dyn Fn(&mut Value)| {
+        let mut value = claims(&fixture.issuer);
+        update(&mut value);
+        *fixture.introspection.lock().unwrap() = value;
+    };
+
+    set(&|claims| {
+        claims["token_type"] = json!("DPoP");
+        claims["cnf"] = json!({"jkt":key.thumbprint()});
+    });
+    let key_proof = proven("opaque");
+    auth.authorize_credentials(Credentials::dpop("opaque", &key_proof), false, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        auth.authenticate(Some("opaque"), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    // A Bearer type that names a key is bound all the same.
+    set(&|claims| claims["cnf"] = json!({"jkt":key.thumbprint()}));
+    assert!(auth.authenticate(Some("opaque"), false).await.is_err());
+    // A DPoP type without its key cannot be confirmed.
+    set(&|claims| claims["token_type"] = json!("DPoP"));
+    let key_proof = proven("opaque");
+    assert_eq!(
+        auth.authorize_credentials(Credentials::dpop("opaque", &key_proof), false, false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    assert!(auth.authenticate(Some("opaque"), false).await.is_err());
+}
+
+#[test]
+fn dpop_configuration_needs_a_public_url_and_a_validator_that_reports_the_binding() {
+    let config = |profile: &str, validation: &str, dpop: Value| {
+        serde_json::from_value::<AuthConfig>(json!({"mode":"oauth2","oidc":{
+            "issuer":"https://id.example.com","audience":"https://pdf.example.com/",
+            "token_profile":profile,"validation":validation,
+            "client_id":"pdf2md-api","client_secret":{"env":"PDF2MD_TEST_SECRET"},"dpop":dpop}}))
+        .map_err(|_| ())
+        .and_then(|config| config.validate().map_err(|_| ()))
+    };
+    let dpop = json!({"public_url":"https://pdf.example.com"});
+    assert!(config("rfc9068", "jwt", dpop.clone()).is_ok());
+    assert!(config("rfc9068", "introspection", dpop.clone()).is_ok());
+    assert!(config("casdoor", "introspection", dpop.clone()).is_ok());
+    // Casdoor JWTs carry no key confirmation, so local validation is refused.
+    assert!(config("casdoor", "jwt", dpop).is_err());
+    assert!(
+        config(
+            "rfc9068",
+            "jwt",
+            json!({"public_url":"http://pdf.example.com"})
+        )
+        .is_err()
+    );
+    assert!(config("rfc9068", "jwt", json!({"required":true})).is_err());
+    assert!(
+        config(
+            "rfc9068",
+            "jwt",
+            json!({"public_url":"https://pdf.example.com","nonce":true})
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn http_and_mcp_accept_dpop_presentations_and_challenge_for_both_schemes() {
+    use pdf2md_mcp::{config::Config, http, service::CallerService};
+    use tokio_util::sync::CancellationToken;
+    const ALGORITHMS: &str = "DPoP algs=\"ES256 ES384 EdDSA PS256 RS256\"";
+
+    let fixture = Fixture::new(TokenValidation::Jwt).await;
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let mut config = Config {
+        auth: with_dpop(&fixture, &base, false),
+        ..Config::default()
+    };
+    config.mcp.enabled = true;
+    config.mcp.resource_url = Some("https://pdf2md.example/mcp".into());
+    let service = Arc::new(CallerService::new(dir.path(), config, None).await.unwrap());
+    let cancel = CancellationToken::new();
+    let router = http::router(service, cancel.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let key = ProofKey::es256();
+    let bound = token(&fixture.issuer, "first", |claims| {
+        claims["cnf"] = json!({"jkt":key.thumbprint()})
+    });
+    let history = format!("{base}/v1/history");
+    let challenges = |response: &reqwest::Response| -> Vec<String> {
+        response
+            .headers()
+            .get_all("www-authenticate")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect()
+    };
+    let get = |authorization: Option<String>, proof: Option<String>| {
+        let mut request = client.get(&history);
+        if let Some(value) = authorization {
+            request = request.header("authorization", value);
+        }
+        if let Some(value) = proof {
+            request = request.header("dpop", value);
+        }
+        request.send()
+    };
+
+    // A bound token with a fresh proof reaches the API; the query string is
+    // not part of the proof target.
+    let proof = key.proof("GET", &history, &bound);
+    let response = client
+        .get(format!("{history}?limit=1"))
+        .header("authorization", format!("DPoP {bound}"))
+        .header("dpop", &proof)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    // Replaying the proof names the proof as the error (RFC 9449 section 7.1).
+    let response = get(Some(format!("DPoP {bound}")), Some(proof))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    assert_eq!(
+        challenges(&response),
+        [
+            "Bearer".to_owned(),
+            format!("{ALGORITHMS}, error=\"invalid_dpop_proof\"")
+        ]
+    );
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "auth_dpop_invalid");
+    // The DPoP scheme without a proof header, or with two, is rejected.
+    let response = get(Some(format!("DPoP {bound}")), None).await.unwrap();
+    assert_eq!(response.status(), 401);
+    assert!(challenges(&response)[1].contains("invalid_dpop_proof"));
+    let response = client
+        .get(&history)
+        .header("authorization", format!("DPoP {bound}"))
+        .header("dpop", key.proof("GET", &history, &bound))
+        .header("dpop", key.proof("GET", &history, &bound))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    // A bound token presented as Bearer is an invalid token for that scheme.
+    let response = get(Some(format!("Bearer {bound}")), None).await.unwrap();
+    assert_eq!(response.status(), 401);
+    assert_eq!(
+        challenges(&response),
+        [
+            "Bearer error=\"invalid_token\"".to_owned(),
+            ALGORITHMS.to_owned()
+        ]
+    );
+    // Without credentials both schemes are offered and no error is named.
+    let response = get(None, None).await.unwrap();
+    assert_eq!(response.status(), 401);
+    assert_eq!(challenges(&response), ["Bearer", ALGORITHMS]);
+    // A proof made for another service is not accepted here.
+    let foreign = key.proof("GET", "https://other.example.com/v1/history", &bound);
+    let response = get(Some(format!("DPoP {bound}")), Some(foreign))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+
+    // Missing scope is reported for the scheme that was used.
+    let read_only = token(&fixture.issuer, "first", |claims| {
+        claims["cnf"] = json!({"jkt":key.thumbprint()});
+        claims["scope"] = json!("pdf2md:read");
+    });
+    let acquisitions = format!("{base}/v1/acquisitions");
+    let response = client
+        .post(&acquisitions)
+        .header("authorization", format!("DPoP {read_only}"))
+        .header("dpop", key.proof("POST", &acquisitions, &read_only))
+        .json(&json!({"url":"https://example.com/a.pdf"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert_eq!(
+        challenges(&response),
+        [format!("{ALGORITHMS}, error=\"insufficient_scope\"")]
+    );
+    // Uploads read the same credentials.
+    let documents = format!("{base}/v1/documents");
+    let response = client
+        .post(&documents)
+        .header("authorization", format!("DPoP {bound}"))
+        .header("dpop", key.proof("POST", &documents, &bound))
+        .header("content-type", "application/pdf")
+        .body("not a pdf")
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(response.status(), 401);
+    assert_ne!(response.status(), 403);
+
+    // MCP: metadata advertises DPoP, and one proof covers the transport
+    // guard and the tool call of a request.
+    let metadata: Value = client
+        .get(format!("{base}/.well-known/oauth-protected-resource/mcp"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata["dpop_signing_alg_values_supported"],
+        json!(["ES256", "ES384", "EdDSA", "PS256", "RS256"])
+    );
+    assert_eq!(metadata["dpop_bound_access_tokens_required"], false);
+    let mcp = format!("{base}/mcp");
+    let call = |proof: String| {
+        client
+            .post(&mcp)
+            .header("authorization", format!("DPoP {bound}"))
+            .header("dpop", proof)
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list","arguments":{"kind":"documents"}}}))
+            .send()
+    };
+    let proof = key.proof("POST", &mcp, &bound);
+    let response = call(proof.clone()).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], false);
+    assert_eq!(body["result"]["structuredContent"]["kind"], "documents");
+    let response = call(proof).await.unwrap();
+    assert_eq!(response.status(), 401);
+    let challenge = challenges(&response);
+    assert!(
+        challenge[0].starts_with("Bearer resource_metadata=") && !challenge[0].contains("error=")
+    );
+    assert!(
+        challenge[1].starts_with(ALGORITHMS)
+            && challenge[1].contains("resource_metadata=")
+            && challenge[1].ends_with("error=\"invalid_dpop_proof\"")
+    );
+    cancel.cancel();
+    server.abort();
 }

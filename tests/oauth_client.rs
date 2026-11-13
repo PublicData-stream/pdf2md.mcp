@@ -1,6 +1,9 @@
 //! Registered OAuth client grants against a synthetic TLS provider.
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, jwk::Jwk};
 use pdf2md_mcp::{
-    auth::{AuthConfig, AuthMode, OidcConfig, OidcSecret, TokenProfile, TokenValidation},
+    auth::{
+        AuthConfig, AuthMode, Authenticator, OidcConfig, OidcSecret, TokenProfile, TokenValidation,
+    },
     config::Config,
     http,
     oauth::{GrantType, OAuthClient, OAuthClientConfig, code_challenge},
@@ -156,6 +159,18 @@ impl Provider {
                                 .pop_front()
                                 .unwrap_or_else(|| (200, token_json("access-1")))
                         }
+                        "/introspect" => {
+                            log.lock().unwrap().push(Recorded {
+                                path,
+                                authorization,
+                                form,
+                            });
+                            let now = chrono::Utc::now().timestamp();
+                            (
+                                200,
+                                json!({"active":true,"token_type":"Bearer","iss":origin,"sub":"alice","aud":AUDIENCE,"exp":now+600,"iat":now-1,"scope":"pdf2md:read","jti":"synthetic","client_id":"pdf2md-web"}),
+                            )
+                        }
                         "/device" => {
                             log.lock().unwrap().push(Recorded {
                                 path,
@@ -203,11 +218,13 @@ impl Provider {
                 jwt_scope_claim: "scope".into(),
                 client_id: None,
                 client_secret: None,
+                client_assertion: None,
                 read_scope: "pdf2md:read".into(),
                 write_scope: "pdf2md:write".into(),
                 operate_scope: "pdf2md:operate".into(),
                 allowed_endpoint_origins: vec![],
                 ca_file: Some(self.ca.clone()),
+                dpop: None,
             }),
             client: Some(OAuthClientConfig {
                 client_id: "pdf2md-web".into(),
@@ -215,6 +232,7 @@ impl Provider {
                     env: None,
                     file: Some(self.secret.clone()),
                 }),
+                client_assertion: None,
                 grant_types: grants.to_vec(),
                 scopes: vec!["pdf2md:read".into(), "pdf2md:write".into()],
                 redirect_base_url: redirect,
@@ -667,6 +685,257 @@ async fn public_clients_send_client_id_without_basic_authentication() {
     let request = provider.last();
     assert!(request.authorization.is_none());
     assert_eq!(request.form["client_id"], "pdf2md-web");
+}
+
+/// Synthetic RSA key shared with the token-validation tests.
+const RSA_KEY: &str = include_str!("common/synthetic-rsa-key.pem");
+
+/// Public half of a PKCS#8 signing key, as the provider would hold it.
+fn public_key(pem: &str, algorithm: Algorithm) -> DecodingKey {
+    let key = match algorithm {
+        Algorithm::RS256 | Algorithm::PS256 => EncodingKey::from_rsa_pem(pem.as_bytes()),
+        _ => EncodingKey::from_ec_pem(pem.as_bytes()),
+    }
+    .unwrap();
+    DecodingKey::from_jwk(&Jwk::from_encoding_key(&key, algorithm).unwrap()).unwrap()
+}
+
+/// Decode a recorded `private_key_jwt` assertion with the signer's public key.
+fn assertion(request: &Recorded, public: &DecodingKey, algorithm: Algorithm) -> (Header, Value) {
+    assert!(request.authorization.is_none(), "no shared secret is sent");
+    assert_eq!(
+        request.form["client_assertion_type"],
+        "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+    );
+    let mut validation = Validation::new(algorithm);
+    validation.validate_aud = false;
+    validation.set_required_spec_claims(&["iss", "sub", "aud", "exp"]);
+    let token = decode::<Value>(&request.form["client_assertion"], public, &validation).unwrap();
+    (token.header, token.claims)
+}
+
+#[tokio::test]
+async fn private_key_jwt_signs_a_fresh_assertion_for_each_provider_request() {
+    let provider = Provider::start().await;
+    let token_endpoint = format!("{}/token?tenant=pdf2md", provider.issuer);
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let ec = rcgen::KeyPair::generate().unwrap().serialize_pem();
+    let ed = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let ed_public = DecodingKey::from_ed_der(ed.public_key_raw());
+    let ed = ed.serialize_pem();
+    for (name, pem, algorithm, public) in [
+        (
+            "ES256",
+            ec.as_str(),
+            Algorithm::ES256,
+            public_key(&ec, Algorithm::ES256),
+        ),
+        ("EdDSA", ed.as_str(), Algorithm::EdDSA, ed_public),
+        (
+            "RS256",
+            RSA_KEY,
+            Algorithm::RS256,
+            public_key(RSA_KEY, Algorithm::RS256),
+        ),
+        (
+            "PS256",
+            RSA_KEY,
+            Algorithm::PS256,
+            public_key(RSA_KEY, Algorithm::PS256),
+        ),
+    ] {
+        let public = &public;
+        let key = dir.path().join(name);
+        std::fs::write(&key, pem).unwrap();
+        let mut auth = provider.auth(
+            &[
+                GrantType::ClientCredentials,
+                GrantType::RefreshToken,
+                GrantType::DeviceCode,
+            ],
+            None,
+            false,
+        );
+        auth.client.as_mut().unwrap().client_assertion = Some(
+            serde_json::from_value(json!({"key":{"file":key},"algorithm":name,"key_id":"key-1"}))
+                .unwrap(),
+        );
+        let client = OAuthClient::new(&auth).unwrap().unwrap();
+
+        client.client_credentials().await.unwrap();
+        let first = provider.last();
+        let (header, claims) = assertion(&first, public, algorithm);
+        assert_eq!(header.kid.as_deref(), Some("key-1"));
+        assert_eq!(first.form["client_id"], "pdf2md-web");
+        // RFC 7523 section 3: the client is issuer and subject, and the
+        // audience is the provider's token endpoint.
+        assert_eq!(claims["iss"], "pdf2md-web");
+        assert_eq!(claims["sub"], "pdf2md-web");
+        assert_eq!(claims["aud"], token_endpoint);
+        assert_eq!(
+            claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+            60
+        );
+
+        client.refresh("refresh-1").await.unwrap();
+        let (_, second) = assertion(&provider.last(), public, algorithm);
+        assert_ne!(claims["jti"], second["jti"], "assertions are single use");
+
+        // The device authorization endpoint receives the same audience.
+        client.device_authorization().await.unwrap();
+        let device = provider.last();
+        assert_eq!(device.path, "/device");
+        assert_eq!(
+            assertion(&device, public, algorithm).1["aud"],
+            token_endpoint
+        );
+    }
+
+    // A provider that expects another issuer value can be accommodated.
+    let key = dir.path().join("ES256");
+    let mut auth = provider.auth(&[GrantType::ClientCredentials], None, false);
+    auth.client.as_mut().unwrap().client_assertion = Some(
+        serde_json::from_value(json!({"key":{"file":key},"algorithm":"ES256","issuer":"https://pdf.example.com/oauth/callback"}))
+            .unwrap(),
+    );
+    let client = OAuthClient::new(&auth).unwrap().unwrap();
+    client.client_credentials().await.unwrap();
+    let (header, claims) = assertion(
+        &provider.last(),
+        &public_key(&ec, Algorithm::ES256),
+        Algorithm::ES256,
+    );
+    assert!(header.kid.is_none());
+    assert_eq!(claims["iss"], "https://pdf.example.com/oauth/callback");
+    assert_eq!(claims["sub"], "pdf2md-web");
+}
+
+#[tokio::test]
+async fn private_key_jwt_counts_as_a_confidential_client_and_authenticates_introspection() {
+    let provider = Provider::start().await;
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let key = dir.path().join("key.pem");
+    let pem = rcgen::KeyPair::generate().unwrap().serialize_pem();
+    std::fs::write(&key, &pem).unwrap();
+    let assertion_config = json!({"key":{"file":key},"algorithm":"ES256"});
+
+    // Without advertised PKCE support only a confidential client may sign in.
+    *provider.pkce_methods.lock().unwrap() = None;
+    let mut auth = provider.auth(
+        &[GrantType::AuthorizationCode],
+        Some("https://pdf.example.com".into()),
+        false,
+    );
+    auth.client.as_mut().unwrap().client_assertion =
+        Some(serde_json::from_value(assertion_config.clone()).unwrap());
+    let client = OAuthClient::new(&auth).unwrap().unwrap();
+    client.authorization_request().await.unwrap();
+
+    // Introspection authenticates with a signed assertion instead of a secret.
+    let oidc = auth.oidc.as_mut().unwrap();
+    oidc.validation = TokenValidation::Introspection;
+    oidc.token_profile = TokenProfile::Rfc9068;
+    oidc.client_id = Some("pdf2md-api".into());
+    oidc.client_assertion = Some(serde_json::from_value(assertion_config).unwrap());
+    auth.client = None;
+    let validator = Authenticator::new(auth).await.unwrap();
+    validator.authenticate(Some("opaque"), false).await.unwrap();
+    let request = provider.last();
+    assert_eq!(request.path, "/introspect");
+    assert_eq!(request.form["token"], "opaque");
+    assert_eq!(request.form["client_id"], "pdf2md-api");
+    let (_, claims) = assertion(
+        &request,
+        &public_key(&pem, Algorithm::ES256),
+        Algorithm::ES256,
+    );
+    assert_eq!(claims["sub"], "pdf2md-api");
+    assert_eq!(
+        claims["aud"],
+        format!("{}/token?tenant=pdf2md", provider.issuer)
+    );
+}
+
+#[test]
+fn client_assertion_configuration_requires_one_credential_and_a_matching_key() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let ec = dir.path().join("ec.pem");
+    std::fs::write(&ec, rcgen::KeyPair::generate().unwrap().serialize_pem()).unwrap();
+    let rsa = dir.path().join("rsa.pem");
+    std::fs::write(&rsa, RSA_KEY).unwrap();
+    let secret = dir.path().join("secret");
+    std::fs::write(&secret, "secret").unwrap();
+    let auth = |oidc: Value, client: Value| -> AuthConfig {
+        let mut oidc_base =
+            json!({"issuer":"https://id.example.com","audience":AUDIENCE,"validation":"jwt"});
+        oidc_base
+            .as_object_mut()
+            .unwrap()
+            .extend(oidc.as_object().unwrap().clone());
+        let mut client_base = json!({"client_id":"pdf2md-web","grant_types":["client_credentials"],"scopes":["pdf2md:read"]});
+        client_base
+            .as_object_mut()
+            .unwrap()
+            .extend(client.as_object().unwrap().clone());
+        serde_json::from_value(json!({"mode":"oauth2","oidc":oidc_base,"client":client_base}))
+            .unwrap()
+    };
+    let assertion =
+        |key: &std::path::Path, algorithm: &str| json!({"key":{"file":key},"algorithm":algorithm});
+
+    // A signing key satisfies the credential that Client Credentials needs.
+    let valid = auth(
+        json!({}),
+        json!({"client_assertion":assertion(&ec, "ES256")}),
+    );
+    assert!(valid.validate().is_ok());
+    assert!(OAuthClient::new(&valid).unwrap().is_some());
+    // A secret and a signing key cannot be combined.
+    let both = auth(
+        json!({}),
+        json!({"client_secret":{"file":secret},"client_assertion":assertion(&ec, "ES256")}),
+    );
+    assert_eq!(both.validate().unwrap_err().code, "auth_config");
+    // The key must fit the algorithm, and is checked at startup.
+    for (key, algorithm) in [(&ec, "RS256"), (&rsa, "ES256"), (&secret, "ES256")] {
+        let mismatched = auth(
+            json!({}),
+            json!({"client_assertion":assertion(key, algorithm)}),
+        );
+        assert_eq!(
+            OAuthClient::new(&mismatched).err().unwrap().code,
+            "auth_config"
+        );
+    }
+    // Unknown algorithms, including symmetric ones, are not configuration values.
+    assert!(
+        serde_json::from_value::<AuthConfig>(json!({"mode":"oauth2","oidc":{"issuer":"https://id.example.com","audience":AUDIENCE,"validation":"jwt"},"client":{"client_id":"c","grant_types":["client_credentials"],"scopes":["pdf2md:read"],"client_assertion":assertion(&ec, "HS256")}}))
+            .is_err()
+    );
+
+    // Introspection takes exactly one credential.
+    let introspection = |extra: Value| {
+        let mut oidc = json!({"validation":"introspection","client_id":"pdf2md-api"});
+        oidc.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let mut config = auth(oidc, json!({"client_assertion":assertion(&ec, "ES256")}));
+        config.client = None;
+        config
+    };
+    assert!(
+        introspection(json!({"client_assertion":assertion(&ec, "ES256")}))
+            .validate()
+            .is_ok()
+    );
+    assert!(introspection(json!({})).validate().is_err());
+    assert!(
+        introspection(
+            json!({"client_secret":{"file":secret},"client_assertion":assertion(&ec, "ES256")})
+        )
+        .validate()
+        .is_err()
+    );
 }
 
 #[test]

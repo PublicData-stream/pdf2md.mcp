@@ -18,8 +18,9 @@
 use crate::{
     auth::{
         AuthConfig, AuthMode, MAX_RESPONSE, MAX_TOKEN, OidcConfig, OidcSecret, config_error,
-        oauth_basic_component, provider_client, provider_endpoint, unavailable, valid_scope,
+        provider_client, provider_endpoint, unavailable, valid_scope,
     },
+    client_auth::{ClientAssertionConfig, ClientAuth},
     error::{LoadError, Result},
 };
 use base64::Engine;
@@ -54,8 +55,13 @@ pub enum GrantType {
 #[serde(deny_unknown_fields)]
 pub struct OAuthClientConfig {
     pub client_id: String,
-    /// Omit for a public client. Required for `client_credentials`.
+    /// Shared secret, sent with `client_secret_basic`. Omit it and
+    /// `client_assertion` for a public client.
     pub client_secret: Option<OidcSecret>,
+    /// `private_key_jwt` signing key, used instead of `client_secret`.
+    /// `client_credentials` requires one of the two.
+    #[serde(default)]
+    pub client_assertion: Option<ClientAssertionConfig>,
     pub grant_types: Vec<GrantType>,
     pub scopes: Vec<String>,
     /// Public origin of this service; required for `authorization_code`.
@@ -100,13 +106,18 @@ impl OAuthClientConfig {
             || self.scopes.is_empty()
             || self.scopes.len() > MAX_SCOPES
             || !self.scopes.iter().all(|scope| valid_scope(scope))
+            || (self.client_secret.is_some() && self.client_assertion.is_some())
             || (self.grant_types.contains(&GrantType::ClientCredentials)
-                && self.client_secret.is_none())
+                && self.client_secret.is_none()
+                && self.client_assertion.is_none())
         {
             return Err(config_error());
         }
         if let Some(secret) = &self.client_secret {
             secret.validate()?;
+        }
+        if let Some(assertion) = &self.client_assertion {
+            assertion.validate()?;
         }
         let browser = self.grant_types.contains(&GrantType::AuthorizationCode);
         match &self.redirect_base_url {
@@ -196,7 +207,7 @@ pub struct OAuthClient {
     oidc: OidcConfig,
     config: OAuthClientConfig,
     http: reqwest::Client,
-    secret: Option<String>,
+    auth: ClientAuth,
     metadata: Mutex<Option<(Metadata, Instant)>>,
 }
 
@@ -278,16 +289,15 @@ impl OAuthClient {
             return Ok(None);
         };
         config.validate(&oidc)?;
-        let secret = config
-            .client_secret
-            .as_ref()
-            .map(OidcSecret::resolve)
-            .transpose()?;
+        let auth = ClientAuth::load(
+            config.client_secret.as_ref(),
+            config.client_assertion.as_ref(),
+        )?;
         Ok(Some(Self {
             http: provider_client(&oidc)?,
             oidc,
             config,
-            secret,
+            auth,
             metadata: Mutex::new(None),
         }))
     }
@@ -372,7 +382,7 @@ impl OAuthClient {
     fn require_pkce_support(&self, metadata: &Metadata) -> Result<()> {
         let supported = match &metadata.code_challenge_methods_supported {
             Some(methods) => methods.iter().any(|method| method == "S256"),
-            None => self.secret.is_some(),
+            None => self.auth.confidential(),
         };
         if supported {
             Ok(())
@@ -429,7 +439,7 @@ impl OAuthClient {
         }
     }
 
-    async fn token_request(&self, mut form: Vec<(&str, String)>) -> Result<TokenResponse> {
+    async fn token_request(&self, mut form: Vec<(&'static str, String)>) -> Result<TokenResponse> {
         let metadata = self.metadata().await?;
         let url = self.endpoint(metadata.token_endpoint.as_deref())?;
         let response = self.post(url, &mut form).await?;
@@ -446,18 +456,24 @@ impl OAuthClient {
         Ok(token)
     }
 
-    async fn post(&self, url: Url, form: &mut Vec<(&str, String)>) -> Result<reqwest::Response> {
-        let mut request = self.http.post(url).header("accept", "application/json");
-        match &self.secret {
-            // RFC 6749 section 2.3.1 client_secret_basic.
-            Some(secret) => {
-                request = request.basic_auth(
-                    oauth_basic_component(&self.config.client_id),
-                    Some(oauth_basic_component(secret)),
-                );
-            }
-            None => form.push(("client_id", self.config.client_id.clone())),
-        }
+    async fn post(
+        &self,
+        url: Url,
+        form: &mut Vec<(&'static str, String)>,
+    ) -> Result<reqwest::Response> {
+        // A signed assertion names the token endpoint as its audience.
+        let token_endpoint = match &self.auth {
+            ClientAuth::Assertion(_) => self
+                .metadata()
+                .await?
+                .token_endpoint
+                .ok_or_else(unavailable)?,
+            _ => String::new(),
+        };
+        let request = self.http.post(url).header("accept", "application/json");
+        let request = self
+            .auth
+            .apply(request, form, &self.config.client_id, &token_endpoint)?;
         request.form(form).send().await.map_err(|_| unavailable())
     }
 
@@ -499,7 +515,7 @@ impl OAuthClient {
         ];
         // RFC 8628 section 3.1 identifies the client in the request body; some
         // providers read it only from there even when the client authenticates.
-        if self.secret.is_some() {
+        if matches!(self.auth, ClientAuth::Secret(_)) {
             form.push(("client_id", self.config.client_id.clone()));
         }
         let response = self.post(url, &mut form).await?;

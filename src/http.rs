@@ -1,4 +1,5 @@
 //! HTTP transport for the workspace-authorized caller service.
+pub(crate) mod caller;
 mod oauth;
 mod spec;
 
@@ -6,8 +7,10 @@ use crate::{auth::AuthMode, error::LoadError, service::CallerService};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    extract::{
+        DefaultBodyLimit, FromRequest, FromRequestParts, Multipart, Path, Query, Request, State,
+    },
+    http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post, put},
@@ -56,8 +59,9 @@ pub fn router(service: Arc<CallerService>, cancel: CancellationToken) -> Router 
         .enabled
         .then(|| crate::mcp::router(app.service.clone(), app.cancel.clone()));
     let oauth = app.service.oauth_client();
-    let bearer = app.service.config().auth.mode == AuthMode::Oauth2;
-    let headers = move |request: Request, next: Next| response_headers(bearer, request, next);
+    let service = app.service.clone();
+    let headers =
+        move |request: Request, next: Next| response_headers(service.clone(), request, next);
     let rest = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
@@ -85,7 +89,7 @@ pub fn router(service: Arc<CallerService>, cancel: CancellationToken) -> Router 
         .route("/v1/conversions/{id}/assets/{name}", get(asset))
         .route("/v1/conversions/{id}/bundle.zip", get(bundle))
         .layer(DefaultBodyLimit::max(max))
-        .layer(middleware::from_fn(headers))
+        .layer(middleware::from_fn(headers.clone()))
         .with_state(app);
     let rest = match oauth {
         Some(client) => rest.merge(
@@ -105,6 +109,26 @@ pub fn router(service: Arc<CallerService>, cancel: CancellationToken) -> Router 
 #[derive(Debug)]
 struct ApiError(LoadError);
 
+/// Response extension marking a 401 caused by the request's DPoP proof, so
+/// the challenge names `invalid_dpop_proof` rather than `invalid_token`.
+#[derive(Clone, Copy)]
+struct ProofRejected;
+
+/// The request's access-token credentials. Extracting it reads the
+/// `Authorization` header and verifies a DPoP proof once per request.
+struct Caller(caller::Presented);
+impl FromRequestParts<App> for Caller {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, ApiError> {
+        Ok(Self(caller::Presented::read(
+            &app.service,
+            &parts.method,
+            parts.uri.path(),
+            &parts.headers,
+        )?))
+    }
+}
+
 /// Response extension marking an intentional HTML error page, which the
 /// response middleware must not replace with a JSON error body.
 #[derive(Clone, Copy)]
@@ -118,7 +142,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let code = self.0.code.as_str();
         let status = match code {
-            "auth_invalid" => StatusCode::UNAUTHORIZED,
+            "auth_invalid" | "auth_dpop_invalid" => StatusCode::UNAUTHORIZED,
             "auth_forbidden" => StatusCode::FORBIDDEN,
             "auth_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
             "oauth_pkce_unsupported" => StatusCode::BAD_GATEWAY,
@@ -145,7 +169,11 @@ impl IntoResponse for ApiError {
             _ => StatusCode::BAD_REQUEST,
         };
         let request_id = uuid::Uuid::new_v4().to_string();
+        let proof_rejected = code == "auth_dpop_invalid";
         let mut response = (status, Json(json!({"code":self.0.code,"message":self.0.message,"retryable":self.0.retryable,"request_id":request_id}))).into_response();
+        if proof_rejected {
+            response.extensions_mut().insert(ProofRejected);
+        }
         response
             .headers_mut()
             .insert("x-request-id", request_id.parse().expect("UUID header"));
@@ -175,28 +203,9 @@ fn invalid(code: &str, message: &str) -> ApiError {
     LoadError::new(code, message).into()
 }
 
-/// RFC 6750 section 3.1 challenge for a response to a request that carried
-/// Bearer credentials. Requests without credentials get the bare scheme.
-fn bearer_error(status: StatusCode) -> Option<HeaderValue> {
-    match status {
-        StatusCode::UNAUTHORIZED => {
-            Some(HeaderValue::from_static("Bearer error=\"invalid_token\""))
-        }
-        StatusCode::FORBIDDEN => Some(HeaderValue::from_static(
-            "Bearer error=\"insufficient_scope\"",
-        )),
-        _ => None,
-    }
-}
-
-async fn response_headers(bearer: bool, request: Request, next: Next) -> Response {
-    let presented = bearer
-        && request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split_ascii_whitespace().next())
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer"));
+async fn response_headers(service: Arc<CallerService>, request: Request, next: Next) -> Response {
+    let oauth = service.config().auth.mode == AuthMode::Oauth2;
+    let presented = caller::scheme(request.headers());
     let mut response = next.run(request).await;
     // Normalize framework-generated rejection responses as well as application errors.
     if response.status().is_client_error()
@@ -219,10 +228,22 @@ async fn response_headers(bearer: bool, request: Request, next: Next) -> Respons
         *replacement.status_mut() = status;
         response = replacement;
     }
-    let challenge = presented.then(|| bearer_error(response.status())).flatten();
+    // RFC 6750 section 3 and RFC 9449 section 7.1: name the supported
+    // schemes, with an error code for the scheme the request used.
+    let status = response.status();
+    let challenges = if oauth && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+    {
+        let proof = response.extensions().get::<ProofRejected>().is_some();
+        caller::challenges(&service, status, presented, proof, "")
+    } else {
+        vec![]
+    };
     let headers = response.headers_mut();
-    if let Some(challenge) = challenge {
-        headers.insert(header::WWW_AUTHENTICATE, challenge);
+    if !challenges.is_empty() {
+        headers.remove(header::WWW_AUTHENTICATE);
+        for challenge in challenges {
+            headers.append(header::WWW_AUTHENTICATE, challenge);
+        }
     }
     if !headers.contains_key("x-request-id") {
         headers.insert(
@@ -243,37 +264,6 @@ async fn response_headers(bearer: bool, request: Request, next: Next) -> Respons
     response
 }
 
-fn token<'a>(app: &App, headers: &'a HeaderMap) -> Result<Option<&'a str>, ApiError> {
-    if app.service.config().auth.mode != AuthMode::Oauth2 {
-        return Ok(None);
-    }
-    let mut values = headers.get_all(header::AUTHORIZATION).iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(invalid(
-            "auth_invalid",
-            "valid access-token credentials are required",
-        ));
-    }
-    let value = value.to_str().map_err(|_| {
-        invalid(
-            "auth_invalid",
-            "valid access-token credentials are required",
-        )
-    })?;
-    let mut parts = value.split_ascii_whitespace();
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(scheme), Some(value), None) if scheme.eq_ignore_ascii_case("Bearer") => {
-            Ok(Some(value))
-        }
-        _ => Err(invalid(
-            "auth_invalid",
-            "valid access-token credentials are required",
-        )),
-    }
-}
 fn key(headers: &HeaderMap) -> Result<Option<&str>, ApiError> {
     if headers.get_all("idempotency-key").iter().count() > 1 {
         return Err(invalid("invalid_request", "duplicate idempotency key"));
@@ -423,28 +413,31 @@ struct ScheduleInput {
 
 async fn acquire(
     State(app): State<App>,
+    caller: Caller,
     headers: HeaderMap,
     ApiJson(input): ApiJson<AcquisitionInput>,
 ) -> Result<Response, ApiError> {
     let job = app
         .service
-        .submit_acquisition(token(&app, &headers)?, input.url, key(&headers)?)
+        .submit_acquisition(caller.0.credentials(), input.url, key(&headers)?)
         .await?;
     accepted(job)
 }
 async fn fetch_source(
     State(app): State<App>,
+    caller: Caller,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     accepted(
         app.service
-            .submit_source(token(&app, &headers)?, &id, key(&headers)?)
+            .submit_source(caller.0.credentials(), &id, key(&headers)?)
             .await?,
     )
 }
 async fn convert(
     State(app): State<App>,
+    caller: Caller,
     Path(id): Path<String>,
     headers: HeaderMap,
     ApiJson(input): ApiJson<ConversionInput>,
@@ -452,7 +445,7 @@ async fn convert(
     accepted(
         app.service
             .submit_conversion(
-                token(&app, &headers)?,
+                caller.0.credentials(),
                 &id,
                 input.pages.as_deref(),
                 input.force,
@@ -472,20 +465,20 @@ fn accepted(job: crate::jobs::Job) -> Result<Response, ApiError> {
 }
 async fn sources(
     State(app): State<App>,
-    headers: HeaderMap,
+    caller: Caller,
     Query(query): Query<PageQuery>,
 ) -> Result<Response, ApiError> {
-    Ok(page(app.service.sources(token(&app, &headers)?).await?, query)?.into_response())
+    Ok(page(app.service.sources(caller.0.credentials()).await?, query)?.into_response())
 }
 async fn jobs(
     State(app): State<App>,
-    headers: HeaderMap,
+    caller: Caller,
     Query(query): Query<PageQuery>,
 ) -> Result<Response, ApiError> {
     let (limit, offset) = bounds(&query)?;
     Ok(bounded_page(
         app.service
-            .jobs_page(token(&app, &headers)?, limit + 1, offset)
+            .jobs_page(caller.0.credentials(), limit + 1, offset)
             .await?,
         limit,
         offset,
@@ -494,45 +487,46 @@ async fn jobs(
 }
 async fn job(
     State(app): State<App>,
+    caller: Caller,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    Ok(Json(app.service.get_job(token(&app, &headers)?, &id).await?).into_response())
+    Ok(Json(app.service.get_job(caller.0.credentials(), &id).await?).into_response())
 }
 async fn cancel_job(
     State(app): State<App>,
+    caller: Caller,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    Ok(Json(app.service.cancel_job(token(&app, &headers)?, &id).await?).into_response())
+    Ok(Json(app.service.cancel_job(caller.0.credentials(), &id).await?).into_response())
 }
 async fn retry_job(
     State(app): State<App>,
+    caller: Caller,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     accepted(
         app.service
-            .retry_job(token(&app, &headers)?, &id, key(&headers)?)
+            .retry_job(caller.0.credentials(), &id, key(&headers)?)
             .await?,
     )
 }
 async fn schedules(
     State(app): State<App>,
-    headers: HeaderMap,
+    caller: Caller,
     Query(query): Query<PageQuery>,
 ) -> Result<Response, ApiError> {
-    Ok(page(app.service.schedules(token(&app, &headers)?).await?, query)?.into_response())
+    Ok(page(app.service.schedules(caller.0.credentials()).await?, query)?.into_response())
 }
 async fn set_schedule(
     State(app): State<App>,
+    caller: Caller,
     Path(id): Path<String>,
-    headers: HeaderMap,
     ApiJson(input): ApiJson<ScheduleInput>,
 ) -> Result<Response, ApiError> {
     Ok(Json(
         app.service
-            .set_schedule(token(&app, &headers)?, &id, input.enabled)
+            .set_schedule(caller.0.credentials(), &id, input.enabled)
             .await?,
     )
     .into_response())
@@ -563,13 +557,13 @@ fn bounded_page<T: Serialize>(mut items: Vec<T>, limit: usize, offset: usize) ->
 }
 async fn status(
     State(app): State<App>,
-    headers: HeaderMap,
+    caller: Caller,
     Query(query): Query<PageQuery>,
 ) -> Result<Response, ApiError> {
     let (limit, offset) = bounds(&query)?;
     Ok(bounded_page(
         app.service
-            .status_page(token(&app, &headers)?, limit + 1, offset)
+            .status_page(caller.0.credentials(), limit + 1, offset)
             .await?,
         limit,
         offset,
@@ -578,14 +572,14 @@ async fn status(
 }
 async fn history(
     State(app): State<App>,
-    headers: HeaderMap,
+    caller: Caller,
     Query(query): Query<PageQuery>,
 ) -> Result<Response, ApiError> {
     let (limit, offset) = bounds(&query)?;
     let items = app
         .service
         .history_page(
-            token(&app, &headers)?,
+            caller.0.credentials(),
             query.source.as_deref(),
             limit + 1,
             offset,
@@ -595,14 +589,14 @@ async fn history(
 }
 async fn conversions(
     State(app): State<App>,
-    headers: HeaderMap,
+    caller: Caller,
     Query(query): Query<PageQuery>,
 ) -> Result<Response, ApiError> {
     let (limit, offset) = bounds(&query)?;
     let items = app
         .service
         .conversion_history_page(
-            token(&app, &headers)?,
+            caller.0.credentials(),
             query.document_id.as_deref(),
             limit + 1,
             offset,
@@ -618,8 +612,13 @@ fn multipart_error(error: axum::extract::multipart::MultipartError) -> ApiError 
     }
 }
 async fn upload(State(app): State<App>, request: Request) -> Result<Response, ApiError> {
-    let authorization = token(&app, request.headers())?.map(str::to_owned);
-    let mut session = app.service.prepare_upload(authorization.as_deref()).await?;
+    let caller = caller::Presented::read(
+        &app.service,
+        request.method(),
+        request.uri().path(),
+        request.headers(),
+    )?;
+    let mut session = app.service.prepare_upload(caller.credentials()).await?;
     let timeout = std::time::Duration::from_secs(app.service.config().limits.timeout_secs);
     let receive = async {
         let content = request
@@ -750,34 +749,34 @@ fn stream_response<R: AsyncRead + Send + Unpin + 'static>(
 }
 async fn pdf(
     State(app): State<App>,
+    caller: Caller,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let permit = download_slot(&app)?;
-    let reader = app.service.read_pdf(token(&app, &headers)?, &id).await?;
+    let reader = app.service.read_pdf(caller.0.credentials(), &id).await?;
     stream_response(reader, "application/pdf", "document.pdf", permit)
 }
 async fn manifest(
     State(app): State<App>,
+    caller: Caller,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     Ok(Json(
         app.service
-            .conversion_manifest(token(&app, &headers)?, &id)
+            .conversion_manifest(caller.0.credentials(), &id)
             .await?,
     )
     .into_response())
 }
 async fn markdown(
     State(app): State<App>,
+    caller: Caller,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let permit = download_slot(&app)?;
     let reader = app
         .service
-        .read_artifact(token(&app, &headers)?, &id, "document.md")
+        .read_artifact(caller.0.credentials(), &id, "document.md")
         .await?;
     stream_response(
         reader,
@@ -788,8 +787,8 @@ async fn markdown(
 }
 async fn asset(
     State(app): State<App>,
+    caller: Caller,
     Path((id, name)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let permit = download_slot(&app)?;
     let path = format!("assets/{name}");
@@ -798,17 +797,17 @@ async fn asset(
     }
     let reader = app
         .service
-        .read_artifact(token(&app, &headers)?, &id, &path)
+        .read_artifact(caller.0.credentials(), &id, &path)
         .await?;
     stream_response(reader, "image/png", &name, permit)
 }
 async fn bundle(
     State(app): State<App>,
+    caller: Caller,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let permit = download_slot(&app)?;
-    let bearer = token(&app, &headers)?;
+    let bearer = caller.0.credentials();
     let bundle = app.service.read_bundle(bearer, &id).await?;
     let manifest = bundle.manifest().clone();
     let temp = tempfile::tempdir_in("/tmp").map_err(crate::error::io_error)?;

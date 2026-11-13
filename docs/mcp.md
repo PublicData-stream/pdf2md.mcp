@@ -48,7 +48,13 @@ like any other access token.
 OAuth protected-resource metadata advertises the configured issuer and read
 scope, and is readable from any browser origin (`Access-Control-Allow-Origin:
 *`). Authentication challenges link to that metadata and add
-`error="invalid_token"` when the request carried credentials. Keep the public URL
+`error="invalid_token"` when the request carried credentials. With
+[`[auth.oidc.dpop]`](authentication.md#dpop-bound-access-tokens) the endpoint
+also accepts DPoP-bound access tokens (`Authorization: DPoP` with a `DPoP`
+proof whose `htu` is the public URL of the MCP endpoint), adds a `DPoP`
+challenge, and the metadata lists `dpop_signing_alg_values_supported` and
+`dpop_bound_access_tokens_required`
+([RFC 9728](https://www.rfc-editor.org/rfc/rfc9728.html)). Keep the public URL
 consistent with ingress routing; it is not inferred from Host or forwarded
 headers. Supplied Origin headers must match `allowed_origins`; clients without
 an Origin header can connect. An empty allowlist rejects every supplied origin.

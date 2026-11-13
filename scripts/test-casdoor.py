@@ -33,6 +33,8 @@ ORGANIZATION = "pdf2md"
 WEB_CLIENT = "pdf2md-web"
 SHORT_CLIENT = "pdf2md-short"
 MACHINE_CLIENT = "pdf2md-machine"
+ASSERTION_CLIENT = "pdf2md-assertion"
+ASSERTION_CERT = "pdf2md-assertion-cert"
 # Casdoor ignores the port when matching loopback redirect URIs.
 CALLBACK = "http://127.0.0.1/oauth/callback"
 SCOPE = "pdf2md:read pdf2md:write pdf2md:operate"
@@ -50,6 +52,18 @@ def certificates(root, subject_alt_names="IP:127.0.0.1"):
     run(["openssl", "x509", "-req", "-in", str(root / "tls.csr"), "-CA", str(root / "ca.crt"), "-CAkey", str(root / "ca.key"), "-CAcreateserial", "-days", "1", "-extfile", str(root / "tls.ext"), "-out", str(root / "tls.crt")])
 
 
+def assertion_key(root):
+    """Key pair of the private_key_jwt client. The provider receives the certificate only."""
+    run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=" + ASSERTION_CLIENT,
+         "-keyout", str(root / "assertion.key"), "-out", str(root / "assertion.crt")])
+    (root / "assertion.key").chmod(0o600)
+    return (root / "assertion.crt").read_text()
+
+
+def rsa_modulus(certificate):
+    return int(run(["openssl", "x509", "-noout", "-modulus"], input=certificate.encode()).stdout.decode().strip().split("=")[1], 16)
+
+
 def app_conf(origin, port, state_dir):
     """Casdoor app.conf: HTTPS only, SQLite state, console logs, unprivileged ports."""
     return "\n".join([
@@ -64,8 +78,11 @@ def app_conf(origin, port, state_dir):
     ])
 
 
-def init_data(secret, passwords):
-    """Organization, three registered clients and two synthetic users."""
+def init_data(secret, passwords, assertion_certificate=None):
+    """Organization, registered clients and two synthetic users.
+
+    With assertion_certificate, also a private_key_jwt client and its certificate.
+    """
     scopes = [{"name": name, "displayName": name, "description": "pdf2md " + name.split(":")[1]}
               for name in SCOPE.split()]
     password_signin = {"name": "Password", "displayName": "Password", "rule": "All"}
@@ -80,7 +97,7 @@ def init_data(secret, passwords):
             "enablePassword": True, "enableSignUp": False, "signinMethods": methods,
             "cert": "cert-built-in",
         }
-    return {
+    data = {
         "organizations": [{"owner": "admin", "name": ORGANIZATION, "displayName": ORGANIZATION,
                            "passwordType": "plain", "defaultApplication": WEB_CLIENT}],
         "applications": [
@@ -94,11 +111,24 @@ def init_data(secret, passwords):
                    "signupApplication": WEB_CLIENT, "type": "normal-user", "email": name + "@example.test"}
                   for name, password in passwords.items()],
     }
+    if assertion_certificate:
+        # Casdoor accepts an assertion whose issuer is a registered redirect URI.
+        client = application(ASSERTION_CLIENT, ["client_credentials"], 1, [CALLBACK])
+        client["clientCert"] = ASSERTION_CERT
+        data["applications"].append(client)
+        # Casdoor publishes every x509 certificate in its JWKS and generates a
+        # key pair for a certificate without a private key. Another type and a
+        # placeholder keep the client's key the client's own.
+        data["certs"] = [{"owner": "admin", "name": ASSERTION_CERT, "displayName": ASSERTION_CERT,
+                          "scope": "JWT", "type": "Payment", "cryptoAlgorithm": "RS256", "bitSize": 2048,
+                          "expireInYears": 1, "certificate": assertion_certificate,
+                          "privateKey": "held by the client"}]
+    return data
 
 
-def write_provider_files(root, origin, port, state_dir, secret, passwords):
+def write_provider_files(root, origin, port, state_dir, secret, passwords, assertion_certificate=None):
     (root / "app.conf").write_text(app_conf(origin, port, state_dir))
-    (root / "init_data.json").write_text(json.dumps(init_data(secret, passwords)))
+    (root / "init_data.json").write_text(json.dumps(init_data(secret, passwords, assertion_certificate)))
 
 
 class Client:
@@ -270,7 +300,8 @@ def main():
         certificates(root)
         passwords = {name: secrets.token_urlsafe(24) for name in ["alice", "bob"]}
         client_secret = secrets.token_urlsafe(32)
-        write_provider_files(root, issuer, 8443, "/state", client_secret, passwords)
+        assertion_certificate = assertion_key(root)
+        write_provider_files(root, issuer, 8443, "/state", client_secret, passwords, assertion_certificate)
         for name in ["app.conf", "init_data.json", "tls.crt", "tls.key", "ca.crt"]:
             (root / name).chmod(0o644)
         try:
@@ -283,10 +314,21 @@ def main():
             print("Casdoor ready (selected image); discovery issuer matches=" + str(discovery.get("issuer") == issuer)
                   + "; device endpoint advertised=" + str("device_authorization_endpoint" in discovery)
                   + "; iss response parameter=" + str(discovery.get("authorization_response_iss_parameter_supported")), flush=True)
+            # A JWT validator trusts every key the provider publishes.
+            jwks = control.request(discovery["jwks_uri"])[2] or {}
+            published = [int.from_bytes(base64.urlsafe_b64decode(key["n"] + "=="), "big")
+                         for key in jwks.get("keys", []) if key.get("kty") == "RSA"]
+            if not published or rsa_modulus(assertion_certificate) in published:
+                raise RuntimeError("provider JWKS is empty or lists the client assertion key")
+            print("Provider advertises private_key_jwt=" + str("private_key_jwt" in discovery.get("token_endpoint_auth_methods_supported", []))
+                  + "; DPoP algorithms=" + ",".join(discovery.get("dpop_signing_alg_values_supported", []))
+                  + "; client assertion key absent from JWKS=True", flush=True)
             (root / "client-secret").write_text(client_secret)
             (root / "client-secret").chmod(0o600)
             fixture = {"secret_file": str(root / "client-secret"), "issuer": issuer, "audience": AUDIENCE,
                        "ca_file": str(root / "ca.crt"), "client_id": WEB_CLIENT, "machine_client_id": MACHINE_CLIENT,
+                       "assertion_client_id": ASSERTION_CLIENT, "assertion_key_file": str(root / "assertion.key"),
+                       "assertion_issuer": CALLBACK,
                        "organization": ORGANIZATION, "passwords": passwords}
             for name in ["alice", "bob"]:
                 fixture[name] = Client(issuer, root / "ca.crt").tokens(name, passwords[name], WEB_CLIENT, client_secret, SCOPE)
@@ -316,7 +358,7 @@ def main():
             time.sleep(expiry_wait)
             os.environ["PDF2MD_LIVE_CASDOOR_PHASE"] = "expired"
             subprocess.run(test, check=True, timeout=300)
-            print("Live Casdoor acceptance passed: four grants, both validators, scopes, two-user isolation, revocation, JWT expiry", flush=True)
+            print("Live Casdoor acceptance passed: four grants, both validators, private_key_jwt, DPoP-bound tokens, scopes, two-user isolation, revocation, JWT expiry", flush=True)
         finally:
             cleanup("disposable Casdoor container",
                     lambda: checked_cleanup(docker + ["rm", "--force", container], timeout=30))

@@ -2,7 +2,10 @@
 //!
 //! These types validate access tokens only. Token acquisition for the optional
 //! registered client lives in [`crate::oauth`]; this module never issues tokens.
-use crate::error::{LoadError, Result};
+use crate::{
+    client_auth::{ClientAssertionConfig, ClientAuth},
+    error::{LoadError, Result},
+};
 use futures_util::StreamExt;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use serde::Deserialize;
@@ -118,6 +121,10 @@ pub struct OidcConfig {
     pub jwt_scope_claim: String,
     pub client_id: Option<String>,
     pub client_secret: Option<OidcSecret>,
+    /// `private_key_jwt` signing key for introspection, used instead of
+    /// `client_secret`.
+    #[serde(default)]
+    pub client_assertion: Option<ClientAssertionConfig>,
     #[serde(default = "read_scope")]
     pub read_scope: String,
     #[serde(default = "write_scope")]
@@ -265,13 +272,18 @@ impl AuthConfig {
             return Err(config_error());
         }
         if oidc.validation == TokenValidation::Introspection {
-            if oidc.client_id.as_ref().is_none_or(|value| value.is_empty()) {
+            // Introspection is an authenticated call: exactly one credential.
+            if oidc.client_id.as_ref().is_none_or(|value| value.is_empty())
+                || oidc.client_secret.is_some() == oidc.client_assertion.is_some()
+            {
                 return Err(config_error());
             }
-            oidc.client_secret
-                .as_ref()
-                .ok_or_else(config_error)?
-                .validate()?;
+            if let Some(secret) = &oidc.client_secret {
+                secret.validate()?;
+            }
+            if let Some(assertion) = &oidc.client_assertion {
+                assertion.validate()?;
+            }
         }
         if let Some(client) = &self.client {
             client.validate(oidc)?;
@@ -291,11 +303,13 @@ struct Discovery {
     issuer: String,
     introspection_endpoint: Option<String>,
     jwks_uri: Option<String>,
+    token_endpoint: Option<String>,
 }
 struct Provider {
     config: OidcConfig,
     client: reqwest::Client,
-    secret: Option<String>,
+    /// Introspection client authentication; unused for JWT validation.
+    auth: ClientAuth,
     metadata: Mutex<Option<Metadata>>,
     keys: Mutex<KeyCache>,
 }
@@ -322,20 +336,15 @@ impl Authenticator {
         let provider = if config.mode == AuthMode::Oauth2 {
             let oidc = config.oidc.expect("validated OIDC configuration");
             let client = provider_client(&oidc)?;
-            let secret = if oidc.validation == TokenValidation::Introspection {
-                Some(
-                    oidc.client_secret
-                        .as_ref()
-                        .expect("validated secret")
-                        .resolve()?,
-                )
+            let auth = if oidc.validation == TokenValidation::Introspection {
+                ClientAuth::load(oidc.client_secret.as_ref(), oidc.client_assertion.as_ref())?
             } else {
-                None
+                ClientAuth::Public
             };
             Some(Provider {
                 config: oidc,
                 client,
-                secret,
+                auth,
                 metadata: Mutex::new(None),
                 keys: Mutex::new(KeyCache::default()),
             })
@@ -540,6 +549,7 @@ impl Provider {
             issuer: discovery.issuer.clone(),
             introspection_endpoint: discovery.introspection_endpoint.clone(),
             jwks_uri: discovery.jwks_uri.clone(),
+            token_endpoint: discovery.token_endpoint.clone(),
         })
     }
     fn validate_claims(&self, claims: &Claims, require_issuer: bool) -> Result<()> {
@@ -597,23 +607,32 @@ impl Provider {
             None
         };
         let discovery = self.discovery().await?;
+        let request = self.client.post(
+            self.endpoint(
+                discovery
+                    .introspection_endpoint
+                    .as_deref()
+                    .ok_or_else(unavailable)?,
+            )?,
+        );
+        let mut form = vec![
+            ("token", token.to_owned()),
+            ("token_type_hint", "access_token".to_owned()),
+        ];
+        // A signed assertion names the token endpoint as its audience.
+        let token_endpoint = match &self.auth {
+            ClientAuth::Assertion(_) => discovery.token_endpoint.ok_or_else(unavailable)?,
+            _ => String::new(),
+        };
         let response = self
-            .client
-            .post(
-                self.endpoint(
-                    discovery
-                        .introspection_endpoint
-                        .as_deref()
-                        .ok_or_else(unavailable)?,
-                )?,
-            )
-            .basic_auth(
-                oauth_basic_component(self.config.client_id.as_ref().expect("validated client")),
-                Some(oauth_basic_component(
-                    self.secret.as_ref().expect("validated secret"),
-                )),
-            )
-            .form(&[("token", token), ("token_type_hint", "access_token")])
+            .auth
+            .apply(
+                request,
+                &mut form,
+                self.config.client_id.as_ref().expect("validated client"),
+                &token_endpoint,
+            )?
+            .form(&form)
             .send()
             .await
             .map_err(|_| unavailable())?;

@@ -75,6 +75,7 @@ impl Fixture {
                     env: None,
                     file: Some(secret),
                 }),
+                client_assertion: None,
                 read_scope: "pdf2md:read".into(),
                 write_scope: "pdf2md:write".into(),
                 operate_scope: "pdf2md:operate".into(),
@@ -1094,35 +1095,7 @@ async fn oauth_and_both_anonymous_modes_preserve_and_hide_each_others_data() {
 }
 
 // Deliberately public, generated synthetic RSA key, used only for token fixtures.
-const TEST_KEY: &str = r"-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCR+oBfnzNj2oZO
-pGvuxJ+GKVs4eg9pJUK9h0ARTPbHKc/fdg09DOskxOHkDh2c97Ifk0Q0PFOxObRq
-aRc23tKgEvijPvQ3QB5vcQSXXYtpVX5PpGyDuA391patQynkWopixfjE+VlxRh8d
-XQCVVBhjvoYERvgwz8umSY3DG/0NVS0/F/RaZqGYGTipqSwrnbUXqLswbhh2OOGe
-BWPQeGPszZk462flyn10ZhRnSNMjP3lWb7+DO2WHQtLR/gjzIqQQGHDi44XwZBe0
-+MN0tkEbKLYOvz668LDKB877dE/EdtSBsPpcNLxh4urTaGvngH5YZIKxMm0LiXGf
-SwVDKCiXAgMBAAECggEARIY+tKRaz0jJOylbsR2DdMr9EynZChZ/mdBfdr+WKC+s
-cM1NsZba2svA7fjiVcjASKosngijkNHxqvHh/9PhM1s0dA0dPsJOhymaaiNzSeLk
-BCa++aXwi3OsD3EzvQnzZCJigLQ8FDxCZto9Z9uuB0RsTJ2z69XfVxO4BBqjUxov
-FG0FRMwwjxhrZQyG6arRGvnG+5mHocL3J+7LRpH/38tFoVEJmIzpenDRigPGvBCc
-cvpOScFN1gxlcREgECu7VkenDusW3jk8gCYkbSqpvdxtwSF46Xu+J3xRHHv+JqCD
-qPuPXIsKCwUDDj3tEiuoeX6e7aZwh0FwtUJepNuMgQKBgQDJ/i4LNU+0kD5TQjfw
-NqFfb36ZbTuqWFBCt9SqlpI6ih3MAxII0KpNPDL4mVqrvEdyPx5fCVbPFWcbekUk
-Y2m1iehqkHjAM8thdlraBpTPh0ZuoO/u3yXJtra0AbvpuUlSho74c4aKp6nvw6Q4
-bkDqNzfpQI5FK7+lbzv8FfcAkQKBgQC5Ak10OwM+J15SCUcgz5dsNavUba6PCtB7
-IFL7J1ktMsu3Z0GQiCPdvjjM9dy0vATnrD+O+ceh7wbs2pSAj324fBxGcSe4YNO8
-7GmdguiRS2col+wv2LEK7jdN1ExMU0kdpUMoOEeenvgwhknZRMi6EM4hk3rdCK4S
-Kj3NkX8qpwKBgAwIWDXStyzKauwKxcpJdtN4kNIS77r2B9HxoXmH/q3+DEha5ngf
-9gUj0OV+PSh9zsO/fs+qfsFXRQ0d+4Bva5yk2nN+p7LLYxIrOr5CJhs2s7tjWuef
-42BgwgF3GPqTTwrbeSjTuPAJjNX7kYzLBJLvNyVt8wurz37LYYdix5QBAoGBALUB
-irP39KE/tSlACIYSdEybaiTotosegoCkTGuKwNXWx7cFYAE/IRAWxs3IkgmFlqrv
-PDPvLyDAkh7zb60kNlVjn+pPVRQwL5i8GEzRwiY9Bo2RrbPWJsjR7evIlGlsZrGJ
-ed4EyhVn5Nzc1a2rfVOFk5cICoHstxnwmAzil+8rAoGBAKo2yueiGRlCWFvia0Ut
-5MBcj0/d1dfPxte/YEnhE0nn+DjnLht+wRKUM/5Mb2lqJnfLid91Xv1/tes+M+Ub
-DVepBUkjbzT6wZT3N6HFYuA1vBw8FvsefEI3hJzKx705zeNXOYgdKOSgHc+CMHI+
-rom0AYO7AXhfR2+90ihrHdD7
------END PRIVATE KEY-----
-";
+const TEST_KEY: &str = include_str!("common/synthetic-rsa-key.pem");
 const TEST_MODULUS: &str = "kfqAX58zY9qGTqRr7sSfhilbOHoPaSVCvYdAEUz2xynP33YNPQzrJMTh5A4dnPeyH5NENDxTsTm0amkXNt7SoBL4oz70N0Aeb3EEl12LaVV-T6Rsg7gN_daWrUMp5FqKYsX4xPlZcUYfHV0AlVQYY76GBEb4MM_LpkmNwxv9DVUtPxf0WmahmBk4qaksK521F6i7MG4YdjjhngVj0Hhj7M2ZOOtn5cp9dGYUZ0jTIz95Vm-_gztlh0LS0f4I8yKkEBhw4uOF8GQXtPjDdLZBGyi2Dr8-uvCwygfO-3RPxHbUgbD6XDS8YeLq02hr54B-WGSCsTJtC4lxn0sFQygolw";
 
 #[tokio::test]

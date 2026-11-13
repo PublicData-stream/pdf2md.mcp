@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod browser;
+pub mod client_auth;
 pub mod config;
 pub mod conversion;
 pub mod direct;

@@ -20,8 +20,8 @@ fn auth_config(fixture: &Value, validation: &str, client: Option<Value>) -> Auth
         "oidc": {
             "issuer": fixture["issuer"], "audience": fixture["audience"],
             "validation": validation, "token_profile": "casdoor",
-            // Casdoor binds Implicit and Client Credentials tokens to the client ID.
-            "additional_audiences": [fixture["client_id"], fixture["machine_client_id"]],
+            // Casdoor binds Client Credentials tokens to the client ID.
+            "additional_audiences": [fixture["machine_client_id"]],
             "client_id": fixture["client_id"],
             "client_secret": {"file": fixture["secret_file"]},
             "ca_file": fixture["ca_file"]
@@ -558,11 +558,8 @@ async fn casdoor_sign_in(fixture: &Value, location: &str, user: &str) -> String 
             .as_str()
             .starts_with(fixture["issuer"].as_str().unwrap())
     );
-    let kind = if query["response_type"] == "code" {
-        "code"
-    } else {
-        "token"
-    };
+    assert_eq!(query["response_type"], "code");
+    let kind = "code";
     let mut params = vec![
         ("clientId", query["client_id"].clone()),
         ("responseType", query["response_type"].clone()),
@@ -641,7 +638,7 @@ async fn real_casdoor_grants_through_the_registered_client() {
     let base = format!("http://{}", listener.local_addr().unwrap());
     let client = serde_json::json!({
         "client_id": fixture["client_id"], "client_secret": {"file": fixture["secret_file"]},
-        "grant_types": ["authorization_code", "implicit", "device_code", "refresh_token"],
+        "grant_types": ["authorization_code", "device_code", "refresh_token"],
         "scopes": ["pdf2md:read", "pdf2md:write"], "redirect_base_url": base,
     });
     let service = std::sync::Arc::new(
@@ -715,23 +712,15 @@ async fn real_casdoor_grants_through_the_registered_client() {
     assert_eq!(history(code_access.clone()).await, StatusCode::OK);
     assert_eq!(subject(&fixture, &code_access).await, alice);
 
-    // Implicit: Casdoor binds the token to the client ID, an additional audience.
-    let login = api
-        .get(format!("{base}/oauth/login?grant=implicit"))
-        .send()
-        .await
-        .unwrap();
-    let location = login.headers()["location"].to_str().unwrap().to_owned();
-    assert!(location.contains("response_type=token"));
-    let implicit = casdoor_sign_in(&fixture, &location, "alice").await;
-    assert_eq!(history(implicit.clone()).await, StatusCode::OK);
-    assert_eq!(subject(&fixture, &implicit).await, alice);
-    let page = api
-        .get(format!("{base}/oauth/implicit"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(page.status(), StatusCode::OK);
+    // The Implicit grant is not offered.
+    assert_eq!(
+        api.get(format!("{base}/oauth/implicit"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
 
     // Device and refresh grants are not brokered over HTTP: the registered
     // client's credentials are not applied to a caller-supplied grant.
@@ -800,13 +789,10 @@ async fn real_casdoor_grants_through_the_registered_client() {
 
     // Refresh Token through the trusted client. Casdoor rotates refresh
     // tokens by default.
-    let request = registered
-        .authorization_request(pdf2md_mcp::oauth::GrantType::AuthorizationCode)
-        .await
-        .unwrap();
+    let request = registered.authorization_request().await.unwrap();
     let code = casdoor_sign_in(&fixture, request.url.as_str(), "alice").await;
     let code_refresh = registered
-        .exchange_code(&code, request.code_verifier.as_deref().unwrap())
+        .exchange_code(&code, &request.code_verifier)
         .await
         .unwrap()
         .refresh_token

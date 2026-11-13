@@ -5,8 +5,8 @@ access tokens in OAuth2 mode. It is an OAuth resource server: the identity
 provider issues, refreshes and revokes tokens, clients store them, and this
 service only validates the access token on each request. It never issues,
 stores or refreshes tokens for HTTP callers. An optional registered OAuth
-client supports every OAuth 2.0 grant except Resource Owner Password
-Credentials for browser sign-in and the trusted CLI; see
+client supports the Authorization Code, Device Authorization, Refresh Token
+and Client Credentials grants for browser sign-in and the trusted CLI; see
 [Obtaining access tokens](#obtaining-access-tokens). The local CLI and
 low-level storage APIs remain trusted operator interfaces. See
 [the HTTP API](http-api.md) for routes and job behavior.
@@ -117,19 +117,19 @@ Access tokens must name `audience` in `aud`. Register it as the
 [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707.html) resource of user-facing
 clients; Casdoor then issues Authorization Code, Device Authorization and
 Refresh Token grants for that resource. Casdoor 4.27.1 ignores the resource
-indicator for the Implicit and Client Credentials grants and sets `aud` to the
-requesting client ID. To accept those tokens, list dedicated client IDs in
+indicator for the Client Credentials grant and sets `aud` to the requesting
+client ID. To accept those tokens, list dedicated client IDs in
 `additional_audiences` (at most 16):
 
 ```toml
-additional_audiences = ["pdf2md-web", "pdf2md-machine"]
+additional_audiences = ["pdf2md-machine"]
 ```
 
 Only list clients registered exclusively for this service: any access token
 issued to them is accepted, whichever resource it was requested for. Prefer
 grants that the provider binds to the resource, and leave the list empty when
-you do not use Implicit or Client Credentials. ID tokens remain rejected by
-the token profile.
+you do not use Client Credentials. ID tokens remain rejected by the token
+profile.
 
 When the MCP endpoint is enabled, its `resource_url` must equal `audience` or
 appear in `additional_audiences`; configuration is rejected otherwise. MCP
@@ -176,24 +176,26 @@ the trusted CLI. It supports these grants:
 | `grant_types` value | Grant | Where |
 | --- | --- | --- |
 | `authorization_code` | Authorization Code with PKCE S256 ([RFC 6749 section 4.1](https://www.rfc-editor.org/rfc/rfc6749#section-4.1), [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636)) | Browser: `GET /oauth/login`, then `GET /oauth/callback` |
-| `implicit` | Implicit ([RFC 6749 section 4.2](https://www.rfc-editor.org/rfc/rfc6749#section-4.2)) | Browser: `GET /oauth/login?grant=implicit`, then `GET /oauth/implicit` |
 | `device_code` | Device Authorization ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) | `pdf2md-mcp oauth device` only |
 | `refresh_token` | Refresh Token ([RFC 6749 section 6](https://www.rfc-editor.org/rfc/rfc6749#section-6)) | `pdf2md-mcp oauth refresh` only |
 | `client_credentials` | Client Credentials ([RFC 6749 section 4.4](https://www.rfc-editor.org/rfc/rfc6749#section-4.4)) | `pdf2md-mcp oauth client-credentials` only |
 
-Only the browser grants have HTTP routes. The HTTP service never redeems a
+Only Authorization Code has HTTP routes. The HTTP service never redeems a
 device code or refresh token supplied by a caller, and never returns a refresh
 token: doing so would apply the registered client's credentials to grants
 held by anonymous callers. Those grants run from the CLI, where the operator
 holds the client configuration, or between a caller's own client and the
 provider.
 
-The Resource Owner Password Credentials grant is not supported: the service
-never receives user passwords, and configuration rejects `password`.
-Authorization Code with PKCE is the recommended browser grant. The Implicit
-grant is deprecated by the
-[OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700#section-2.1.2)
-and omitted from OAuth 2.1; enable it only for compatibility.
+Two OAuth 2.0 grants are not supported, and configuration rejects their
+`grant_types` values:
+
+- Resource Owner Password Credentials (`password`): the service never receives
+  user passwords.
+- Implicit (`implicit`): it returns the access token in the redirect URL, is
+  deprecated by the
+  [OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700#section-2.1.2)
+  and is omitted from OAuth 2.1. Use Authorization Code with PKCE instead.
 
 ```toml
 [auth.client]
@@ -208,20 +210,18 @@ redirect_base_url = "https://pdf.example.com"
 trust anchors and endpoint-origin rules. Omit `client_secret` for a public
 client, which then sends `client_id` in each request; Client Credentials
 requires a secret. The secret is sent with `client_secret_basic`. Every request
-carries `resource`, which defaults to `[auth.oidc] audience`. Browser grants
-require `redirect_base_url`, the public HTTPS origin of this service
+carries `resource`, which defaults to `[auth.oidc] audience`. Authorization
+Code requires `redirect_base_url`, the public HTTPS origin of this service
 (loopback HTTP is allowed for development). Register
-`<redirect_base_url>/oauth/callback` and `<redirect_base_url>/oauth/implicit`
-as the client's redirect URIs. Use a provider application separate from the
+`<redirect_base_url>/oauth/callback` as the client's redirect URI. Use a provider application separate from the
 one used for introspection, so that sign-in and token validation can be
 revoked and rotated independently. Routes for disabled grants are not
 registered.
 
-Browser grants:
+Browser sign-in:
 
-- `/oauth/login` redirects to the provider with a random `state`. Authorization
-  Code adds an S256 PKCE challenge; the verifier stays in server memory for ten
-  minutes. At most 8,192 sign-ins are pending at once; a newer sign-in replaces
+- `/oauth/login` redirects to the provider with a random `state` and an S256
+  PKCE challenge; the verifier stays in server memory for ten minutes. At most 8,192 sign-ins are pending at once; a newer sign-in replaces
   the oldest one when the table is full. The `state` is also bound to the
   browser with an `HttpOnly`, `SameSite=Lax` cookie, `Secure` for HTTPS.
 - `/oauth/callback` requires the matching cookie and single-use `state`, then
@@ -230,15 +230,11 @@ Browser grants:
   The code is redeemed with its verifier, and a result page shows the access
   token. ID tokens and refresh tokens are never displayed; sign in again when
   the access token expires.
-- `/oauth/implicit` reads the token from the URL fragment in the browser, so
-  the server never receives it. The page script checks `state` against a
-  script-readable cookie and `iss` against the configured issuer, then removes
-  the fragment from the address bar.
 
 Pages share a dark-only stylesheet (`/oauth/oauth.css`) in the GitHub Dark
 color range and a copy-button script (`/oauth/page.js`), with no inline scripts
-or styles. The result pages
-show the token type, lifetime and granted scopes next to the access token. Browser
+or styles. The result page
+shows the token type, lifetime and granted scopes next to the access token. Browser
 navigations that send `Accept: text/html` receive an HTML error page from
 `/oauth/login` and `/oauth/callback` with the same status, error code and
 request ID as the JSON error; other clients keep the JSON body. Provider error
@@ -359,8 +355,8 @@ Registered-client grants run against a synthetic TLS provider in
 `tests/oauth_client.rs` as part of the core suite.
 
 Live Casdoor checks use a disposable provider with two synthetic users and
-registered test clients. They exercise all five supported grants through the
-registered client (browser grants over HTTP, the others through the library
+registered test clients. They exercise all four supported grants through the
+registered client (Authorization Code over HTTP, the others through the library
 client), both validators, permissions, isolation, revocation,
 expiry, and durable job recovery against the library and HTTP boundaries.
 These checks alone do not establish MCP client or Kubernetes deployment

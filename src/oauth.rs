@@ -4,16 +4,17 @@
 //! access token independently of how it was obtained, and the provider alone
 //! issues, refreshes and revokes tokens. This optional client drives the
 //! provider's grants: Authorization Code with PKCE (RFC 6749 section 4.1,
-//! RFC 7636), Implicit (section 4.2), Client Credentials (section 4.4), Device
-//! Authorization (RFC 8628), and Refresh Token (section 6). The Resource Owner
-//! Password Credentials grant is intentionally unsupported: the service never
-//! handles user passwords.
+//! RFC 7636), Client Credentials (section 4.4), Device Authorization
+//! (RFC 8628), and Refresh Token (section 6). Two grants are intentionally
+//! unsupported: Resource Owner Password Credentials, because the service
+//! never handles user passwords, and Implicit, which returns the access token
+//! in the redirect URL and is omitted from OAuth 2.1.
 //!
-//! The HTTP service uses only the interactive browser grants. Grants that
-//! redeem a credential with the registered client's own authentication
-//! (device code, refresh token, client credentials) are available to the
-//! trusted CLI and library callers only, so the client's credentials are
-//! never lent to anonymous HTTP callers.
+//! The HTTP service uses only the interactive Authorization Code grant.
+//! Grants that redeem a credential with the registered client's own
+//! authentication (device code, refresh token, client credentials) are
+//! available to the trusted CLI and library callers only, so the client's
+//! credentials are never lent to anonymous HTTP callers.
 use crate::{
     auth::{
         AuthConfig, AuthMode, MAX_RESPONSE, MAX_TOKEN, OidcConfig, OidcSecret, config_error,
@@ -36,17 +37,14 @@ const METADATA_TTL: Duration = Duration::from_secs(300);
 const MAX_SCOPES: usize = 32;
 /// Path of the Authorization Code redirect endpoint below `redirect_base_url`.
 pub const CODE_CALLBACK_PATH: &str = "/oauth/callback";
-/// Path of the Implicit redirect page below `redirect_base_url`.
-pub const IMPLICIT_CALLBACK_PATH: &str = "/oauth/implicit";
 const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// Grants this client can drive. ROPC (`password`) is deliberately absent and
-/// is rejected as an unknown configuration value.
+/// Grants this client can drive. ROPC (`password`) and Implicit (`implicit`)
+/// are deliberately absent and are rejected as unknown configuration values.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantType {
     AuthorizationCode,
-    Implicit,
     ClientCredentials,
     DeviceCode,
     RefreshToken,
@@ -60,7 +58,7 @@ pub struct OAuthClientConfig {
     pub client_secret: Option<OidcSecret>,
     pub grant_types: Vec<GrantType>,
     pub scopes: Vec<String>,
-    /// Public origin of this service; required for browser grants.
+    /// Public origin of this service; required for `authorization_code`.
     pub redirect_base_url: Option<String>,
     /// RFC 8707 resource indicator. Defaults to `[auth.oidc] audience`.
     pub resource: Option<String>,
@@ -110,8 +108,7 @@ impl OAuthClientConfig {
         if let Some(secret) = &self.client_secret {
             secret.validate()?;
         }
-        let browser = self.grant_types.contains(&GrantType::AuthorizationCode)
-            || self.grant_types.contains(&GrantType::Implicit);
+        let browser = self.grant_types.contains(&GrantType::AuthorizationCode);
         match &self.redirect_base_url {
             Some(value) => {
                 redirect_base(value)?;
@@ -180,7 +177,7 @@ impl fmt::Debug for DeviceAuthorization {
 pub struct AuthorizationRequest {
     pub url: Url,
     pub state: String,
-    pub code_verifier: Option<String>,
+    pub code_verifier: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -307,18 +304,17 @@ impl OAuthClient {
             .as_deref()
             .is_some_and(|value| value.starts_with("https:"))
     }
-    pub fn redirect_uri(&self, grant: GrantType) -> Result<String> {
+    /// Authorization Code redirect URI below `redirect_base_url`.
+    pub fn redirect_uri(&self) -> Result<String> {
         let base = self
             .config
             .redirect_base_url
             .as_deref()
             .ok_or_else(config_error)?;
-        let path = match grant {
-            GrantType::AuthorizationCode => CODE_CALLBACK_PATH,
-            GrantType::Implicit => IMPLICIT_CALLBACK_PATH,
-            _ => return Err(config_error()),
-        };
-        Ok(format!("{}{path}", base.trim_end_matches('/')))
+        Ok(format!(
+            "{}{CODE_CALLBACK_PATH}",
+            base.trim_end_matches('/')
+        ))
     }
 
     fn require(&self, grant: GrantType) -> Result<()> {
@@ -359,37 +355,24 @@ impl OAuthClient {
         provider_endpoint(&self.oidc, value.ok_or_else(unavailable)?)
     }
 
-    /// Build an Authorization Code (with PKCE S256) or Implicit request.
-    pub async fn authorization_request(&self, grant: GrantType) -> Result<AuthorizationRequest> {
-        self.require(grant)?;
+    /// Build an Authorization Code request with a PKCE S256 challenge.
+    pub async fn authorization_request(&self) -> Result<AuthorizationRequest> {
+        self.require(GrantType::AuthorizationCode)?;
         let metadata = self.metadata().await?;
         let mut url = self.endpoint(metadata.authorization_endpoint.as_deref())?;
         let state = random_token();
-        let redirect_uri = self.redirect_uri(grant)?;
+        let redirect_uri = self.redirect_uri()?;
         let scope = self.scope();
-        let code_verifier = (grant == GrantType::AuthorizationCode).then(random_token);
-        {
-            let mut query = url.query_pairs_mut();
-            query
-                .append_pair("client_id", &self.config.client_id)
-                .append_pair("redirect_uri", &redirect_uri)
-                .append_pair(
-                    "response_type",
-                    if code_verifier.is_some() {
-                        "code"
-                    } else {
-                        "token"
-                    },
-                )
-                .append_pair("scope", &scope)
-                .append_pair("state", &state)
-                .append_pair("resource", self.resource());
-            if let Some(verifier) = &code_verifier {
-                query
-                    .append_pair("code_challenge", &code_challenge(verifier))
-                    .append_pair("code_challenge_method", "S256");
-            }
-        }
+        let code_verifier = random_token();
+        url.query_pairs_mut()
+            .append_pair("client_id", &self.config.client_id)
+            .append_pair("redirect_uri", &redirect_uri)
+            .append_pair("response_type", "code")
+            .append_pair("scope", &scope)
+            .append_pair("state", &state)
+            .append_pair("resource", self.resource())
+            .append_pair("code_challenge", &code_challenge(&code_verifier))
+            .append_pair("code_challenge_method", "S256");
         Ok(AuthorizationRequest {
             url,
             state,
@@ -457,10 +440,7 @@ impl OAuthClient {
         self.token_request(vec![
             ("grant_type", "authorization_code".into()),
             ("code", code.into()),
-            (
-                "redirect_uri",
-                self.redirect_uri(GrantType::AuthorizationCode)?,
-            ),
+            ("redirect_uri", self.redirect_uri()?),
             ("code_verifier", code_verifier.into()),
             ("resource", self.resource().into()),
         ])

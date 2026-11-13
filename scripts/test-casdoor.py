@@ -35,7 +35,6 @@ SHORT_CLIENT = "pdf2md-short"
 MACHINE_CLIENT = "pdf2md-machine"
 # Casdoor ignores the port when matching loopback redirect URIs.
 CALLBACK = "http://127.0.0.1/oauth/callback"
-IMPLICIT = "http://127.0.0.1/oauth/implicit"
 SCOPE = "pdf2md:read pdf2md:write pdf2md:operate"
 DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 
@@ -85,8 +84,8 @@ def init_data(secret, passwords):
         "organizations": [{"owner": "admin", "name": ORGANIZATION, "displayName": ORGANIZATION,
                            "passwordType": "plain", "defaultApplication": WEB_CLIENT}],
         "applications": [
-            application(WEB_CLIENT, ["authorization_code", "implicit", "token", "refresh_token", DEVICE_GRANT],
-                        1, [CALLBACK, IMPLICIT], device=True),
+            application(WEB_CLIENT, ["authorization_code", "refresh_token", DEVICE_GRANT],
+                        1, [CALLBACK], device=True),
             # 0.02 hours: a 72-second access-token lifetime for the expiry phase.
             application(SHORT_CLIENT, ["authorization_code"], 0.02, [CALLBACK]),
             application(MACHINE_CLIENT, ["client_credentials"], 1),
@@ -317,7 +316,7 @@ def main():
             time.sleep(expiry_wait)
             os.environ["PDF2MD_LIVE_CASDOOR_PHASE"] = "expired"
             subprocess.run(test, check=True, timeout=300)
-            print("Live Casdoor acceptance passed: five grants, both validators, scopes, two-user isolation, revocation, JWT expiry", flush=True)
+            print("Live Casdoor acceptance passed: four grants, both validators, scopes, two-user isolation, revocation, JWT expiry", flush=True)
         finally:
             cleanup("disposable Casdoor container",
                     lambda: checked_cleanup(docker + ["rm", "--force", container], timeout=30))

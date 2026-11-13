@@ -97,8 +97,8 @@ The container HTTP smoke test is `python3 scripts/test-http.py IMAGE`; add
 harness is `python3 scripts/test-http-oidc.py IMAGE`. See the script prerequisites.
 
 The bundled API console and OAuth sign-in page use browser JavaScript, HTML,
-and CSS with two-space indentation and LF endings (`.editorconfig`). Their
-JavaScript lint rules are in `eslint.config.mjs`. Run the pinned development lint without installing runtime
+and CSS with two-space indentation and LF endings (`.editorconfig`). The API
+console's JavaScript lint rules are in `eslint.config.mjs`. Run the pinned development lint without installing runtime
 Node dependencies into the repository:
 
 ```sh

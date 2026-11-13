@@ -34,7 +34,7 @@ response fields. Main routes are:
 | `POST /v1/jobs/{id}/cancel`, `/retry` | Cancel or retry a job. |
 | `GET /v1/sources`, `POST /v1/sources/{id}/fetch` | List or fetch operator-published sources. |
 | `GET /v1/schedules`, `PUT /v1/schedules/{source_id}` | Inspect or enable/disable schedules for published sources. |
-| `GET /oauth/login`, `/oauth/callback`, `/oauth/implicit` | Optional browser sign-in (Authorization Code with PKCE, or Implicit) when `[auth.client]` enables it. |
+| `GET /oauth/login`, `/oauth/callback` | Optional browser sign-in (Authorization Code with PKCE) when `[auth.client]` enables it. |
 
 List responses contain `items` and `next_cursor`; the default page size is 100
 and the maximum is 1,000. Uploads return HTTP 201 with `observation` and

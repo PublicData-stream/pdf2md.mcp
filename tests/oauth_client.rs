@@ -272,8 +272,8 @@ impl Api {
             .unwrap()
     }
     /// Start a browser login; return the authorization URL parameters and cookie.
-    async fn login(&self, grant: &str) -> (HashMap<String, String>, String) {
-        let response = self.get(&format!("/oauth/login?grant={grant}"), None).await;
+    async fn login(&self) -> (HashMap<String, String>, String) {
+        let response = self.get("/oauth/login", None).await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let location = url::Url::parse(response.headers()["location"].to_str().unwrap()).unwrap();
         let cookie = response.headers()["set-cookie"]
@@ -298,7 +298,7 @@ async fn code(response: reqwest::Response) -> (StatusCode, String) {
 async fn authorization_code_login_binds_state_pkce_issuer_and_browser_cookie() {
     let provider = Provider::start().await;
     let api = Api::start(&provider, &[GrantType::AuthorizationCode]).await;
-    let (query, set_cookie) = api.login("authorization_code").await;
+    let (query, set_cookie) = api.login().await;
     assert_eq!(query["response_type"], "code");
     // RFC 6749 section 3.1: the endpoint query component is retained.
     assert_eq!(query["tenant"], "pdf2md");
@@ -333,7 +333,7 @@ async fn authorization_code_login_binds_state_pkce_issuer_and_browser_cookie() {
         code(api.get(&missing_iss, Some(&cookie)).await).await.1,
         "oauth_issuer_mismatch"
     );
-    let (query, set_cookie) = api.login("authorization_code").await;
+    let (query, set_cookie) = api.login().await;
     let state = &query["state"];
     let cookie = cookie_pair(&set_cookie);
     let wrong_iss = format!("/oauth/callback?code=abc&state={state}&iss=https://evil.example");
@@ -343,7 +343,7 @@ async fn authorization_code_login_binds_state_pkce_issuer_and_browser_cookie() {
     );
     assert!(provider.requests.lock().unwrap().is_empty());
 
-    let (query, set_cookie) = api.login("authorization_code").await;
+    let (query, set_cookie) = api.login().await;
     let state = &query["state"];
     let cookie = cookie_pair(&set_cookie);
     let callback = format!(
@@ -395,7 +395,7 @@ async fn authorization_code_login_binds_state_pkce_issuer_and_browser_cookie() {
 async fn provider_errors_on_callback_and_token_exchange_are_fixed_public_codes() {
     let provider = Provider::start().await;
     let api = Api::start(&provider, &[GrantType::AuthorizationCode]).await;
-    let (query, set_cookie) = api.login("authorization_code").await;
+    let (query, set_cookie) = api.login().await;
     let denied = format!(
         "/oauth/callback?error=access_denied&error_description=secret+detail&state={}&iss={}",
         query["state"], provider.issuer
@@ -408,7 +408,7 @@ async fn provider_errors_on_callback_and_token_exchange_are_fixed_public_codes()
         400,
         json!({"error":"invalid_grant","error_description":"private"}),
     ));
-    let (query, set_cookie) = api.login("authorization_code").await;
+    let (query, set_cookie) = api.login().await;
     let callback = format!(
         "/oauth/callback?code=used&state={}&iss={}",
         query["state"], provider.issuer
@@ -421,46 +421,26 @@ async fn provider_errors_on_callback_and_token_exchange_are_fixed_public_codes()
 }
 
 #[tokio::test]
-async fn implicit_login_uses_a_script_readable_state_cookie_and_issuer_page() {
+async fn implicit_grant_is_not_offered() {
     let provider = Provider::start().await;
-    let api = Api::start(&provider, &[GrantType::Implicit]).await;
-    let (query, set_cookie) = api.login("implicit").await;
-    assert_eq!(query["response_type"], "token");
-    assert_eq!(
-        query["redirect_uri"],
-        format!("{}/oauth/implicit", api.base)
-    );
-    assert!(!query.contains_key("code_challenge"));
-    assert!(set_cookie.starts_with(&format!("pdf2md_implicit_state={}", query["state"])));
-    assert!(set_cookie.contains("Path=/oauth/implicit") && !set_cookie.contains("HttpOnly"));
-    let page = api.get("/oauth/implicit", None).await;
-    assert!(
-        page.headers()["content-security-policy"]
-            .to_str()
-            .unwrap()
-            .contains("script-src 'self'")
-    );
-    let page = page.text().await.unwrap();
-    assert!(page.contains(&format!("content=\"{}\"", provider.issuer)));
-    assert!(page.contains("name=\"pdf2md-require-iss\" content=\"true\""));
-    assert!(page.contains("src=\"/oauth/implicit.js\""));
-    let script = api.get("/oauth/implicit.js", None).await;
-    assert!(script.text().await.unwrap().contains("replaceState"));
-    // Disabled grants expose no route.
-    assert_eq!(
-        api.get("/oauth/callback", None).await.status(),
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        api.post("/oauth/token", json!({})).await.status(),
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        code(api.get("/oauth/login?grant=authorization_code", None).await)
-            .await
-            .1,
-        "oauth_grant_disabled"
-    );
+    let api = Api::start(&provider, &[GrantType::AuthorizationCode]).await;
+    // The login route always starts Authorization Code with PKCE, whatever
+    // the query asks for.
+    let response = api.get("/oauth/login?grant=implicit", None).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = url::Url::parse(response.headers()["location"].to_str().unwrap()).unwrap();
+    let query: HashMap<String, String> = location.query_pairs().into_owned().collect();
+    assert_eq!(query["response_type"], "code");
+    assert_eq!(query["code_challenge_method"], "S256");
+    for path in ["/oauth/implicit", "/oauth/implicit.js"] {
+        assert_eq!(api.get(path, None).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    // Without the Authorization Code grant there are no browser routes.
+    let api = Api::start(&provider, &[GrantType::DeviceCode]).await;
+    for path in ["/oauth/login", "/oauth/callback", "/oauth/oauth.css"] {
+        assert_eq!(api.get(path, None).await.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[tokio::test]
@@ -598,7 +578,7 @@ async fn public_clients_send_client_id_without_basic_authentication() {
 }
 
 #[test]
-fn client_configuration_rejects_password_grant_and_incomplete_flows() {
+fn client_configuration_rejects_password_and_implicit_grants_and_incomplete_flows() {
     let base = r#"
 [auth]
 mode = "oauth2"
@@ -618,6 +598,10 @@ scopes = ["pdf2md:read"]
     };
     assert!(parse("grant_types = [\"device_code\", \"refresh_token\"]\n").is_ok());
     assert!(parse("grant_types = [\"password\"]\n").is_err());
+    assert!(
+        parse("grant_types = [\"implicit\"]\nredirect_base_url = \"https://pdf.example\"\n")
+            .is_err()
+    );
     assert!(parse("grant_types = []\n").is_err());
     assert!(parse("grant_types = [\"device_code\", \"device_code\"]\n").is_err());
     // Client Credentials requires a confidential client.
@@ -626,15 +610,19 @@ scopes = ["pdf2md:read"]
         parse("grant_types = [\"client_credentials\"]\nclient_secret = { env = \"PDF2MD_TEST_SECRET\" }\n")
             .is_ok()
     );
-    // Browser grants need the public service origin for redirect URIs.
+    // Authorization Code needs the public service origin for its redirect URI.
     assert!(parse("grant_types = [\"authorization_code\"]\n").is_err());
     assert!(
-        parse("grant_types = [\"implicit\"]\nredirect_base_url = \"https://pdf.example\"\n")
-            .is_ok()
+        parse(
+            "grant_types = [\"authorization_code\"]\nredirect_base_url = \"https://pdf.example\"\n"
+        )
+        .is_ok()
     );
     assert!(
-        parse("grant_types = [\"implicit\"]\nredirect_base_url = \"http://pdf.example\"\n")
-            .is_err()
+        parse(
+            "grant_types = [\"authorization_code\"]\nredirect_base_url = \"http://pdf.example\"\n"
+        )
+        .is_err()
     );
     // RFC 8707 resources may be any absolute URI without a fragment.
     assert!(parse("grant_types = [\"device_code\"]\nresource = \"urn:pdf2md:api\"\n").is_ok());
@@ -693,7 +681,7 @@ async fn browser_navigation_errors_render_html_pages_while_api_errors_stay_json(
     assert!(page.contains("href=\"/oauth/login\""));
 
     // Provider error descriptions stay hidden on the HTML page too.
-    let (query, set_cookie) = api.login("authorization_code").await;
+    let (query, set_cookie) = api.login().await;
     let denied = format!(
         "/oauth/callback?error=access_denied&error_description=secret+detail&state={}&iss={}",
         query["state"], provider.issuer
@@ -706,14 +694,6 @@ async fn browser_navigation_errors_render_html_pages_while_api_errors_stay_json(
         .unwrap();
     assert!(page.contains("Access denied") && page.contains("oauth_access_denied"));
     assert!(!page.contains("secret detail"));
-
-    // A disabled browser grant is an HTML page for navigations as well.
-    let response = html("/oauth/login?grant=implicit".into(), None)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let page = response.text().await.unwrap();
-    assert!(page.contains("oauth_grant_disabled") && page.contains("Implicit"));
 
     // Shared assets carry their media types.
     let css = api.get("/oauth/oauth.css", None).await;

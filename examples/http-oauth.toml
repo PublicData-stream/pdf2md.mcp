@@ -12,8 +12,8 @@ client_secret = { env = "PDF2MD_OIDC_CLIENT_SECRET" }
 read_scope = "pdf2md:read"
 write_scope = "pdf2md:write"
 operate_scope = "pdf2md:operate"
-# Casdoor binds Implicit and Client Credentials tokens to the client ID.
-# additional_audiences = ["pdf2md-web"]
+# Casdoor binds Client Credentials tokens to the client ID.
+# additional_audiences = ["pdf2md-machine"]
 
 # API and MCP clients register their own application with the provider and
 # obtain tokens there. Optional: browser sign-in for the bundled API console,

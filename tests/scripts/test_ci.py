@@ -80,7 +80,7 @@ class ArtifactTests(unittest.TestCase):
             executable(self.target / "debug" / name)
         rows = []
         for name, kind, file in (("pdf2md_mcp", "lib", "browser-test"),
-                                 ("live_casdoor", "test", "provider-test")):
+                                 ("live_keycloak", "test", "provider-test")):
             rows.append({"reason": "compiler-artifact", "target": {"name": name, "kind": [kind]},
                          "executable": str(self.target / "debug/deps" / file)})
         self.cargo = self.base / "cargo.json"
@@ -98,7 +98,7 @@ class ArtifactTests(unittest.TestCase):
             artifacts.restore_native(self.restore)
         self.assertTrue(os.access(self.base / "restored/debug/deps/browser-test", os.X_OK))
         self.assertIn("PDF2MD_BROWSER_TEST_EXECUTABLE=", environment.read_text())
-        self.assertIn("PDF2MD_LIVE_CASDOOR_TEST_EXECUTABLE=", environment.read_text())
+        self.assertIn("PDF2MD_LIVE_KEYCLOAK_TEST_EXECUTABLE=", environment.read_text())
 
     def test_missing_test_executable_rejects_bundle(self):
         self.cargo.write_text("")
@@ -298,7 +298,7 @@ class GateTests(unittest.TestCase):
             workflow = root / ".github/workflows/check.yml"
             workflow.write_text("steps:\n  - uses: actions/checkout@v4\n")
             (root / "Dockerfile").write_text("FROM debian:bookworm\n")
-            (root / "scripts/ci/compose.yml").write_text("services:\n  provider:\n    image: casbin/casdoor:latest\n")
+            (root / "scripts/ci/compose.yml").write_text("services:\n  provider:\n    image: keycloak/keycloak:latest\n")
             with self.assertRaisesRegex(ValueError, "full commit SHA"):
                 check.source(root)
             workflow.write_text("steps:\n  - uses: actions/checkout@" + "1" * 40 + "\n")

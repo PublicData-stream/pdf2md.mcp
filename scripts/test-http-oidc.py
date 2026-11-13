@@ -36,12 +36,13 @@ def load(name, path):
     spec.loader.exec_module(module)
     return module
 
-provider = load("casdoor_harness", "test-casdoor.py")
+provider = load("keycloak_harness", "test-keycloak.py")
 conversion = load("conversion_harness", "test-conversion.py")
 mcp = load("mcp_smoke", "mcp-smoke.py")
-ISSUER = "https://127.0.0.1:9091"
+ORIGIN = "https://127.0.0.1:9091"
+ISSUER = provider.issuer_of(ORIGIN)
 SCOPE = provider.SCOPE
-PROVIDER_FILES = ("tls.crt", "tls.key", "ca.crt", "app.conf", "init_data.json", "client-secret")
+PROVIDER_FILES = ("tls.crt", "tls.key", "ca.crt", "client-secret")
 
 
 def invoke(args, *, env=None, timeout=120):
@@ -70,8 +71,8 @@ mode = "oauth2"
 issuer = "{ISSUER}"
 audience = "{provider.AUDIENCE}"
 validation = "{mode}"
-token_profile = "casdoor"
-client_id = "{provider.WEB_CLIENT}"
+token_profile = "keycloak"
+client_id = "{provider.INTROSPECTION_CLIENT}"
 client_secret = {{ file = "/config/client-secret" }}
 ca_file = "/config/ca.crt"
 [http]
@@ -90,8 +91,8 @@ def generate(root, source_mode="live"):
     provider.certificates(root)
     passwords = {name: secrets.token_urlsafe(24) for name in ("alice", "bob")}
     secret = secrets.token_urlsafe(32)
-    # Casdoor reads /conf/app.conf; its SQLite state lives on the provider PVC.
-    provider.write_provider_files(root, ISSUER, 9091, "/state", secret, passwords)
+    # Keycloak imports the realm on first start; its database lives on the provider PVC.
+    provider.write_provider_files(root, secret, passwords)
     (root / "client-secret").write_text(secret)
     if source_mode == "fixture":
         provider.run(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=fixture.example", "-keyout", str(root / "fixture.key"), "-out", str(root / "fixture.csr")])
@@ -103,13 +104,16 @@ def generate(root, source_mode="live"):
 
 def resources(root, image, source_mode="live"):
     secret = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "provider-config"}, "type": "Opaque", "data": {name: base64.b64encode((root / name).read_bytes()).decode() for name in PROVIDER_FILES}}
+    realm_file = provider.REALM + ".json"
+    realm = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "provider-realm"}, "type": "Opaque", "data": {realm_file: base64.b64encode((root / "import" / realm_file).read_bytes()).decode()}}
     cm = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-config"}, "data": {"config.toml": config("introspection", source_mode)}}
     def pvc(name):
         return {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": name}, "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}}
     deployment = {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "oidc-api"}, "spec": {"replicas": 1, "strategy": {"type": "Recreate"}, "selector": {"matchLabels": {"app": "oidc-api"}}, "template": {"metadata": {"labels": {"app": "oidc-api"}, "annotations": {"test-mode": "introspection"}}, "spec": {"securityContext": {"runAsNonRoot": True, "runAsUser": 10001, "runAsGroup": 10001, "fsGroup": 10001}, "containers": [
-        {"name": "provider", "image": provider.IMAGE, "ports": [{"containerPort": 9091}], "readinessProbe": {"httpGet": {"scheme": "HTTPS", "path": "/api/health", "port": 9091}, "periodSeconds": 5, "timeoutSeconds": 3}, "volumeMounts": [{"name": "provider-config", "mountPath": "/conf", "readOnly": True}, {"name": "provider-state", "mountPath": "/state"}]},
+        # Keycloak's image grants its install directory to group 0.
+        {"name": "provider", "image": provider.IMAGE, "args": provider.server_args(ORIGIN, 9091), "securityContext": {"runAsGroup": 0, "allowPrivilegeEscalation": False}, "ports": [{"containerPort": 9091}], "readinessProbe": {"httpGet": {"scheme": "HTTPS", "path": "/realms/" + provider.REALM + "/.well-known/openid-configuration", "port": 9091}, "periodSeconds": 5, "timeoutSeconds": 3}, "volumeMounts": [{"name": "provider-config", "mountPath": "/conf", "readOnly": True}, {"name": "provider-realm", "mountPath": "/opt/keycloak/data/import", "readOnly": True}, {"name": "provider-state", "mountPath": "/opt/keycloak/data/h2"}]},
         {"name": "api", "image": image, "imagePullPolicy": "Never", "args": ["--data-dir", "/data", "--config", "/etc/pdf2md/config.toml", "serve", "--listen", "0.0.0.0:8080"], "ports": [{"containerPort": 8080}], "readinessProbe": {"httpGet": {"path": "/readyz", "port": 8080}}, "volumeMounts": [{"name": "data", "mountPath": "/data"}, {"name": "api-config", "mountPath": "/etc/pdf2md", "readOnly": True}, {"name": "provider-config", "mountPath": "/config", "readOnly": True}]}
-    ], "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "data"}}, {"name": "provider-state", "persistentVolumeClaim": {"claimName": "provider-state"}}, {"name": "provider-config", "secret": {"secretName": "provider-config"}}, {"name": "api-config", "configMap": {"name": "api-config"}}]}}}}
+    ], "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "data"}}, {"name": "provider-state", "persistentVolumeClaim": {"claimName": "provider-state"}}, {"name": "provider-config", "secret": {"secretName": "provider-config"}}, {"name": "provider-realm", "secret": {"secretName": "provider-realm"}}, {"name": "api-config", "configMap": {"name": "api-config"}}]}}}}
     # ConfigMap and Secret projections are symlinks; API configuration readers
     # require regular files. Copy them into pod-private volumes before startup.
     pod = deployment["spec"]["template"]["spec"]
@@ -142,7 +146,7 @@ def resources(root, image, source_mode="live"):
             "volumeMounts": [{"name": "fixture-data", "mountPath": "/fixture-data", "readOnly": True}]})
         api_container["env"] = [{"name": "SSL_CERT_FILE", "value": "/config/ca.crt"}]
     path = root / "resources.json"
-    items = [secret, cm, pvc("data"), pvc("provider-state"), deployment]
+    items = [secret, realm, cm, pvc("data"), pvc("provider-state"), deployment]
     if source_mode == "fixture":
         items.append(fixture_secret)
     path.write_text(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))

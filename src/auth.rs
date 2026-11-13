@@ -24,8 +24,6 @@ use url::Url;
 pub(crate) const MAX_RESPONSE: usize = 256 * 1024;
 pub(crate) const MAX_TOKEN: usize = 64 * 1024;
 const MAX_ADDITIONAL_AUDIENCES: usize = 16;
-/// Casdoor's signed access-token class claim and value.
-const CASDOOR_TOKEN_TYPE: &str = "access-token";
 const METADATA_TTL: Duration = Duration::from_secs(300);
 const KEY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// Tolerated clock difference, in seconds, for the not-yet-valid checks
@@ -84,8 +82,9 @@ pub enum TokenProfile {
     /// RFC 9068 JWTs (`typ` `at+jwt`, `client_id`) and RFC 7662 introspection.
     #[default]
     Rfc9068,
-    /// Casdoor JWTs (`typ` `JWT`, signed `tokenType` `access-token`, `azp`).
-    Casdoor,
+    /// Keycloak JWTs (`typ` header `JWT`, `typ` claim `Bearer` or `DPoP`,
+    /// `azp`) and introspection responses carrying the same `typ` claim.
+    Keycloak,
 }
 
 fn read_scope() -> String {
@@ -245,7 +244,7 @@ impl AuthConfig {
                     || value == &oidc.audience
                     || value.bytes().any(|b| b.is_ascii_control())
             })
-            || (oidc.token_profile == TokenProfile::Casdoor
+            || (oidc.token_profile == TokenProfile::Keycloak
                 && (oidc.jwt_scope_claim != "scope" || oidc.access_token_prefix.is_some()))
             || !matches!(oidc.jwt_scope_claim.as_str(), "scope" | "scp")
             || (oidc.validation == TokenValidation::Introspection
@@ -291,14 +290,6 @@ impl AuthConfig {
         }
         if let Some(dpop) = &oidc.dpop {
             dpop.validate()?;
-            // Casdoor reports the key binding only through introspection; its
-            // JWTs carry no `cnf` claim, so local validation could never
-            // confirm a binding.
-            if oidc.token_profile == TokenProfile::Casdoor
-                && oidc.validation == TokenValidation::Jwt
-            {
-                return Err(config_error());
-            }
         }
         if let Some(client) = &self.client {
             client.validate(oidc)?;
@@ -504,13 +495,31 @@ struct Claims {
     azp: Option<String>,
     /// RFC 7800 confirmation; `jkt` binds the token to a DPoP key.
     cnf: Option<Confirmation>,
-    /// Casdoor's token-class claim.
-    #[serde(rename = "tokenType")]
-    casdoor_token_type: Option<String>,
+    /// Keycloak's token-class claim (`Bearer`, `DPoP`, `Refresh`, `ID`, ...).
+    typ: Option<String>,
+}
+impl Claims {
+    /// Whether Keycloak's `typ` claim names an access token: `Bearer`, or
+    /// `DPoP` for a token that also names its key. Keycloak signs access,
+    /// refresh and ID tokens with the same issuer and reports them through the
+    /// same introspection endpoint, so the class claim tells them apart.
+    fn keycloak_access_token(&self) -> bool {
+        match self.typ.as_deref() {
+            Some("Bearer") => true,
+            Some("DPoP") => self
+                .cnf
+                .as_ref()
+                .is_some_and(|cnf| cnf.jkt.as_ref().is_some_and(|jkt| !jkt.is_empty())),
+            _ => false,
+        }
+    }
 }
 #[derive(Debug, Deserialize)]
 struct Confirmation {
     jkt: Option<String>,
+    /// RFC 8705 certificate thumbprint of a mutual-TLS-bound token.
+    #[serde(rename = "x5t#S256")]
+    x5t_s256: Option<serde_json::Value>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -563,23 +572,6 @@ pub(crate) fn provider_client(config: &OidcConfig) -> Result<reqwest::Client> {
         builder = builder.add_root_certificate(certificate);
     }
     builder.build().map_err(|_| config_error())
-}
-
-/// Decode a JWT payload without verifying it. Use only for provider-issued
-/// tokens whose authenticity is established separately (for example by
-/// introspection of the exact token string).
-fn unverified_payload(token: &str) -> Option<Claims> {
-    use base64::Engine;
-    let mut parts = token.split('.');
-    let (Some(_), Some(payload), Some(_), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return None;
-    };
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
 }
 
 impl Provider {
@@ -665,8 +657,17 @@ impl Provider {
     /// Enforce the sender constraint (RFC 9449 section 7). A DPoP-bound token
     /// is accepted only with the DPoP scheme and a fresh proof from the bound
     /// key, and never as a Bearer token. An unbound token is accepted only as
-    /// a Bearer token, unless binding is required.
+    /// a Bearer token, unless binding is required. A certificate-bound token
+    /// (RFC 8705) cannot be confirmed here and is refused, rather than
+    /// accepted as a bearer token.
     fn confirm_key(&self, claims: &Claims, proven: Option<&ProvenKey>) -> Result<()> {
+        if claims
+            .cnf
+            .as_ref()
+            .is_some_and(|cnf| cnf.x5t_s256.is_some())
+        {
+            return Err(invalid());
+        }
         let bound = claims.cnf.as_ref().and_then(|cnf| cnf.jkt.as_deref());
         match (proven, bound, &self.dpop) {
             (Some(proven), Some(bound), Some(verifier)) if proven.thumbprint() == bound => {
@@ -687,24 +688,6 @@ impl Provider {
         {
             return Err(invalid());
         }
-        // Casdoor introspection reports refresh tokens as active Bearer
-        // tokens. Its tokens are JWTs whose exact string the provider looks
-        // up, so the issued token-class claim distinguishes access tokens; the
-        // introspected jti must also identify the same token.
-        let casdoor_jti = if self.config.token_profile == TokenProfile::Casdoor {
-            let payload = unverified_payload(token).ok_or_else(invalid)?;
-            if payload.casdoor_token_type.as_deref() != Some(CASDOOR_TOKEN_TYPE) {
-                return Err(invalid());
-            }
-            Some(
-                payload
-                    .jti
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(invalid)?,
-            )
-        } else {
-            None
-        };
         let discovery = self.discovery().await?;
         let request = self.client.post(
             self.endpoint(
@@ -751,9 +734,10 @@ impl Provider {
         };
         if !claims.active
             || !access_type
-            || casdoor_jti
-                .as_ref()
-                .is_some_and(|expected| claims.jti.as_ref() != Some(expected))
+            // Keycloak reports refresh and ID tokens as active to the client
+            // they were issued to, with their class in `typ`.
+            || (self.config.token_profile == TokenProfile::Keycloak
+                && !claims.keycloak_access_token())
             || claims
                 .token_use
                 .as_ref()
@@ -773,7 +757,7 @@ impl Provider {
                     typ.eq_ignore_ascii_case("at+jwt")
                         || typ.eq_ignore_ascii_case("application/at+jwt")
                 }
-                TokenProfile::Casdoor => typ.eq_ignore_ascii_case("JWT"),
+                TokenProfile::Keycloak => typ.eq_ignore_ascii_case("JWT"),
             })
             || header.jku.is_some()
             || header.x5u.is_some()
@@ -839,7 +823,7 @@ impl Provider {
         validation.set_issuer(&[self.config.issuer.as_str()]);
         let client_claim = match profile {
             TokenProfile::Rfc9068 => "client_id",
-            TokenProfile::Casdoor => "azp",
+            TokenProfile::Keycloak => "azp",
         };
         validation.set_required_spec_claims(&[
             "iss",
@@ -859,13 +843,12 @@ impl Provider {
         self.validate_claims(&claims, true)?;
         let client = match profile {
             TokenProfile::Rfc9068 => claims.client_id.as_ref(),
-            TokenProfile::Casdoor => claims.azp.as_ref(),
+            TokenProfile::Keycloak => claims.azp.as_ref(),
         };
         if claims.iat.is_none()
             || claims.jti.as_ref().is_none_or(|value| value.is_empty())
             || client.is_none_or(|value| value.is_empty())
-            || (profile == TokenProfile::Casdoor
-                && claims.casdoor_token_type.as_deref() != Some(CASDOOR_TOKEN_TYPE))
+            || (profile == TokenProfile::Keycloak && !claims.keycloak_access_token())
         {
             return Err(invalid());
         }

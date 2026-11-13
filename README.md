@@ -16,7 +16,7 @@ the background `watch`/`run` daemon processes pending conversions. The trusted C
 also request conversions, retry them, select pages, inspect history, and export
 verified bundles. The HTTP service provides isolated caller workspaces with
 `none_ro`, `none_rw`,
-and OIDC-backed `oauth2` modes, validated against providers such as Casdoor.
+and OIDC-backed `oauth2` modes, validated against providers such as Keycloak.
 The service validates tokens and never issues, stores or refreshes them for
 HTTP callers. An optional registered OAuth client supports browser sign-in
 with Authorization Code and PKCE, and Device Authorization, Refresh Token and

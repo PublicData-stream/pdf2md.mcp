@@ -30,9 +30,9 @@ unit tests use `cargo test --locked --package pdf2md-obscura-worker`; the
 browser integration script is `scripts/test-browser.sh` and requires OpenSSL.
 The HTTP container smoke harness is `python3 scripts/test-http.py IMAGE`, with
 optional `--minikube`. Live OIDC provider checks use
-`python3 scripts/test-casdoor.py`; real OIDC Kubernetes checks use
+`python3 scripts/test-keycloak.py`; real OIDC Kubernetes checks use
 `python3 scripts/test-http-oidc.py IMAGE`. See
-`examples/casdoor/README.md`. Generated certificates, credentials, provider
+`examples/keycloak/README.md`. Generated certificates, credentials, provider
 storage, and other test state belong under `/tmp`.
 The browser worker build uses the pinned upstream Obscura dependency. These
 local commands do not establish hosted CI, image, MCP client, or deployment

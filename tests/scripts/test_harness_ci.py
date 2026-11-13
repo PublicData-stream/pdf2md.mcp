@@ -33,14 +33,20 @@ class HarnessControls(unittest.TestCase):
     def test_oidc_provider_listener_probe_is_present_in_both_modes(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             root = Path(directory)
-            for name in ("tls.crt", "tls.key", "ca.crt", "app.conf", "init_data.json", "client-secret", "fixture.crt", "fixture.key", "sample.pdf"):
+            for name in ("tls.crt", "tls.key", "ca.crt", "client-secret", "fixture.crt", "fixture.key", "sample.pdf", "import/pdf2md.json"):
+                (root / name).parent.mkdir(exist_ok=True)
                 (root / name).write_bytes(b"synthetic")
             for mode in ("live", "fixture"):
                 with self.subTest(mode=mode), patch.dict(os.environ, {"PDF2MD_FIXTURE_IMAGE": "fixture:local"}):
                     items = json.loads(oidc.resources(root, "api:local", mode).read_text())["items"]
                     pod = next(item for item in items if item["kind"] == "Deployment")["spec"]["template"]["spec"]
                     provider = next(container for container in pod["containers"] if container["name"] == "provider")
-                    self.assertEqual(provider["readinessProbe"], {"httpGet": {"scheme": "HTTPS", "path": "/api/health", "port": 9091}, "periodSeconds": 5, "timeoutSeconds": 3})
+                    self.assertEqual(provider["readinessProbe"], {"httpGet": {"scheme": "HTTPS", "path": "/realms/pdf2md/.well-known/openid-configuration", "port": 9091}, "periodSeconds": 5, "timeoutSeconds": 3})
+                    self.assertIn("--hostname=https://127.0.0.1:9091", provider["args"])
+                    mounts = {mount["name"]: mount["mountPath"] for mount in provider["volumeMounts"]}
+                    self.assertEqual(mounts["provider-realm"], "/opt/keycloak/data/import")
+                    realm = next(item for item in items if item.get("metadata", {}).get("name") == "provider-realm")
+                    self.assertEqual(set(realm["data"]), {"pdf2md.json"})
 
     def test_oidc_readiness_retries_both_checks_and_bounds_timeouts(self):
         now = [0.0]
@@ -301,7 +307,8 @@ class HarnessControls(unittest.TestCase):
         self.assertIn('url = "https://fixture.example/sample.pdf"', oidc.config("jwt", "fixture"))
         with tempfile.TemporaryDirectory(dir="/tmp", prefix="pdf2md-harness-unit-") as directory:
             root = Path(directory)
-            for name in ("tls.crt", "tls.key", "ca.crt", "app.conf", "init_data.json", "client-secret", "fixture.crt", "fixture.key", "sample.pdf"):
+            for name in ("tls.crt", "tls.key", "ca.crt", "client-secret", "fixture.crt", "fixture.key", "sample.pdf", "import/pdf2md.json"):
+                (root / name).parent.mkdir(exist_ok=True)
                 (root / name).write_bytes(b"synthetic")
             with patch.dict(os.environ, {"PDF2MD_FIXTURE_IMAGE": "fixture:local"}):
                 items = json.loads(oidc.resources(root, "api:local", "fixture").read_text())["items"]
@@ -327,17 +334,17 @@ class HarnessControls(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("browser integration tests did not run", result.stderr)
 
-    def test_prebuilt_casdoor_missing_or_zero_tests_fails_before_provider_start(self):
+    def test_prebuilt_keycloak_missing_or_zero_tests_fails_before_provider_start(self):
         with tempfile.TemporaryDirectory(dir="/tmp", prefix="pdf2md-provider-unit-") as directory:
             fake = Path(directory) / "fake-tests"
             fake.write_text('#!/bin/sh\nprintf "0 tests, 0 benchmarks\\n"\n')
             fake.chmod(0o755)
             for executable in (str(fake), str(fake) + "-missing"):
-                result = subprocess.run([sys.executable, "scripts/test-casdoor.py"], cwd=ROOT,
-                                        env=os.environ | {"PDF2MD_LIVE_CASDOOR_TEST_EXECUTABLE": executable},
+                result = subprocess.run([sys.executable, "scripts/test-keycloak.py"], cwd=ROOT,
+                                        env=os.environ | {"PDF2MD_LIVE_KEYCLOAK_TEST_EXECUTABLE": executable},
                                         capture_output=True, text=True, timeout=30)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("prebuilt Casdoor", result.stdout)
+                self.assertIn("prebuilt Keycloak", result.stdout)
 
 
 if __name__ == "__main__":

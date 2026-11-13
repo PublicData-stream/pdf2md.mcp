@@ -47,11 +47,11 @@ def native_files(cargo_json, target):
         item = row.get("target", {})
         if item.get("name") == "pdf2md_mcp" and "lib" in item.get("kind", []):
             selected["browser"] = Path(row["executable"])
-        if item.get("name") == "live_casdoor" and "test" in item.get("kind", []):
-            selected["casdoor"] = Path(row["executable"])
+        if item.get("name") == "live_keycloak" and "test" in item.get("kind", []):
+            selected["keycloak"] = Path(row["executable"])
     selected.update({name: target / "debug" / name for name in (
         "pdf2md-mcp", "pdf2md-convert-worker", "pdf2md-obscura-worker")})
-    if set(selected) != {"browser", "casdoor", "pdf2md-mcp", "pdf2md-convert-worker", "pdf2md-obscura-worker"}:
+    if set(selected) != {"browser", "keycloak", "pdf2md-mcp", "pdf2md-convert-worker", "pdf2md-obscura-worker"}:
         raise ValueError("Cargo output is missing a required test executable")
     return selected
 
@@ -125,7 +125,7 @@ def restore_native(args):
     if machine != args.arch:
         raise ValueError("native artifact does not match this runner")
     files = metadata.get("files", [])
-    expected_roles = {"browser", "casdoor", "pdf2md-mcp", "pdf2md-convert-worker", "pdf2md-obscura-worker"}
+    expected_roles = {"browser", "keycloak", "pdf2md-mcp", "pdf2md-convert-worker", "pdf2md-obscura-worker"}
     if len(files) != 5 or {row["role"] for row in files} != expected_roles:
         raise ValueError("native artifact role manifest is incomplete")
     target = Path(args.target_dir).resolve() / "debug"
@@ -162,7 +162,7 @@ def restore_native(args):
         with Path(os.environ["GITHUB_PATH"]).open("a") as stream:
             stream.write(str(target) + "\n")
     emit_env({"PDF2MD_BROWSER_TEST_EXECUTABLE": selected["browser"],
-              "PDF2MD_LIVE_CASDOOR_TEST_EXECUTABLE": selected["casdoor"],
+              "PDF2MD_LIVE_KEYCLOAK_TEST_EXECUTABLE": selected["keycloak"],
               "PDF2MD_TEST_CLI": selected["pdf2md-mcp"],
               "PDF2MD_TEST_WORKER": selected["pdf2md-obscura-worker"]})
 

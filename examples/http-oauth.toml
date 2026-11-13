@@ -2,29 +2,27 @@
 mode = "oauth2"
 
 [auth.oidc]
-issuer = "https://auth.example.com"
+issuer = "https://auth.example.com/realms/pdf2md"
 audience = "https://pdf.example.com/"
 validation = "introspection"
-token_profile = "casdoor"
-# A confidential application used only to introspect tokens.
+token_profile = "keycloak"
+# A confidential client used only to introspect tokens. Keycloak introspects
+# only tokens whose audience names this client; add it with an audience mapper.
 client_id = "pdf2md-introspection"
 client_secret = { env = "PDF2MD_OIDC_CLIENT_SECRET" }
 read_scope = "pdf2md:read"
 write_scope = "pdf2md:write"
 operate_scope = "pdf2md:operate"
-# Casdoor binds Client Credentials tokens to the client ID.
-# additional_audiences = ["pdf2md-machine"]
 
 # Optional: authenticate introspection with a signed assertion
-# (private_key_jwt) instead of client_secret. Casdoor expects a registered
-# redirect URI of the application as issuer.
+# (private_key_jwt, Keycloak's "Signed JWT" client authenticator) instead of
+# client_secret.
 # [auth.oidc.client_assertion]
 # key = { file = "introspection-key.pem" }
 # algorithm = "ES256"
-# issuer = "https://pdf.example.com/oauth/callback"
 
-# Optional: accept DPoP-bound access tokens (RFC 9449). Casdoor reports the
-# binding through introspection only.
+# Optional: accept DPoP-bound access tokens (RFC 9449). Keycloak reports the
+# binding in its JWTs and through introspection.
 # [auth.oidc.dpop]
 # public_url = "https://pdf.example.com"
 # required = false

@@ -53,8 +53,8 @@ jobs:
           python3 scripts/ci/check.py source
           python3 -m unittest discover -s tests/scripts -p 'test_*.py'
           git diff --check
-      - name: Lint API console
-        run: scripts/lint-console.sh
+      - name: Lint and type-check web assets
+        run: scripts/check-web.sh
 
   core:
     name: ${{ matrix.check_name }}

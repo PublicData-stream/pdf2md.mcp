@@ -6,9 +6,13 @@
     "node": ">=26.13.1"
   },
   "scripts": {
-    "lint": "eslint src/http/docs.js eslint.config.mjs"
+    "build": "tsc --project tsconfig.json",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "lint": "oxlint --deny-warnings"
   },
   "devDependencies": {
-    "eslint": "10.14.0"
+    "oxlint": "1.93.0",
+    "oxlint-tsgolint": "7.0.2006",
+    "typescript": "7.0.2"
   }
 }

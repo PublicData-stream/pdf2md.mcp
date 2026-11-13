@@ -1,0 +1,3 @@
+# Emitted by `pnpm run build` from the TypeScript sources beside them.
+/src/http/docs.js linguist-generated=true
+/src/http/oauth-page.js linguist-generated=true

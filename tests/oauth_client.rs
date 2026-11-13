@@ -37,6 +37,8 @@ struct Provider {
     secret: std::path::PathBuf,
     requests: Arc<Mutex<Vec<Recorded>>>,
     token_responses: Arc<Mutex<VecDeque<(u16, Value)>>>,
+    /// Discovery `code_challenge_methods_supported`; `None` omits the field.
+    pkce_methods: Arc<Mutex<Option<Value>>>,
     task: JoinHandle<()>,
     _dir: TempDir,
 }
@@ -74,11 +76,14 @@ impl Provider {
         );
         let requests = Arc::new(Mutex::new(Vec::new()));
         let token_responses = Arc::new(Mutex::new(VecDeque::new()));
+        let pkce_methods = Arc::new(Mutex::new(Some(json!(["S256"]))));
         let (origin, log, queue) = (issuer.clone(), requests.clone(), token_responses.clone());
+        let pkce = pkce_methods.clone();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (acceptor, origin, log, queue) =
                     (acceptor.clone(), origin.clone(), log.clone(), queue.clone());
+                let pkce = pkce.clone();
                 tokio::spawn(async move {
                     let Ok(mut stream) = acceptor.accept(stream).await else {
                         return;
@@ -124,9 +129,8 @@ impl Provider {
                     });
                     let form = url::form_urlencoded::parse(body).into_owned().collect();
                     let (status, value) = match path.as_str() {
-                        "/.well-known/openid-configuration" => (
-                            200,
-                            json!({
+                        "/.well-known/openid-configuration" => {
+                            let mut discovery = json!({
                                 "issuer": origin,
                                 "authorization_endpoint": format!("{origin}/authorize?tenant=pdf2md"),
                                 "token_endpoint": format!("{origin}/token?tenant=pdf2md"),
@@ -134,8 +138,12 @@ impl Provider {
                                 "introspection_endpoint": format!("{origin}/introspect"),
                                 "jwks_uri": format!("{origin}/jwks"),
                                 "authorization_response_iss_parameter_supported": true,
-                            }),
-                        ),
+                            });
+                            if let Some(methods) = pkce.lock().unwrap().clone() {
+                                discovery["code_challenge_methods_supported"] = methods;
+                            }
+                            (200, discovery)
+                        }
                         "/token?tenant=pdf2md" => {
                             log.lock().unwrap().push(Recorded {
                                 path,
@@ -176,6 +184,7 @@ impl Provider {
             secret,
             requests,
             token_responses,
+            pkce_methods,
             task,
             _dir: dir,
         }
@@ -233,11 +242,15 @@ impl Drop for Api {
 }
 impl Api {
     async fn start(provider: &Provider, grants: &[GrantType]) -> Self {
+        Self::start_as(provider, grants, true).await
+    }
+    /// `secret` selects a confidential client; `false` registers a public one.
+    async fn start_as(provider: &Provider, grants: &[GrantType], secret: bool) -> Self {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let config = Config {
-            auth: provider.auth(grants, Some(base.clone()), true),
+            auth: provider.auth(grants, Some(base.clone()), secret),
             ..Config::default()
         };
         let service = Arc::new(CallerService::new(dir.path(), config, None).await.unwrap());
@@ -389,6 +402,85 @@ async fn authorization_code_login_binds_state_pkce_issuer_and_browser_cookie() {
         code(api.get(&callback, Some(&cookie)).await).await.1,
         "oauth_state_mismatch"
     );
+}
+
+#[tokio::test]
+async fn sign_in_requires_a_provider_that_supports_pkce_s256() {
+    let grants = [GrantType::AuthorizationCode];
+    let refused = (StatusCode::BAD_GATEWAY, "oauth_pkce_unsupported".to_owned());
+
+    // Advertised methods without S256 are refused for every client type.
+    let provider = Provider::start().await;
+    *provider.pkce_methods.lock().unwrap() = Some(json!(["plain"]));
+    for secret in [true, false] {
+        let api = Api::start_as(&provider, &grants, secret).await;
+        let response = api.get("/oauth/login", None).await;
+        assert!(response.headers().get("set-cookie").is_none());
+        assert!(response.headers().get("location").is_none());
+        assert_eq!(code(response).await, refused);
+    }
+
+    // Without the advertisement a public client is refused, because PKCE is
+    // its only protection for the authorization code.
+    let provider = Provider::start().await;
+    *provider.pkce_methods.lock().unwrap() = None;
+    let api = Api::start_as(&provider, &grants, false).await;
+    assert_eq!(code(api.get("/oauth/login", None).await).await, refused);
+    let page = api
+        .client
+        .get(format!("{}/oauth/login", api.base))
+        .header("accept", "text/html")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("Provider not supported") && page.contains("oauth_pkce_unsupported"));
+
+    // A confidential client still authenticates the code exchange and binds
+    // the response with `state`, so it may sign in and keeps sending S256.
+    let api = Api::start_as(&provider, &grants, true).await;
+    let (query, _) = api.login().await;
+    assert_eq!(query["code_challenge_method"], "S256");
+
+    // A public client signs in once the provider lists S256.
+    let provider = Provider::start().await;
+    *provider.pkce_methods.lock().unwrap() = Some(json!(["plain", "S256"]));
+    let api = Api::start_as(&provider, &grants, false).await;
+    let (query, _) = api.login().await;
+    assert_eq!(query["code_challenge_method"], "S256");
+}
+
+#[tokio::test]
+async fn library_code_exchange_rejects_a_malformed_pkce_verifier() {
+    let provider = Provider::start().await;
+    let auth = provider.auth(
+        &[GrantType::AuthorizationCode],
+        Some("https://pdf.example.com".into()),
+        true,
+    );
+    let client = OAuthClient::new(&auth).unwrap().unwrap();
+    for verifier in ["short", &"a".repeat(129), &format!("{}+", "a".repeat(43))] {
+        assert_eq!(
+            client
+                .exchange_code("abc", verifier)
+                .await
+                .unwrap_err()
+                .code,
+            "oauth_invalid_grant"
+        );
+    }
+    assert!(provider.requests.lock().unwrap().is_empty());
+
+    let request = client.authorization_request().await.unwrap();
+    client
+        .exchange_code("abc", &request.code_verifier)
+        .await
+        .unwrap();
+    let sent = provider.last();
+    assert_eq!(sent.form["code_verifier"], request.code_verifier);
+    assert_eq!(sent.form["grant_type"], "authorization_code");
 }
 
 #[tokio::test]

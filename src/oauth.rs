@@ -188,6 +188,8 @@ struct Metadata {
     device_authorization_endpoint: Option<String>,
     #[serde(default)]
     authorization_response_iss_parameter_supported: bool,
+    /// RFC 8414 section 2; absent when the provider does not advertise PKCE.
+    code_challenge_methods_supported: Option<Vec<String>>,
 }
 
 pub struct OAuthClient {
@@ -207,6 +209,14 @@ pub fn random_token() -> String {
 /// RFC 7636 S256 code challenge.
 pub fn code_challenge(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+/// RFC 7636 section 4.1: 43 to 128 unreserved characters.
+fn valid_code_verifier(value: &str) -> bool {
+    (43..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
 }
 
 fn valid_token_value(value: &str) -> bool {
@@ -355,10 +365,30 @@ impl OAuthClient {
         provider_endpoint(&self.oidc, value.ok_or_else(unavailable)?)
     }
 
+    /// RFC 9700 section 2.1.1: PKCE protects the code only when the provider
+    /// enforces it. A provider that advertises its methods must list S256. A
+    /// public client has no other protection for the code, so it also needs
+    /// the advertisement; a confidential client may proceed without it.
+    fn require_pkce_support(&self, metadata: &Metadata) -> Result<()> {
+        let supported = match &metadata.code_challenge_methods_supported {
+            Some(methods) => methods.iter().any(|method| method == "S256"),
+            None => self.secret.is_some(),
+        };
+        if supported {
+            Ok(())
+        } else {
+            Err(LoadError::new(
+                "oauth_pkce_unsupported",
+                "the provider does not advertise PKCE with S256",
+            ))
+        }
+    }
+
     /// Build an Authorization Code request with a PKCE S256 challenge.
     pub async fn authorization_request(&self) -> Result<AuthorizationRequest> {
         self.require(GrantType::AuthorizationCode)?;
         let metadata = self.metadata().await?;
+        self.require_pkce_support(&metadata)?;
         let mut url = self.endpoint(metadata.authorization_endpoint.as_deref())?;
         let state = random_token();
         let redirect_uri = self.redirect_uri()?;
@@ -434,7 +464,7 @@ impl OAuthClient {
     /// Exchange an authorization code with its PKCE verifier.
     pub async fn exchange_code(&self, code: &str, code_verifier: &str) -> Result<TokenResponse> {
         self.require(GrantType::AuthorizationCode)?;
-        if code.is_empty() || code.len() > 4096 {
+        if code.is_empty() || code.len() > 4096 || !valid_code_verifier(code_verifier) {
             return Err(oauth_error("invalid_grant"));
         }
         self.token_request(vec![
@@ -599,6 +629,17 @@ mod tests {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         );
         assert_ne!(first, random_token());
+        assert!(valid_code_verifier(&first));
+    }
+
+    #[test]
+    fn code_verifier_syntax_follows_rfc7636_section_4_1() {
+        assert!(valid_code_verifier(&"a".repeat(43)));
+        assert!(valid_code_verifier(&"-._~".repeat(32)));
+        assert!(!valid_code_verifier(&"a".repeat(42)));
+        assert!(!valid_code_verifier(&"a".repeat(129)));
+        assert!(!valid_code_verifier(&format!("{}+", "a".repeat(43))));
+        assert!(!valid_code_verifier(&format!("{} ", "a".repeat(43))));
     }
 
     #[test]

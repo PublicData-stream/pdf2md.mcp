@@ -121,6 +121,7 @@ impl IntoResponse for ApiError {
             "auth_invalid" => StatusCode::UNAUTHORIZED,
             "auth_forbidden" => StatusCode::FORBIDDEN,
             "auth_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+            "oauth_pkce_unsupported" => StatusCode::BAD_GATEWAY,
             "document_not_found"
             | "conversion_not_found"
             | "job_not_found"

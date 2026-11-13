@@ -118,6 +118,18 @@ async fn health_and_offline_docs_and_read_only_upload() {
         .upload(conversion_pdf::sample_pdf(), "application/pdf")
         .await;
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    // Anonymous modes take no bearer credentials, so they send no challenge.
+    let denied = server
+        .client
+        .post(server.url("/v1/documents"))
+        .header("content-type", "application/pdf")
+        .header("authorization", "Bearer ignored")
+        .body(conversion_pdf::sample_pdf())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert!(!denied.headers().contains_key("www-authenticate"));
     let history: Value = json_body(server.get("/v1/history").await).await;
     assert_eq!(history["items"].as_array().unwrap().len(), 0);
 }

@@ -118,8 +118,15 @@ impl McpConfig {
                 return Err(invalid());
             }
         }
-        if auth.mode == AuthMode::Oauth2 && (auth.oidc.is_none() || self.resource_url.is_none()) {
-            return Err(invalid());
+        if auth.mode == AuthMode::Oauth2 {
+            let (Some(oidc), Some(resource)) = (&auth.oidc, &self.resource_url) else {
+                return Err(invalid());
+            };
+            // Clients request tokens for the advertised resource (RFC 8707),
+            // so the validator must accept exactly that audience.
+            if !oidc.accepts_audience(resource) {
+                return Err(invalid());
+            }
         }
         Ok(())
     }
@@ -170,23 +177,41 @@ pub(crate) fn router(service: Arc<CallerService>, cancel: CancellationToken) -> 
             Router::new()
                 .route(
                     &format!("/.well-known/oauth-protected-resource{path}"),
-                    get(metadata),
+                    get(metadata).options(metadata_preflight),
                 )
                 .with_state(state),
         );
     }
     router
 }
-async fn metadata(State(state): State<HttpState>) -> Json<Value> {
+/// Protected-resource metadata is public and credential-free, so any origin
+/// may read it; browser-based clients need that to start authorization.
+async fn metadata(State(state): State<HttpState>) -> Response {
     let config = state.service.config();
     let oidc = config
         .auth
         .oidc
         .as_ref()
         .expect("validated OAuth configuration");
-    Json(
-        json!({"resource":config.mcp.resource_url, "authorization_servers":[oidc.issuer], "scopes_supported":[oidc.read_scope], "bearer_methods_supported":["header"]}),
+    (
+        [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
+        Json(
+            json!({"resource":config.mcp.resource_url, "authorization_servers":[oidc.issuer], "scopes_supported":[oidc.read_scope], "bearer_methods_supported":["header"]}),
+        ),
     )
+        .into_response()
+}
+async fn metadata_preflight() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            (header::ACCESS_CONTROL_ALLOW_METHODS, "GET"),
+            (header::ACCESS_CONTROL_ALLOW_HEADERS, "mcp-protocol-version"),
+            (header::ACCESS_CONTROL_MAX_AGE, "86400"),
+        ],
+    )
+        .into_response()
 }
 async fn guard(State(state): State<HttpState>, request: Request, next: Next) -> Response {
     let headers = request.headers();
@@ -206,23 +231,22 @@ async fn guard(State(state): State<HttpState>, request: Request, next: Next) -> 
     {
         return StatusCode::FORBIDDEN.into_response();
     }
+    // RFC 6750 section 3.1: name an error only when credentials were sent.
+    let presented = headers.contains_key(header::AUTHORIZATION);
     let token = match bearer(headers, state.service.config().auth.mode) {
         Ok(v) => v,
-        Err(()) => return unauthorized(&state),
+        Err(()) => return challenge(&state, StatusCode::UNAUTHORIZED, presented),
     };
     if let Err(error) = state.service.authorize(token, false, false).await {
         return match error.code.as_str() {
-            "auth_invalid" => unauthorized(&state),
-            "auth_forbidden" => challenge(&state, StatusCode::FORBIDDEN),
+            "auth_invalid" => challenge(&state, StatusCode::UNAUTHORIZED, presented),
+            "auth_forbidden" => challenge(&state, StatusCode::FORBIDDEN, presented),
             _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
     }
     next.run(request).await
 }
-fn unauthorized(state: &HttpState) -> Response {
-    challenge(state, StatusCode::UNAUTHORIZED)
-}
-fn challenge(state: &HttpState, status: StatusCode) -> Response {
+fn challenge(state: &HttpState, status: StatusCode, presented: bool) -> Response {
     let mut response = status.into_response();
     let resource = state
         .service
@@ -252,6 +276,8 @@ fn challenge(state: &HttpState, status: StatusCode) -> Response {
         .read_scope;
     let reason = if status == StatusCode::FORBIDDEN {
         ", error=\"insufficient_scope\""
+    } else if presented {
+        ", error=\"invalid_token\""
     } else {
         ""
     };

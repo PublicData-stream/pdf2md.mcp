@@ -1,9 +1,12 @@
 # Authentication foundations
 
 The HTTP service uses the caller authorization boundary and accepts bearer
-access tokens in OAuth2 mode. It never issues tokens itself. An optional
-registered OAuth client can obtain tokens from the provider for callers with
-every OAuth 2.0 grant except Resource Owner Password Credentials; see
+access tokens in OAuth2 mode. It is an OAuth resource server: the identity
+provider issues, refreshes and revokes tokens, clients store them, and this
+service only validates the access token on each request. It never issues,
+stores or refreshes tokens for HTTP callers. An optional registered OAuth
+client supports every OAuth 2.0 grant except Resource Owner Password
+Credentials for browser sign-in and the trusted CLI; see
 [Obtaining access tokens](#obtaining-access-tokens). The local CLI and
 low-level storage APIs remain trusted operator interfaces. See
 [the HTTP API](http-api.md) for routes and job behavior.
@@ -53,7 +56,7 @@ issuer = "https://auth.example.com"
 audience = "https://pdf.example.com/"
 validation = "introspection"
 token_profile = "casdoor"
-client_id = "pdf2md-web"
+client_id = "pdf2md-introspection"
 client_secret = { env = "PDF2MD_OIDC_CLIENT_SECRET" }
 read_scope = "pdf2md:read"
 write_scope = "pdf2md:write"
@@ -66,6 +69,16 @@ JWKS; JWT mode does not need introspection credentials. Validators are selected
 explicitly, without fallback. Introspection checks every operation without
 token-result caching. Local JWT validation can continue accepting a revoked
 token until expiry; choose introspection when prompt revocation is required.
+
+Expiry is enforced without leeway. The not-yet-valid checks (`nbf` and `iat`)
+tolerate a provider clock up to 30 seconds ahead, because providers issue
+whole-second timestamps and a freshly issued token can otherwise be rejected.
+
+In OAuth2 mode, API responses to requests that carried Bearer credentials
+follow [RFC 6750 section 3.1](https://www.rfc-editor.org/rfc/rfc6750#section-3.1):
+HTTP 401 sends `WWW-Authenticate: Bearer error="invalid_token"` and HTTP 403
+sends `Bearer error="insufficient_scope"`. Requests without credentials
+receive the bare `Bearer` challenge.
 
 ### Token profiles
 
@@ -113,12 +126,25 @@ additional_audiences = ["pdf2md-web", "pdf2md-machine"]
 ```
 
 Only list clients registered exclusively for this service: any access token
-issued to them is accepted. ID tokens remain rejected by the token profile.
+issued to them is accepted, whichever resource it was requested for. Prefer
+grants that the provider binds to the resource, and leave the list empty when
+you do not use Implicit or Client Credentials. ID tokens remain rejected by
+the token profile.
+
+When the MCP endpoint is enabled, its `resource_url` must equal `audience` or
+appear in `additional_audiences`; configuration is rejected otherwise. MCP
+clients request tokens for the advertised resource, so the validator has to
+accept exactly that value.
 
 ### Provider registration
 
 Register clients explicitly; this integration does not depend on Dynamic
-Client Registration. In Casdoor, create an application with the **Agent**
+Client Registration. Give each MCP client or other API client its own provider
+application, as a public client using Authorization Code with PKCE where it
+cannot keep a secret. Clients then obtain, store and refresh their tokens
+directly with the provider, which can grant consent to and revoke each client
+separately. Use a separate confidential application for introspection. In
+Casdoor, create an application with the **Agent**
 category and define the custom scopes `pdf2md:read`, `pdf2md:write` and
 `pdf2md:operate` ([custom scopes](https://casdoor.ai/docs/application/scopes/)).
 Enable only the grant types you use. Keep subject configuration stable: a
@@ -141,16 +167,26 @@ enabled. Auth configuration is validated even for operator commands; only the
 
 ## Obtaining access tokens
 
-The optional `[auth.client]` section registers this service as an OAuth client
-of the same issuer. It supports these grants:
+API and MCP clients normally obtain tokens from the provider with their own
+registered client; this service only needs to validate them. The optional
+`[auth.client]` section additionally registers this service as an OAuth client
+of the same issuer, for interactive sign-in to the bundled API console and for
+the trusted CLI. It supports these grants:
 
 | `grant_types` value | Grant | Where |
 | --- | --- | --- |
 | `authorization_code` | Authorization Code with PKCE S256 ([RFC 6749 section 4.1](https://www.rfc-editor.org/rfc/rfc6749#section-4.1), [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636)) | Browser: `GET /oauth/login`, then `GET /oauth/callback` |
 | `implicit` | Implicit ([RFC 6749 section 4.2](https://www.rfc-editor.org/rfc/rfc6749#section-4.2)) | Browser: `GET /oauth/login?grant=implicit`, then `GET /oauth/implicit` |
-| `device_code` | Device Authorization ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) | `POST /oauth/device` and `POST /oauth/token`, or `pdf2md-mcp oauth device` |
-| `refresh_token` | Refresh Token ([RFC 6749 section 6](https://www.rfc-editor.org/rfc/rfc6749#section-6)) | `POST /oauth/token`, or `pdf2md-mcp oauth refresh` |
+| `device_code` | Device Authorization ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) | `pdf2md-mcp oauth device` only |
+| `refresh_token` | Refresh Token ([RFC 6749 section 6](https://www.rfc-editor.org/rfc/rfc6749#section-6)) | `pdf2md-mcp oauth refresh` only |
 | `client_credentials` | Client Credentials ([RFC 6749 section 4.4](https://www.rfc-editor.org/rfc/rfc6749#section-4.4)) | `pdf2md-mcp oauth client-credentials` only |
+
+Only the browser grants have HTTP routes. The HTTP service never redeems a
+device code or refresh token supplied by a caller, and never returns a refresh
+token: doing so would apply the registered client's credentials to grants
+held by anonymous callers. Those grants run from the CLI, where the operator
+holds the client configuration, or between a caller's own client and the
+provider.
 
 The Resource Owner Password Credentials grant is not supported: the service
 never receives user passwords, and configuration rejects `password`.
@@ -163,7 +199,7 @@ and omitted from OAuth 2.1; enable it only for compatibility.
 [auth.client]
 client_id = "pdf2md-web"
 client_secret = { env = "PDF2MD_OAUTH_CLIENT_SECRET" }
-grant_types = ["authorization_code", "device_code", "refresh_token"]
+grant_types = ["authorization_code"]
 scopes = ["pdf2md:read", "pdf2md:write"]
 redirect_base_url = "https://pdf.example.com"
 ```
@@ -176,20 +212,24 @@ carries `resource`, which defaults to `[auth.oidc] audience`. Browser grants
 require `redirect_base_url`, the public HTTPS origin of this service
 (loopback HTTP is allowed for development). Register
 `<redirect_base_url>/oauth/callback` and `<redirect_base_url>/oauth/implicit`
-as the client's redirect URIs. The client may be the same provider application
-used for introspection. Routes for disabled grants are not registered.
+as the client's redirect URIs. Use a provider application separate from the
+one used for introspection, so that sign-in and token validation can be
+revoked and rotated independently. Routes for disabled grants are not
+registered.
 
 Browser grants:
 
 - `/oauth/login` redirects to the provider with a random `state`. Authorization
   Code adds an S256 PKCE challenge; the verifier stays in server memory for ten
-  minutes, at most 1,024 pending sign-ins. The `state` is also bound to the
+  minutes. At most 8,192 sign-ins are pending at once; a newer sign-in replaces
+  the oldest one when the table is full. The `state` is also bound to the
   browser with an `HttpOnly`, `SameSite=Lax` cookie, `Secure` for HTTPS.
 - `/oauth/callback` requires the matching cookie and single-use `state`, then
   checks the [RFC 9207](https://www.rfc-editor.org/rfc/rfc9207) `iss`
   parameter. It is mandatory when the provider advertises it, as Casdoor does.
   The code is redeemed with its verifier, and a result page shows the access
-  and refresh tokens. ID tokens are never displayed.
+  token. ID tokens and refresh tokens are never displayed; sign in again when
+  the access token expires.
 - `/oauth/implicit` reads the token from the URL fragment in the browser, so
   the server never receives it. The page script checks `state` against a
   script-readable cookie and `iss` against the configured issuer, then removes
@@ -198,27 +238,13 @@ Browser grants:
 Pages share a dark-only stylesheet (`/oauth/oauth.css`) in the GitHub Dark
 color range and a copy-button script (`/oauth/page.js`), with no inline scripts
 or styles. The result pages
-show the token type, lifetime and granted scopes next to the tokens. Browser
+show the token type, lifetime and granted scopes next to the access token. Browser
 navigations that send `Accept: text/html` receive an HTML error page from
 `/oauth/login` and `/oauth/callback` with the same status, error code and
 request ID as the JSON error; other clients keep the JSON body. Provider error
 descriptions are never shown. Responses use `Cache-Control: no-store`,
 `Referrer-Policy: no-referrer` and a content security policy that allows only
 same-origin scripts and styles.
-
-`POST /oauth/device` starts device authorization and returns `device_code`,
-`user_code`, `verification_uri`, `expires_in` and `interval`. Show the user the
-verification URI and code; the provider hosts the approval page. Poll
-`POST /oauth/token` with
-`{"grant_type": "urn:ietf:params:oauth:grant-type:device_code", "device_code": "..."}`
-no more often than `interval`. Refresh with
-`{"grant_type": "refresh_token", "refresh_token": "..."}`. Responses contain
-`access_token`, `token_type`, `expires_in`, `scope` and, when issued,
-`refresh_token`. Casdoor rotates refresh tokens by default; store the new
-value. The broker adds the registered client's credentials to these requests,
-so a confidential client's secret never leaves the service. Client Credentials
-is never brokered over HTTP, because it would issue the service's own
-application token to anonymous callers.
 
 Provider errors become fixed codes without provider descriptions:
 `oauth_authorization_pending`, `oauth_slow_down`, `oauth_access_denied`,
@@ -229,10 +255,13 @@ use `oauth_state_mismatch`, `oauth_issuer_mismatch` and
 `auth_unavailable`.
 
 The CLI reads the same configuration and prints the token response as JSON on
-standard output. Device authorization prints the verification URI and code on
+standard output: `access_token`, `token_type`, `expires_in`, `scope` and, when
+issued, `refresh_token`. Treat that output as a credential and keep it out of
+logs. Device authorization prints the verification URI and code on
 standard error and polls until approval, denial or expiry, slowing down when
 asked. Refresh reads the token from a named environment variable so it does
-not appear in process arguments:
+not appear in process arguments. Casdoor rotates refresh tokens by default;
+store the new value:
 
 ```sh
 pdf2md-mcp --config pdf2md.toml oauth device
@@ -331,7 +360,8 @@ Registered-client grants run against a synthetic TLS provider in
 
 Live Casdoor checks use a disposable provider with two synthetic users and
 registered test clients. They exercise all five supported grants through the
-registered client, both validators, permissions, isolation, revocation,
+registered client (browser grants over HTTP, the others through the library
+client), both validators, permissions, isolation, revocation,
 expiry, and durable job recovery against the library and HTTP boundaries.
 These checks alone do not establish MCP client or Kubernetes deployment
 acceptance. Run `python3 scripts/test-casdoor.py`; see

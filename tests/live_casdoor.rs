@@ -648,7 +648,7 @@ async fn real_casdoor_grants_through_the_registered_client() {
         CallerService::new(
             root.path(),
             Config {
-                auth: auth_config(&fixture, "introspection", Some(client)),
+                auth: auth_config(&fixture, "introspection", Some(client.clone())),
                 ..Config::default()
             },
             None,
@@ -710,7 +710,8 @@ async fn real_casdoor_grants_through_the_registered_client() {
     assert_eq!(page.status(), StatusCode::OK);
     let page = page.text().await.unwrap();
     let code_access = textarea(&page, "access-token");
-    let code_refresh = textarea(&page, "refresh-token");
+    // The refresh token issued to the registered client stays out of the browser.
+    assert!(!page.contains("refresh-token"));
     assert_eq!(history(code_access.clone()).await, StatusCode::OK);
     assert_eq!(subject(&fixture, &code_access).await, alice);
 
@@ -732,29 +733,52 @@ async fn real_casdoor_grants_through_the_registered_client() {
         .unwrap();
     assert_eq!(page.status(), StatusCode::OK);
 
-    // Device Authorization: start, observe pending, approve as Bob, then poll.
-    let device: Value = api
-        .post(format!("{base}/oauth/device"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    // Device and refresh grants are not brokered over HTTP: the registered
+    // client's credentials are not applied to a caller-supplied grant.
     let grant = "urn:ietf:params:oauth:grant-type:device_code";
-    let poll = || {
-        api.post(format!("{base}/oauth/token"))
-            .json(&serde_json::json!({"grant_type": grant, "device_code": device["device_code"]}))
+    assert_eq!(
+        api.post(format!("{base}/oauth/device"))
             .send()
-    };
-    let pending: Value = poll().await.unwrap().json().await.unwrap();
-    assert_eq!(pending["code"], "oauth_authorization_pending");
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    for body in [
+        serde_json::json!({"grant_type": grant, "device_code": "device"}),
+        serde_json::json!({"grant_type": "refresh_token", "refresh_token": "refresh"}),
+    ] {
+        assert_eq!(
+            api.post(format!("{base}/oauth/token"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    let registered = OAuthClient::new(&auth_config(&fixture, "introspection", Some(client)))
+        .unwrap()
+        .unwrap();
+
+    // Device Authorization through the trusted client: start, observe
+    // pending, approve as Bob, then poll.
+    let device = registered.device_authorization().await.unwrap();
+    assert_eq!(
+        registered
+            .poll_device(&device.device_code)
+            .await
+            .unwrap_err()
+            .code,
+        "oauth_authorization_pending"
+    );
     let approved: Value = provider_client(&fixture)
         .post(format!("{}/api/login", fixture["issuer"].as_str().unwrap()))
         .bearer_auth(token(&fixture, "bob"))
         .json(&serde_json::json!({
             "application": fixture["client_id"], "organization": fixture["organization"],
-            "type": "device", "userCode": device["user_code"],
+            "type": "device", "userCode": device.user_code,
         }))
         .send()
         .await
@@ -763,35 +787,40 @@ async fn real_casdoor_grants_through_the_registered_client() {
         .await
         .unwrap();
     assert_eq!(approved["status"], "ok");
-    let response = poll().await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let device_tokens: Value = response.json().await.unwrap();
-    let device_access = device_tokens["access_token"].as_str().unwrap().to_owned();
+    let device_access = registered
+        .poll_device(&device.device_code)
+        .await
+        .unwrap()
+        .access_token;
     assert_eq!(history(device_access.clone()).await, StatusCode::OK);
     assert_eq!(
         subject(&fixture, &device_access).await,
         subject(&fixture, token(&fixture, "bob")).await
     );
 
-    // Refresh Token: Casdoor rotates refresh tokens by default.
-    let refresh = |value: String| {
-        api.post(format!("{base}/oauth/token"))
-            .json(&serde_json::json!({"grant_type": "refresh_token", "refresh_token": value}))
-            .send()
-    };
-    let refreshed: Value = refresh(code_refresh.clone())
-        .await
-        .unwrap()
-        .json()
+    // Refresh Token through the trusted client. Casdoor rotates refresh
+    // tokens by default.
+    let request = registered
+        .authorization_request(pdf2md_mcp::oauth::GrantType::AuthorizationCode)
         .await
         .unwrap();
-    let refreshed_access = refreshed["access_token"].as_str().unwrap().to_owned();
-    assert_eq!(history(refreshed_access.clone()).await, StatusCode::OK);
-    assert_eq!(subject(&fixture, &refreshed_access).await, alice);
-    let reused: Value = refresh(code_refresh).await.unwrap().json().await.unwrap();
-    assert_eq!(reused["code"], "oauth_invalid_grant");
-    // ID tokens are not access tokens; the broker never returns them.
-    assert!(refreshed.get("id_token").is_none());
+    let code = casdoor_sign_in(&fixture, request.url.as_str(), "alice").await;
+    let code_refresh = registered
+        .exchange_code(&code, request.code_verifier.as_deref().unwrap())
+        .await
+        .unwrap()
+        .refresh_token
+        .expect("Authorization Code grant issues a refresh token");
+    let refreshed = registered.refresh(&code_refresh).await.unwrap();
+    assert_eq!(
+        history(refreshed.access_token.clone()).await,
+        StatusCode::OK
+    );
+    assert_eq!(subject(&fixture, &refreshed.access_token).await, alice);
+    assert_eq!(
+        registered.refresh(&code_refresh).await.unwrap_err().code,
+        "oauth_invalid_grant"
+    );
 
     // Client Credentials: an application identity with its own workspace.
     let machine = auth_config(

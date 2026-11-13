@@ -1,21 +1,24 @@
-//! Browser and token-broker routes for the optional registered OAuth client.
+//! Browser sign-in routes for the optional registered OAuth client.
+//!
+//! Only the interactive browser grants are served over HTTP, and the result
+//! pages show an access token only. Refresh tokens are never returned, and no
+//! route accepts a caller-supplied grant (device code or refresh token) to
+//! redeem with the registered client's credentials: those grants run from the
+//! trusted CLI, or directly between the caller's own client and the provider.
 //!
 //! Pages share `/oauth/oauth.css` and `/oauth/page.js` and render without
 //! inline scripts or styles. Responses are `no-store` and use the service's
 //! restrictive content security policy and `no-referrer` policy. Browser
 //! navigations (`Accept: text/html`) to `/oauth/login` and `/oauth/callback`
 //! receive an HTML error page; other clients keep the JSON error body.
-use super::{ApiError, ApiJson, BrowserPage, invalid};
-use crate::{
-    error::LoadError,
-    oauth::{GrantType, OAuthClient, TokenResponse, authorization_error},
-};
+use super::{ApiError, BrowserPage, invalid};
+use crate::oauth::{GrantType, OAuthClient, TokenResponse, authorization_error};
 use axum::{
-    Json, Router,
+    Router,
     extract::{Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, header},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::get,
 };
 use serde::Deserialize;
 use std::{
@@ -25,10 +28,12 @@ use std::{
 };
 
 const PENDING_TTL: Duration = Duration::from_secs(600);
-const MAX_PENDING: usize = 1024;
+/// Pending Authorization Code sign-ins kept in memory. When the table is
+/// full the oldest entry is replaced, so unauthenticated requests to
+/// `/oauth/login` cannot lock other users out until entries expire.
+const MAX_PENDING: usize = 8192;
 const CODE_COOKIE: &str = "pdf2md_oauth_state";
 const IMPLICIT_COOKIE: &str = "pdf2md_implicit_state";
-const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 #[derive(Clone)]
 struct OAuthState {
@@ -52,12 +57,6 @@ pub(super) fn router(client: Arc<OAuthClient>) -> Router {
         router = router
             .route("/oauth/implicit", get(implicit_page))
             .route("/oauth/implicit.js", get(implicit_js));
-    }
-    if client.enabled(GrantType::DeviceCode) {
-        router = router.route("/oauth/device", post(device));
-    }
-    if client.enabled(GrantType::DeviceCode) || client.enabled(GrantType::RefreshToken) {
-        router = router.route("/oauth/token", post(token));
     }
     router.with_state(OAuthState {
         client,
@@ -128,11 +127,7 @@ async fn start_login(state: &OAuthState, grant: GrantType) -> Result<Response, A
     let secure = state.client.secure_redirects();
     let set_cookie = if let Some(verifier) = request.code_verifier {
         let mut pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|_, (_, created)| created.elapsed() < PENDING_TTL);
-        if pending.len() >= MAX_PENDING {
-            return Err(LoadError::transient("service_busy", "too many pending sign-ins").into());
-        }
-        pending.insert(request.state.clone(), (verifier, Instant::now()));
+        insert_pending(&mut pending, request.state.clone(), verifier);
         cookie(
             CODE_COOKIE,
             &request.state,
@@ -156,6 +151,27 @@ async fn start_login(state: &OAuthState, grant: GrantType) -> Result<Response, A
         .headers_mut()
         .insert(header::SET_COOKIE, set_cookie);
     Ok(response)
+}
+
+/// Record a pending sign-in, dropping expired entries and, at capacity, the
+/// oldest one.
+fn insert_pending(
+    pending: &mut HashMap<String, (String, Instant)>,
+    state: String,
+    verifier: String,
+) {
+    pending.retain(|_, (_, created)| created.elapsed() < PENDING_TTL);
+    while pending.len() >= MAX_PENDING {
+        let Some(oldest) = pending
+            .iter()
+            .min_by_key(|(_, (_, created))| *created)
+            .map(|(state, _)| state.clone())
+        else {
+            break;
+        };
+        pending.remove(&oldest);
+    }
+    pending.insert(state, (verifier, Instant::now()));
 }
 
 #[derive(Deserialize)]
@@ -213,8 +229,7 @@ async fn finish_code(
         .as_deref()
         .ok_or_else(|| invalid("oauth_error", "missing authorization code"))?;
     let tokens = state.client.exchange_code(code, &verifier).await?;
-    let refreshable = state.client.enabled(GrantType::RefreshToken);
-    let mut response = token_page(&tokens, refreshable).into_response();
+    let mut response = token_page(&tokens).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
         cookie(
@@ -334,18 +349,9 @@ fn token_field(id: &str, label: &str, hint: &str, rows: u8, value: &str) -> Stri
     )
 }
 
-const TOKEN_NOTE: &str = "<p class=\"note\"><strong>Treat these tokens like passwords.</strong> pdf2md does not keep them, so copy what you need now. Do not paste them into chats, tickets or shared documents.</p>";
+const TOKEN_NOTE: &str = "<p class=\"note\"><strong>Treat this token like a password.</strong> pdf2md does not keep it, so copy it now. Do not paste it into chats, tickets or shared documents.</p>";
 
-fn usage(refresh: bool) -> String {
-    let refresh = if refresh {
-        "<p>Before the access token expires, exchange the refresh token at <code>POST /oauth/token</code> with <code>{\"grant_type\": \"refresh_token\", \"refresh_token\": \"...\"}</code> and keep the new refresh token it returns.</p>"
-    } else {
-        ""
-    };
-    format!(
-        "<div class=\"usage\"><p>Send the access token as a Bearer credential:</p><pre>Authorization: Bearer &lt;access token&gt;</pre>{refresh}</div>"
-    )
-}
+const USAGE: &str = "<div class=\"usage\"><p>Send the access token as a Bearer credential:</p><pre>Authorization: Bearer &lt;access token&gt;</pre><p>Sign in again when it expires. Refresh tokens are not shown here.</p></div>";
 
 /// Page actions. After a successful sign-in the API console comes first;
 /// after a failure, starting again does.
@@ -362,9 +368,10 @@ fn actions(grant: GrantType, signed_in: bool) -> String {
     }
 }
 
-/// Authorization Code result page. ID tokens are never displayed.
-fn token_page(tokens: &TokenResponse, refreshable: bool) -> Html<String> {
-    let refresh = tokens.refresh_token.as_deref();
+/// Authorization Code result page. Only the access token is displayed: ID
+/// tokens are not credentials for this service, and a refresh token issued to
+/// the registered client stays out of the browser.
+fn token_page(tokens: &TokenResponse) -> Html<String> {
     let mut body = format!(
         "<dl class=\"details\"><dt>Token type</dt><dd>{}</dd><dt>Expires in</dt><dd>{}</dd><dt>Scope</dt><dd>{}</dd></dl>",
         escape(&tokens.token_type),
@@ -378,24 +385,15 @@ fn token_page(tokens: &TokenResponse, refreshable: bool) -> Html<String> {
         6,
         &tokens.access_token,
     ));
-    if let Some(refresh) = refresh {
-        body.push_str(&token_field(
-            "refresh-token",
-            "Refresh token",
-            "Obtains new access tokens",
-            3,
-            refresh,
-        ));
-    }
     body.push_str(TOKEN_NOTE);
-    body.push_str(&usage(refreshable && refresh.is_some()));
+    body.push_str(USAGE);
     body.push_str(&actions(GrantType::AuthorizationCode, true));
     Html(
         Page {
             flow: CODE_FLOW,
             state: PageState::Success,
             title: "Signed in",
-            message: "Your tokens are ready. Copy them before you close this page.",
+            message: "Your access token is ready. Copy it before you close this page.",
             head: String::new(),
             body,
             scripts: &["/oauth/page.js"],
@@ -419,7 +417,7 @@ async fn implicit_page(State(state): State<OAuthState>) -> Result<Html<String>, 
         "",
     ));
     body.push_str(TOKEN_NOTE);
-    body.push_str(&usage(false));
+    body.push_str(USAGE);
     body.push_str("</section>");
     body.push_str(&actions(GrantType::Implicit, true));
     Ok(Html(
@@ -460,10 +458,6 @@ fn error_text(code: &str) -> (&'static str, Option<&'static str>) {
             Some("Authorization was denied by you or the provider."),
         ),
         "oauth_grant_disabled" => ("Sign-in method unavailable", None),
-        "service_busy" => (
-            "Too many sign-ins in progress",
-            Some("Wait a moment, then start again."),
-        ),
         _ => ("Sign-in failed", None),
     }
 }
@@ -558,35 +552,23 @@ async fn implicit_js() -> impl IntoResponse {
     )
 }
 
-/// Start RFC 8628 device authorization for a CLI or device caller.
-async fn device(State(state): State<OAuthState>) -> Result<Response, ApiError> {
-    let device = state.client.device_authorization().await?;
-    Ok((StatusCode::OK, Json(device)).into_response())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TokenInput {
-    grant_type: String,
-    device_code: Option<String>,
-    refresh_token: Option<String>,
-}
-
-/// Token broker for device-code polling and refresh-token exchange with the
-/// registered client's credentials. Authorization Code redemption happens only
-/// through the callback, and Client Credentials is never brokered.
-async fn token(
-    State(state): State<OAuthState>,
-    ApiJson(input): ApiJson<TokenInput>,
-) -> Result<Response, ApiError> {
-    let tokens = match (
-        input.grant_type.as_str(),
-        input.device_code.as_deref(),
-        input.refresh_token.as_deref(),
-    ) {
-        (DEVICE_CODE_GRANT, Some(code), None) => state.client.poll_device(code).await?,
-        ("refresh_token", None, Some(refresh)) => state.client.refresh(refresh).await?,
-        _ => return Err(invalid("invalid_request", "unsupported token request")),
-    };
-    Ok((StatusCode::OK, Json(tokens)).into_response())
+    #[test]
+    fn full_pending_table_replaces_the_oldest_sign_in() {
+        let mut pending = HashMap::new();
+        let earlier = Instant::now() - Duration::from_secs(1);
+        pending.insert("oldest".to_owned(), ("verifier".to_owned(), earlier));
+        for index in 1..MAX_PENDING {
+            insert_pending(&mut pending, format!("state-{index}"), "verifier".into());
+        }
+        assert_eq!(pending.len(), MAX_PENDING);
+        assert!(pending.contains_key("oldest"));
+        insert_pending(&mut pending, "newest".into(), "verifier".into());
+        assert_eq!(pending.len(), MAX_PENDING);
+        assert!(pending.contains_key("newest"));
+        assert!(!pending.contains_key("oldest"));
+    }
 }

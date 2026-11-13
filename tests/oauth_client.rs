@@ -360,13 +360,13 @@ async fn authorization_code_login_binds_state_pkce_issuer_and_browser_cookie() {
     );
     assert_eq!(response.headers()["cache-control"], "no-store");
     let page = response.text().await.unwrap();
-    assert!(page.contains("access-1") && page.contains("refresh-1"));
+    assert!(page.contains("access-1"));
     assert!(!page.contains("ignored"), "ID tokens are not displayed");
+    // A refresh token issued to the registered client never reaches the browser.
+    assert!(!page.contains("refresh-1") && !page.contains("refresh-token"));
     // The result page uses the shared same-origin stylesheet and copy script.
     assert!(page.contains("href=\"/oauth/oauth.css\"") && page.contains("src=\"/oauth/page.js\""));
-    assert!(
-        page.contains("data-copy=\"access-token\"") && page.contains("data-copy=\"refresh-token\"")
-    );
+    assert!(page.contains("data-copy=\"access-token\""));
     let request = provider.last();
     // RFC 6749 section 3.2: the endpoint query component is retained.
     assert_eq!(request.path, "/token?tenant=pdf2md");
@@ -464,78 +464,66 @@ async fn implicit_login_uses_a_script_readable_state_cookie_and_issuer_page() {
 }
 
 #[tokio::test]
-async fn device_and_refresh_token_broker_relays_only_supported_grants() {
+async fn device_and_refresh_grants_are_not_brokered_over_http() {
     let provider = Provider::start().await;
-    let api = Api::start(&provider, &[GrantType::DeviceCode, GrantType::RefreshToken]).await;
+    let api = Api::start(
+        &provider,
+        &[
+            GrantType::AuthorizationCode,
+            GrantType::DeviceCode,
+            GrantType::RefreshToken,
+        ],
+    )
+    .await;
+    // The registered client's credentials are never applied to a device code
+    // or refresh token supplied by an HTTP caller.
     assert_eq!(
-        api.get("/oauth/login", None).await.status(),
+        api.post("/oauth/device", json!(null)).await.status(),
         StatusCode::NOT_FOUND
     );
-    let device: Value = api
-        .post("/oauth/device", json!(null))
-        .await
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(device["user_code"], "ab12cd");
+    let grant = "urn:ietf:params:oauth:grant-type:device_code";
+    for body in [
+        json!({"grant_type":grant,"device_code":"device-1"}),
+        json!({"grant_type":"refresh_token","refresh_token":"refresh-1"}),
+        json!({"grant_type":"client_credentials"}),
+    ] {
+        assert_eq!(
+            api.post("/oauth/token", body).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert!(provider.requests.lock().unwrap().is_empty());
+
+    // The same grants stay available to the trusted CLI and library.
+    let auth = provider.auth(
+        &[GrantType::DeviceCode, GrantType::RefreshToken],
+        None,
+        true,
+    );
+    let client = OAuthClient::new(&auth).unwrap().unwrap();
+    let device = client.device_authorization().await.unwrap();
+    assert_eq!(device.user_code, "ab12cd");
     assert_eq!(provider.last().form["resource"], AUDIENCE);
     assert_eq!(provider.last().form["scope"], "pdf2md:read pdf2md:write");
     // RFC 8628 identifies the client in the body alongside its authentication.
     assert_eq!(provider.last().form["client_id"], "pdf2md-web");
-
     provider
         .token_responses
         .lock()
         .unwrap()
         .push_back((400, json!({"error":"authorization_pending"})));
-    let grant = "urn:ietf:params:oauth:grant-type:device_code";
-    let pending = api
-        .post(
-            "/oauth/token",
-            json!({"grant_type":grant,"device_code":"device-1"}),
-        )
-        .await;
     assert_eq!(
-        code(pending).await,
-        (
-            StatusCode::BAD_REQUEST,
-            "oauth_authorization_pending".into()
-        )
+        client.poll_device("device-1").await.unwrap_err().code,
+        "oauth_authorization_pending"
     );
-    let tokens: Value = api
-        .post(
-            "/oauth/token",
-            json!({"grant_type":grant,"device_code":"device-1"}),
-        )
-        .await
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(tokens["access_token"], "access-1");
-    assert!(tokens.get("id_token").is_none());
+    let tokens = client.poll_device("device-1").await.unwrap();
+    assert_eq!(tokens.access_token, "access-1");
     assert_eq!(provider.last().form["grant_type"], grant);
-
-    let refreshed = api
-        .post(
-            "/oauth/token",
-            json!({"grant_type":"refresh_token","refresh_token":"refresh-1"}),
-        )
-        .await;
-    assert_eq!(refreshed.status(), StatusCode::OK);
+    let refreshed = client.refresh("refresh-1").await.unwrap();
+    assert_eq!(refreshed.refresh_token.as_deref(), Some("refresh-1"));
     assert_eq!(provider.last().form["grant_type"], "refresh_token");
     assert_eq!(provider.last().form["refresh_token"], "refresh-1");
-
-    for body in [
-        json!({"grant_type":"client_credentials"}),
-        json!({"grant_type":"password","username":"alice","password":"x"}),
-        json!({"grant_type":"authorization_code","code":"abc"}),
-        json!({"grant_type":"refresh_token","refresh_token":"r","device_code":"d"}),
-    ] {
-        assert_eq!(
-            api.post("/oauth/token", body).await.status(),
-            StatusCode::BAD_REQUEST
-        );
-    }
+    assert!(provider.last().authorization.unwrap().starts_with("Basic "));
 }
 
 #[tokio::test]

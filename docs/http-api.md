@@ -35,7 +35,6 @@ response fields. Main routes are:
 | `GET /v1/sources`, `POST /v1/sources/{id}/fetch` | List or fetch operator-published sources. |
 | `GET /v1/schedules`, `PUT /v1/schedules/{source_id}` | Inspect or enable/disable schedules for published sources. |
 | `GET /oauth/login`, `/oauth/callback`, `/oauth/implicit` | Optional browser sign-in (Authorization Code with PKCE, or Implicit) when `[auth.client]` enables it. |
-| `POST /oauth/device`, `POST /oauth/token` | Optional Device Authorization start, device-code polling and refresh-token exchange. |
 
 List responses contain `items` and `next_cursor`; the default page size is 100
 and the maximum is 1,000. Uploads return HTTP 201 with `observation` and

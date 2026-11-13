@@ -17,9 +17,11 @@ also request conversions, retry them, select pages, inspect history, and export
 verified bundles. The HTTP service provides isolated caller workspaces with
 `none_ro`, `none_rw`,
 and OIDC-backed `oauth2` modes, validated against providers such as Casdoor.
-An optional registered OAuth client obtains caller tokens with Authorization
-Code with PKCE, Implicit, Device Authorization, Refresh Token and Client
-Credentials grants; Resource Owner Password Credentials is not supported. See
+The service validates tokens and never issues, stores or refreshes them for
+HTTP callers. An optional registered OAuth client supports Authorization
+Code with PKCE and Implicit browser sign-in, and Device Authorization, Refresh
+Token and Client Credentials from the trusted CLI; Resource Owner Password
+Credentials is not supported. See
 [authentication](docs/authentication.md) and the [HTTP API](docs/http-api.md). An opt-in MCP endpoint exposes eight read-only retrieval and search tools;
 see [MCP tools](docs/mcp.md). There is no OCR. Runtime container image tags
 and publication evidence are documented in the

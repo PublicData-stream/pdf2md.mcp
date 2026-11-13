@@ -24,6 +24,11 @@ const MAX_ADDITIONAL_AUDIENCES: usize = 16;
 const CASDOOR_TOKEN_TYPE: &str = "access-token";
 const METADATA_TTL: Duration = Duration::from_secs(300);
 const KEY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// Tolerated clock difference, in seconds, for the not-yet-valid checks
+/// (`nbf` and `iat`). Providers issue whole-second timestamps, so a freshly
+/// issued token can appear to come from the future when clocks differ
+/// slightly. Expiry is never extended.
+const CLOCK_SKEW_SECS: i64 = 30;
 
 fn invalid() -> LoadError {
     LoadError::new(
@@ -203,6 +208,12 @@ pub(crate) fn valid_scope(scope: &str) -> bool {
         && scope
             .bytes()
             .all(|b| b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b))
+}
+impl OidcConfig {
+    /// Whether an access token issued for `resource` passes the audience check.
+    pub(crate) fn accepts_audience(&self, resource: &str) -> bool {
+        self.audience == resource || self.additional_audiences.iter().any(|v| v == resource)
+    }
 }
 impl AuthConfig {
     pub fn validate(&self) -> Result<()> {
@@ -546,8 +557,8 @@ impl Provider {
                         .any(|accepted| aud.contains(accepted))
             })
             || claims.exp.is_none_or(|exp| exp <= now)
-            || claims.nbf.is_some_and(|nbf| nbf > now)
-            || claims.iat.is_some_and(|iat| iat > now)
+            || claims.nbf.is_some_and(|nbf| nbf > now + CLOCK_SKEW_SECS)
+            || claims.iat.is_some_and(|iat| iat > now + CLOCK_SKEW_SECS)
             || claims
                 .iss
                 .as_ref()
@@ -696,8 +707,10 @@ impl Provider {
         }
         let key = DecodingKey::from_jwk(jwk).map_err(|_| invalid())?;
         let mut validation = Validation::new(Algorithm::RS256);
+        // Expiry is enforced without leeway. `validate_claims` checks `nbf`
+        // and `iat` with the bounded clock-skew tolerance.
         validation.leeway = 0;
-        validation.validate_nbf = true;
+        validation.validate_nbf = false;
         validation.set_issuer(&[self.config.issuer.as_str()]);
         let client_claim = match profile {
             TokenProfile::Rfc9068 => "client_id",

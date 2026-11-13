@@ -38,9 +38,11 @@ The opt-in Rust test `tests/live_casdoor.rs` checks:
 - Authorization Code with PKCE through `/oauth/login` and `/oauth/callback`,
   including the cookie-bound state and the RFC 9207 `iss` parameter.
 - Implicit through `/oauth/login?grant=implicit`.
-- Device Authorization through `/oauth/device` and `/oauth/token`, including
+- That the result page shows no refresh token, and that no HTTP route redeems
+  a device code or refresh token.
+- Device Authorization through the library client, including
   `authorization_pending` before a second user approves the code.
-- Refresh Token through `/oauth/token`, including rejection of a rotated
+- Refresh Token through the library client, including rejection of a rotated
   refresh token.
 - Client Credentials through the library client, as a separate workspace.
 - Both validators with the `casdoor` token profile, configured scopes,

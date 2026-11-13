@@ -1,12 +1,19 @@
 //! Registered OAuth 2.0 client for obtaining caller access tokens.
 //!
 //! The service remains a resource server: [`crate::auth`] validates every
-//! access token independently of how it was obtained. This optional client
-//! drives the provider's grants on behalf of callers: Authorization Code with
-//! PKCE (RFC 6749 section 4.1, RFC 7636), Implicit (section 4.2), Client
-//! Credentials (section 4.4), Device Authorization (RFC 8628), and Refresh
-//! Token (section 6). The Resource Owner Password Credentials grant is
-//! intentionally unsupported: the service never handles user passwords.
+//! access token independently of how it was obtained, and the provider alone
+//! issues, refreshes and revokes tokens. This optional client drives the
+//! provider's grants: Authorization Code with PKCE (RFC 6749 section 4.1,
+//! RFC 7636), Implicit (section 4.2), Client Credentials (section 4.4), Device
+//! Authorization (RFC 8628), and Refresh Token (section 6). The Resource Owner
+//! Password Credentials grant is intentionally unsupported: the service never
+//! handles user passwords.
+//!
+//! The HTTP service uses only the interactive browser grants. Grants that
+//! redeem a credential with the registered client's own authentication
+//! (device code, refresh token, client credentials) are available to the
+//! trusted CLI and library callers only, so the client's credentials are
+//! never lent to anonymous HTTP callers.
 use crate::{
     auth::{
         AuthConfig, AuthMode, MAX_RESPONSE, MAX_TOKEN, OidcConfig, OidcSecret, config_error,

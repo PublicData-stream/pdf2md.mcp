@@ -1,0 +1,96 @@
+/* Shared dark-only style for the OAuth browser pages. Same-origin only (CSP style-src 'self'). */
+:root {
+  /* GitHub Dark (Primer dark default) color range. */
+  color-scheme: dark;
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface-2: #0d1117;
+  --ink: #e6edf3;
+  --muted: #8d96a0;
+  --line: #30363d;
+  --accent: #4493f8;
+  --accent-emphasis: #1f6feb;
+  --btn-primary: #238636;
+  --btn-primary-hover: #2ea043;
+  --btn: #21262d;
+  --btn-hover: #30363d;
+  --btn-border: rgb(240 246 252 / 10%);
+  --ok: #3fb950;
+  --ok-bg: rgb(46 160 67 / 15%);
+  --warn: #d29922;
+  --warn-bg: rgb(187 128 9 / 15%);
+  --bad: #f85149;
+  --bad-bg: rgb(248 81 73 / 10%);
+  --info-bg: rgb(56 139 253 / 10%);
+  --radius: 12px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+  line-height: 1.5;
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 2.5rem 1rem; }
+a { color: var(--accent); }
+.brand { width: 100%; max-width: 640px; display: flex; align-items: center; gap: .6rem; margin-bottom: 1rem; color: var(--muted); font-size: .9rem; }
+.brand strong { color: var(--ink); font-size: 1.05rem; letter-spacing: -.01em; }
+.brand .mark { width: 1.6rem; height: 1.6rem; border-radius: 6px; background: var(--accent-emphasis); color: #ffffff; display: grid; place-items: center; font-weight: 700; font-size: .85rem; }
+main { width: 100%; max-width: 640px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 2rem; box-shadow: 0 8px 24px rgb(1 4 9 / 75%); }
+.flow { display: inline-block; margin: 0 0 1.25rem; padding: .2rem .65rem; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--line); color: var(--muted); font-size: .8rem; font-weight: 600; letter-spacing: .02em; }
+
+/* Status header: icon + title + message. data-state drives the colors. */
+.status { display: flex; gap: 1rem; align-items: flex-start; }
+.status h1 { margin: 0; font-size: 1.45rem; line-height: 1.25; }
+.status p { margin: .3rem 0 0; color: var(--muted); }
+.icon { flex: none; width: 2.5rem; height: 2.5rem; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 1.15rem; }
+[data-state="success"] .icon { background: var(--ok-bg); color: var(--ok); }
+[data-state="success"] .icon::before { content: "\2713"; }
+[data-state="error"] .icon { background: var(--bad-bg); color: var(--bad); }
+[data-state="error"] .icon::before { content: "!"; }
+[data-state="pending"] .icon { background: var(--info-bg); }
+[data-state="pending"] .icon::before { content: ""; width: 1.1rem; height: 1.1rem; border-radius: 50%; border: 2.5px solid var(--accent); border-right-color: transparent; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { [data-state="pending"] .icon::before { animation: none; } }
+
+/* Token details. */
+.details { display: grid; grid-template-columns: max-content 1fr; gap: .45rem 1.25rem; margin: 1.75rem 0 0; padding: 1rem 1.25rem; background: var(--surface-2); border-radius: 8px; font-size: .92rem; }
+.details dt { color: var(--muted); }
+.details dd { margin: 0; overflow-wrap: anywhere; }
+.chips { display: flex; flex-wrap: wrap; gap: .3rem; }
+.chip { padding: .05rem .5rem; border-radius: 4px; background: var(--surface); border: 1px solid var(--line); font-family: var(--mono); font-size: .82rem; }
+.none { color: var(--muted); font-style: italic; }
+
+.field { margin-top: 1.5rem; }
+.field-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: .4rem; }
+.field-head label { font-weight: 600; }
+.field-head small { color: var(--muted); font-weight: 400; margin-left: .35rem; }
+textarea { display: block; width: 100%; padding: .75rem; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); color: var(--ink); font: .82rem/1.45 var(--mono); resize: vertical; word-break: break-all; }
+textarea:focus, button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+button, .button { display: inline-flex; align-items: center; justify-content: center; gap: .35rem; padding: .5rem 1rem; border-radius: 6px; border: 1px solid var(--btn-border); background: var(--btn-primary); color: #ffffff; font: inherit; font-weight: 600; font-size: .9rem; text-decoration: none; cursor: pointer; }
+button:hover, .button:hover { background: var(--btn-primary-hover); }
+.button.secondary, button.secondary { background: var(--btn); border-color: var(--line); color: var(--ink); }
+.button.secondary:hover, button.secondary:hover { background: var(--btn-hover); border-color: #8b949e; }
+button.copy { padding: .2rem .7rem; font-size: .8rem; }
+button.copy[data-copied] { border-color: var(--btn-border); background: var(--btn-primary); color: #ffffff; }
+
+.note { margin: 1.5rem 0 0; padding: .8rem 1rem; border-left: 3px solid var(--warn); background: var(--warn-bg); border-radius: 0 8px 8px 0; font-size: .9rem; }
+.note strong { color: var(--warn); }
+.usage { margin-top: 1.5rem; font-size: .92rem; }
+.usage p { margin: 0 0 .4rem; color: var(--muted); }
+pre, code { font-family: var(--mono); font-size: .84rem; }
+pre { margin: 0; padding: .75rem 1rem; background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.error-code { margin-top: 1.5rem; display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1.25rem; font-size: .9rem; }
+.error-code dt { color: var(--muted); }
+.error-code dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+
+.actions { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--line); }
+footer { max-width: 640px; margin-top: 1rem; color: var(--muted); font-size: .8rem; text-align: center; }
+[hidden] { display: none !important; }
+
+@media (max-width: 520px) {
+  body { padding: 1rem .75rem; }
+  main { padding: 1.25rem; }
+  .details, .error-code { grid-template-columns: 1fr; gap: .1rem; }
+  .details dd, .error-code dd { margin-bottom: .5rem; }
+}

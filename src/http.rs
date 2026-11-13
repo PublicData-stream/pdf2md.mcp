@@ -102,6 +102,11 @@ pub fn router(service: Arc<CallerService>, cancel: CancellationToken) -> Router 
 
 #[derive(Debug)]
 struct ApiError(LoadError);
+
+/// Response extension marking an intentional HTML error page, which the
+/// response middleware must not replace with a JSON error body.
+#[derive(Clone, Copy)]
+struct BrowserPage;
 impl From<LoadError> for ApiError {
     fn from(value: LoadError) -> Self {
         Self(value)
@@ -171,6 +176,7 @@ async fn response_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     // Normalize framework-generated rejection responses as well as application errors.
     if response.status().is_client_error()
+        && response.extensions().get::<BrowserPage>().is_none()
         && !response
             .headers()
             .get(header::CONTENT_TYPE)

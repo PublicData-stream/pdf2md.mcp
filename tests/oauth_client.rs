@@ -362,6 +362,11 @@ async fn authorization_code_login_binds_state_pkce_issuer_and_browser_cookie() {
     let page = response.text().await.unwrap();
     assert!(page.contains("access-1") && page.contains("refresh-1"));
     assert!(!page.contains("ignored"), "ID tokens are not displayed");
+    // The result page uses the shared same-origin stylesheet and copy script.
+    assert!(page.contains("href=\"/oauth/oauth.css\"") && page.contains("src=\"/oauth/page.js\""));
+    assert!(
+        page.contains("data-copy=\"access-token\"") && page.contains("data-copy=\"refresh-token\"")
+    );
     let request = provider.last();
     // RFC 6749 section 3.2: the endpoint query component is retained.
     assert_eq!(request.path, "/token?tenant=pdf2md");
@@ -656,4 +661,80 @@ scopes = ["pdf2md:read"]
     )
     .unwrap();
     assert!(anonymous.validate().is_err());
+}
+
+#[tokio::test]
+async fn browser_navigation_errors_render_html_pages_while_api_errors_stay_json() {
+    let provider = Provider::start().await;
+    let api = Api::start(&provider, &[GrantType::AuthorizationCode]).await;
+    let html = |path: String, cookie: Option<String>| {
+        let mut request = api
+            .client
+            .get(format!("{}{path}", api.base))
+            .header("accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8");
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        request.send()
+    };
+
+    let response = html("/oauth/callback?code=abc&state=unknown".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(
+        response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("style-src 'self'")
+    );
+    let request_id = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let page = response.text().await.unwrap();
+    assert!(page.contains("Sign-in expired") && page.contains("oauth_state_mismatch"));
+    assert!(page.contains(&request_id), "the page shows the request ID");
+    assert!(page.contains("href=\"/oauth/login\""));
+
+    // Provider error descriptions stay hidden on the HTML page too.
+    let (query, set_cookie) = api.login("authorization_code").await;
+    let denied = format!(
+        "/oauth/callback?error=access_denied&error_description=secret+detail&state={}&iss={}",
+        query["state"], provider.issuer
+    );
+    let page = html(denied, Some(cookie_pair(&set_cookie)))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("Access denied") && page.contains("oauth_access_denied"));
+    assert!(!page.contains("secret detail"));
+
+    // A disabled browser grant is an HTML page for navigations as well.
+    let response = html("/oauth/login?grant=implicit".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let page = response.text().await.unwrap();
+    assert!(page.contains("oauth_grant_disabled") && page.contains("Implicit"));
+
+    // Shared assets carry their media types.
+    let css = api.get("/oauth/oauth.css", None).await;
+    assert_eq!(css.headers()["content-type"], "text/css; charset=utf-8");
+    assert!(css.text().await.unwrap().contains("color-scheme: dark"));
+    let script = api.get("/oauth/page.js", None).await;
+    assert_eq!(
+        script.headers()["content-type"],
+        "application/javascript; charset=utf-8"
+    );
+    assert!(script.text().await.unwrap().contains("clipboard"));
 }

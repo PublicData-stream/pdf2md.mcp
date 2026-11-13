@@ -96,21 +96,41 @@ The container HTTP smoke test is `python3 scripts/test-http.py IMAGE`; add
 `--minikube` for its disposable Kubernetes path. The real-provider Kubernetes
 harness is `python3 scripts/test-http-oidc.py IMAGE`. See the script prerequisites.
 
-The bundled API console and OAuth sign-in page use browser JavaScript, HTML,
-and CSS with two-space indentation and LF endings (`.editorconfig`). The API
-console's JavaScript lint rules are in `eslint.config.mjs`. Run the pinned development lint without installing runtime
+The bundled API console and OAuth sign-in page scripts are written in
+TypeScript (`src/http/docs.ts` and `src/http/oauth-page.ts`). TypeScript 7
+(the native `tsc`) emits `src/http/docs.js` and `src/http/oauth-page.js`, which
+the Rust service embeds and which are committed so that Rust builds need no
+Node.js. Edit the `.ts` sources and regenerate the JavaScript; do not edit the
+emitted files by hand. TypeScript, HTML, CSS, JSON, and hand-written JavaScript
+use two-space indentation and LF endings (`.editorconfig`); the emitted
+JavaScript keeps the compiler's four-space indentation.
+
+Oxlint enforces the web style with `.oxlintrc.json` and the local
+`pdf2md-mcp` plugin in `oxlint-plugin.mjs`: single-quoted strings, no optional
+semicolons, and PascalCase names for variables, functions, parameters, and
+type members in TypeScript. Names fixed by an external format, such as
+OpenAPI fields, are exempted with a scoped `oxlint-disable` comment that
+states the reason. TypeScript files also get type-aware rules through
+`oxlint-tsgolint`; the lint fails on warnings. `tsconfig.json` sets the
+strict compiler options.
+
+Run the pinned lint, type check, and emitted-file comparison without installing
 Node dependencies into the repository:
 
 ```sh
-scripts/lint-console.sh
+scripts/check-web.sh
 ```
 
 The helper uses Node.js 26.13.1 or newer and npm to bootstrap the exact pnpm
-version in `package.json`. It copies the lint inputs into a disposable workspace
-under `/tmp`, installs the committed lockfile with `--frozen-lockfile`, and
-removes that workspace after success or failure. Package stores and caches also
-stay under `/tmp`; no repository `node_modules` is created. The Rust service
-embeds the console assets; Node and pnpm are development tools only.
+version in `package.json`. It copies the web inputs into a disposable workspace
+under `/tmp`, installs the committed lockfile with `--frozen-lockfile`, runs
+`pnpm run lint`, `pnpm run typecheck`, and `pnpm run build`, and fails when the
+committed JavaScript differs from the emitted output. It removes that
+workspace after success or failure. Package stores and caches also stay under
+`/tmp`; no repository `node_modules` is created. To regenerate the JavaScript
+after editing a source, install the development dependencies with
+`pnpm install --frozen-lockfile` and run `pnpm run build`; `node_modules` is
+ignored by Git. Node and pnpm are development tools only.
 
 ### CI coverage and reproduction
 
@@ -119,7 +139,7 @@ embeds the console assets; Node and pnpm are development tools only.
 `CI summary` covering every selected job group. Selecting that summary in
 repository protection settings is a separate operator action.
 
-Each push and pull request runs workflow/pin checks, API-console lint, Rust
+Each push and pull request runs workflow/pin checks, web lint and type checks, Rust
 formatting and workspace Clippy, core PostgreSQL tests, an isolated destructive
 conversion migration, worker unit tests, browser integration, full Casdoor
 acceptance, Docker CLI/conversion/HTTP/MCP tests, and separate

@@ -2,13 +2,19 @@
 set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-workspace=$(mktemp -d /tmp/pdf2md-console-lint.XXXXXXXX)
+workspace=$(mktemp -d /tmp/pdf2md-web-check.XXXXXXXX)
 trap 'rm -rf -- "$workspace"' EXIT
+
+# TypeScript sources and the JavaScript the service embeds from them.
+sources=(docs oauth-page)
 
 mkdir -p "$workspace/project/src/http" "$workspace/tmp"
 cp -- "$repo_root/package.json" "$repo_root/pnpm-lock.yaml" \
-  "$repo_root/eslint.config.mjs" "$workspace/project/"
-cp -- "$repo_root/src/http/docs.js" "$workspace/project/src/http/"
+  "$repo_root/.oxlintrc.json" "$repo_root/oxlint-plugin.mjs" \
+  "$repo_root/tsconfig.json" "$workspace/project/"
+for source in "${sources[@]}"; do
+  cp -- "$repo_root/src/http/$source.ts" "$workspace/project/src/http/"
+done
 
 export TMPDIR="$workspace/tmp"
 export XDG_CACHE_HOME="$workspace/cache"
@@ -29,6 +35,20 @@ package_manager=$(node --input-type=module -e '
   process.stdout.write(value);
 ')
 
-npm exec --yes --package="$package_manager" -- pnpm install \
-  --frozen-lockfile --store-dir "$workspace/store"
-npm exec --yes --package="$package_manager" -- pnpm run lint
+pnpm() {
+  npm exec --yes --package="$package_manager" -- pnpm "$@"
+}
+
+pnpm install --frozen-lockfile --store-dir "$workspace/store"
+pnpm run lint
+pnpm run typecheck
+pnpm run build
+
+stale=0
+for source in "${sources[@]}"; do
+  if ! cmp -s -- "src/http/$source.js" "$repo_root/src/http/$source.js"; then
+    echo "src/http/$source.js does not match src/http/$source.ts; run pnpm run build." >&2
+    stale=1
+  fi
+done
+exit "$stale"

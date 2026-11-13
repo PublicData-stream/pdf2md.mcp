@@ -72,7 +72,9 @@ curl --fail-with-body -X PUT -H 'Content-Type: application/json' \
 ```
 
 For OAuth add `Authorization: Bearer ACCESS_TOKEN`; keep tokens out of shell
-history, logs, and shared configuration. API callers cannot select workspace
+history, logs, and shared configuration. With `[auth.oidc.dpop]`, DPoP-bound
+tokens use `Authorization: DPoP ACCESS_TOKEN` and a `DPoP` proof header; see
+[DPoP-bound access tokens](authentication.md#dpop-bound-access-tokens). API callers cannot select workspace
 paths, configure worker processes, or submit source definitions.
 
 ## Published sources and schedules

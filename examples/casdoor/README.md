@@ -17,7 +17,7 @@ SQLite state, console logging and unprivileged LDAP/RADIUS ports. All generated
 provider storage, certificates, synthetic credentials, and token fixtures live
 under `/tmp`.
 
-The harness loads one organization, two synthetic users and three Agent
+The harness loads one organization, two synthetic users and four Agent
 applications with the `pdf2md:read`, `pdf2md:write` and `pdf2md:operate`
 custom scopes from a Casdoor
 [init data file](https://casdoor.ai/docs/deployment/data-initialization/):
@@ -26,7 +26,8 @@ custom scopes from a Casdoor
 | --- | --- | --- |
 | `pdf2md-web` | Authorization Code, Refresh Token, Device Authorization | Introspection client and registered client of the service |
 | `pdf2md-short` | Authorization Code | 72-second access tokens for the JWT expiry check |
-| `pdf2md-machine` | Client Credentials | Application identity |
+| `pdf2md-machine` | Client Credentials | Application identity, also with a DPoP-bound token |
+| `pdf2md-assertion` | Client Credentials | `private_key_jwt` client and introspection client |
 
 Casdoor's sign-in page is a browser application. The harness and the Rust test
 call the same JSON sign-in API that page uses, with the parameters of the
@@ -44,6 +45,12 @@ The opt-in Rust test `tests/live_casdoor.rs` checks:
 - Refresh Token through the library client, including rejection of a rotated
   refresh token.
 - Client Credentials through the library client, as a separate workspace.
+- `private_key_jwt`: Client Credentials and introspection authenticated with a
+  signed assertion instead of a shared secret.
+- DPoP: a token that Casdoor bound to a key is accepted over HTTP with a fresh
+  proof from that key, and refused as a Bearer token, without a proof, with a
+  replayed proof, with another key's proof and with a proof made for another
+  token.
 - Both validators with the `casdoor` token profile, configured scopes,
   private-workspace history and PDF access, rejection of ID and refresh
   tokens, immediate revocation through introspection, and JWT expiry. Local JWT
@@ -70,12 +77,36 @@ Client Credentials tokens to the client ID instead; list those dedicated
 client IDs in `additional_audiences`. Register clients explicitly;
 this integration does not depend on Dynamic Client Registration.
 
+### Signed client assertions and DPoP
+
+For `private_key_jwt`, the harness generates an RSA key and a self-signed
+certificate with OpenSSL and registers the certificate as the client
+certificate of `pdf2md-assertion`. See
+[Client authentication with a signed assertion](../../docs/authentication.md#client-authentication-with-a-signed-assertion)
+for the service configuration. Casdoor 4.27.1 has these particulars:
+
+- The assertion's `iss` must be a registered redirect URI of the application,
+  so the test sets `issuer` to the registered callback URL.
+- Casdoor's JWKS lists every certificate of type `x509`, and Casdoor replaces a
+  certificate stored without a private key by a generated key pair. The
+  harness therefore stores the client certificate under the `Payment` type
+  with a placeholder instead of the private key, and fails when the provider's
+  JWKS lists the client key. The private key stays with the client.
+
+For DPoP, the test requests a Client Credentials token with a proof for
+Casdoor's token endpoint. Casdoor reports the bound key only through
+introspection, so the test validates with `validation = "introspection"` and
+`[auth.oidc.dpop]`; see
+[DPoP-bound access tokens](../../docs/authentication.md#dpop-bound-access-tokens).
+
 References:
 
 - [Casdoor OAuth 2.0 endpoints and grant types](https://casdoor.ai/docs/how-to-connect/oauth/)
 - [Casdoor tokens](https://casdoor.ai/docs/token/overview/)
 - [Casdoor custom scopes](https://casdoor.ai/docs/application/scopes/)
 - [OAuth token introspection](https://www.rfc-editor.org/rfc/rfc7662.html)
+- [JWT client authentication](https://www.rfc-editor.org/rfc/rfc7523.html)
+- [DPoP](https://www.rfc-editor.org/rfc/rfc9449.html)
 - [Resource indicators](https://www.rfc-editor.org/rfc/rfc8707.html)
 
 Passing this harness establishes local provider and library-boundary evidence.

@@ -1,7 +1,9 @@
 # Authentication foundations
 
 The HTTP service uses the caller authorization boundary and accepts bearer
-access tokens in OAuth2 mode. It is an OAuth resource server: the identity
+access tokens in OAuth2 mode, and optionally
+[DPoP-bound access tokens](#dpop-bound-access-tokens). It is an OAuth resource
+server: the identity
 provider issues, refreshes and revokes tokens, clients store them, and this
 service only validates the access token on each request. It never issues,
 stores or refreshes tokens for HTTP callers. An optional registered OAuth
@@ -63,7 +65,9 @@ write_scope = "pdf2md:write"
 operate_scope = "pdf2md:operate"
 ```
 
-Introspection authenticates with `client_secret_basic`. Select
+Introspection authenticates with `client_secret_basic`, or with a
+[signed assertion](#client-authentication-with-a-signed-assertion) when
+`client_assertion` replaces `client_secret`. Select
 `validation = "jwt"` to verify RS256 access tokens locally with the provider's
 JWKS; JWT mode does not need introspection credentials. Validators are selected
 explicitly, without fallback. Introspection checks every operation without
@@ -78,7 +82,9 @@ In OAuth2 mode, API responses to requests that carried Bearer credentials
 follow [RFC 6750 section 3.1](https://www.rfc-editor.org/rfc/rfc6750#section-3.1):
 HTTP 401 sends `WWW-Authenticate: Bearer error="invalid_token"` and HTTP 403
 sends `Bearer error="insufficient_scope"`. Requests without credentials
-receive the bare `Bearer` challenge.
+receive the bare `Bearer` challenge. With DPoP configured, responses also
+carry a `DPoP` challenge; see
+[DPoP-bound access tokens](#dpop-bound-access-tokens).
 
 ### Token profiles
 
@@ -165,6 +171,124 @@ unknown key IDs can trigger one refresh per 30 seconds. TLS verification stays
 enabled. Auth configuration is validated even for operator commands; only the
 `oauth` commands contact the provider.
 
+### Client authentication with a signed assertion
+
+A confidential client can authenticate to the provider with a signed assertion
+(`private_key_jwt`, [RFC 7523 section 2.2](https://www.rfc-editor.org/rfc/rfc7523#section-2.2))
+instead of a shared secret. The provider then stores only the public key, as
+[RFC 9700 section 2.5](https://www.rfc-editor.org/rfc/rfc9700#section-2.5)
+recommends. `client_assertion` is available for introspection in `[auth.oidc]`
+and for the registered client in `[auth.client]`; in each place it replaces
+`client_secret`, and configuring both is rejected.
+
+```toml
+[auth.oidc]
+validation = "introspection"
+client_id = "pdf2md-introspection"
+
+[auth.oidc.client_assertion]
+key = { file = "introspection-key.pem" }
+algorithm = "ES256"
+key_id = "2026-01"
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `key` | Runtime reference (`env` or `file`) to the PEM private key in PKCS#8 form. RSA keys may also use PKCS#1. |
+| `algorithm` | `RS256`, `PS256`, `ES256`, `ES384` or `EdDSA`. The key must fit it; a mismatch is rejected at startup. |
+| `key_id` | Optional `kid` header that names the key at the provider. |
+| `issuer` | Optional `iss` claim. It defaults to the client ID, as RFC 7523 requires; set it only for a provider that expects another value. |
+
+Every provider request signs a fresh assertion: `iss` and `sub` are the client
+ID, `aud` is the provider's token endpoint URL from its metadata, `jti` is
+random and the assertion expires after 60 seconds. It is sent as
+`client_assertion` with the `jwt-bearer` assertion type and `client_id` in the
+request body. Rotate the key by registering the new public key at the provider
+before changing the configuration.
+
+Casdoor 4.27.1 differs from RFC 7523 in three ways:
+
+- It accepts an assertion only when `iss` is one of the application's redirect
+  URIs. Set `issuer` to a registered redirect URI.
+- It verifies RSA (`RS256`) and ECDSA (`ES256`, `ES384`) assertions with the
+  certificate selected as the application's client certificate. `PS256` and
+  `EdDSA` assertions are rejected.
+- Its JWKS lists every stored certificate of type `x509`. With
+  `validation = "jwt"` this service trusts every key in that JWKS, so the
+  holder of a client key listed there could sign tokens that pass local
+  validation. Keep the client certificate out of the JWKS, as the
+  [live harness](../examples/casdoor/README.md#signed-client-assertions-and-dpop)
+  does, or use `validation = "introspection"`.
+
+### DPoP-bound access tokens
+
+A bearer token works for whoever holds it. A sender-constrained token is bound
+to a key of the client, and each request proves possession of that key, so a
+copied token is of no use on its own.
+[RFC 9700 section 2.2.1](https://www.rfc-editor.org/rfc/rfc9700#section-2.2.1)
+recommends such tokens. This service validates tokens bound with DPoP
+([RFC 9449](https://www.rfc-editor.org/rfc/rfc9449)) when `[auth.oidc.dpop]`
+is present:
+
+```toml
+[auth.oidc.dpop]
+public_url = "https://pdf.example.com"
+required = false
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `public_url` | URL under which callers reach this service: HTTPS, or loopback HTTP for development. A path prefix is allowed. A proof's `htu` must equal this URL followed by the request path. It is never taken from `Host` or forwarded headers, so a proof made for another host is not accepted. |
+| `required` | `false` (default) also accepts unbound bearer tokens. `true` refuses every token that is not DPoP-bound and drops the `Bearer` challenge. |
+
+A client obtains a bound token by sending a DPoP proof with its token request
+to the provider. It then calls this service with
+`Authorization: DPoP ACCESS_TOKEN` and a `DPoP` header holding a fresh proof
+for that request. The service checks, in this order:
+
+1. The proof: `typ` `dpop+jwt`; an `alg` of `ES256`, `ES384`, `EdDSA`, `PS256`
+   or `RS256`; a public `jwk` that fits the algorithm (RSA keys need at least
+   2048 bits) and verifies the signature; `htm` and `htu` matching the request
+   without query and fragment; `iat` at most 60 seconds old, with 30 seconds of
+   clock tolerance; a `jti`; and `ath`, the hash of the presented access token.
+2. The access token, with the configured validator, exactly as for a bearer
+   token.
+3. The binding: the token's `cnf.jkt` confirmation must equal the RFC 7638
+   thumbprint of the proof key.
+4. Replay: a proof is accepted once. Proofs are remembered in process memory
+   until they expire (up to 65,536, the oldest dropped first), so run one
+   replica, or keep clients on one replica, when replay detection across
+   replicas matters. The 60-second window bounds reuse elsewhere.
+
+A DPoP-bound token presented with the `Bearer` scheme is refused, whether or
+not `[auth.oidc.dpop]` is configured, and so is an unbound token presented
+with the `DPoP` scheme. Without `[auth.oidc.dpop]`, bound tokens are refused
+altogether instead of being treated as bearer tokens. Proof nonces
+(RFC 9449 section 9) are not issued.
+
+Failures use `auth_invalid` (HTTP 401) for the token and binding and
+`auth_dpop_invalid` (HTTP 401) for a missing, malformed, mismatched or replayed
+proof. Responses carry one `WWW-Authenticate` field per accepted scheme
+([RFC 9449 section 7.1](https://www.rfc-editor.org/rfc/rfc9449#section-7.1)):
+`Bearer` unless `required` is set, and `DPoP algs="ES256 ES384 EdDSA PS256 RS256"`.
+The scheme the request used carries the error: `invalid_token`,
+`invalid_dpop_proof` or, with HTTP 403, `insufficient_scope`.
+
+The binding reaches this service in the token's `cnf.jkt` claim with
+`validation = "jwt"`, or in the introspection response
+([RFC 9449 section 6](https://www.rfc-editor.org/rfc/rfc9449#section-6)).
+Casdoor 4.27.1 binds tokens when the token request carries a proof, but its
+JWTs carry no `cnf` claim; only its introspection response reports the
+binding. `token_profile = "casdoor"` therefore requires
+`validation = "introspection"` for DPoP, and configuration rejects the JWT
+validator in that combination.
+
+The registered client in `[auth.client]` does not request DPoP-bound tokens:
+it hands the access token to the person who signed in or to the CLI caller,
+who would not hold the proof key. Mutual-TLS-bound tokens
+([RFC 8705](https://www.rfc-editor.org/rfc/rfc8705)) are not supported; see
+[Standards conformance](#standards-conformance).
+
 ## Obtaining access tokens
 
 API and MCP clients normally obtain tokens from the provider with their own
@@ -209,7 +333,11 @@ redirect_base_url = "https://pdf.example.com"
 `[auth.client]` requires `mode = "oauth2"` and uses the `[auth.oidc]` issuer,
 trust anchors and endpoint-origin rules. Omit `client_secret` for a public
 client, which then sends `client_id` in each request; Client Credentials
-requires a secret. The secret is sent with `client_secret_basic`. Every request
+requires a credential. The secret is sent with `client_secret_basic`. To
+authenticate with a signed assertion instead, replace `client_secret` with
+`[auth.client.client_assertion]`; see
+[Client authentication with a signed assertion](#client-authentication-with-a-signed-assertion).
+Every request
 carries `resource`, which defaults to `[auth.oidc] audience`. Authorization
 Code requires `redirect_base_url`, the public HTTPS origin of this service
 (loopback HTTP is allowed for development). Register
@@ -272,7 +400,9 @@ Use a separate configuration with a dedicated machine client for Client
 Credentials, and add that client ID to `additional_audiences` when the
 provider does not bind its tokens to the resource. Obtained tokens are ordinary
 bearer credentials: they are validated on every request exactly like tokens
-from any other client.
+from any other client. With `[auth.oidc.dpop] required = true` they are
+refused like any other unbound token, so leave `required` unset while people
+sign in through `[auth.client]`.
 
 ### Standards conformance
 
@@ -293,8 +423,8 @@ Current Practice):
   without `S256`. When the provider does not publish that field, a public
   client is refused as well, because PKCE is its only protection for the
   authorization code; a confidential client may sign in, since it
-  authenticates the code exchange and binds the response to the browser with
-  `state`. Casdoor publishes `S256`.
+  authenticates the code exchange, with a secret or a signed assertion, and
+  binds the response to the browser with `state`. Casdoor publishes `S256`.
 - Cross-site request forgery and code injection: the single-use `state` is
   bound to the browser with a cookie, and the code is bound to the request
   with PKCE.
@@ -310,14 +440,23 @@ Current Practice):
   requires. Sign-in pages load no third-party content and send
   `Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
 
-Two recommendations of RFC 9700 are optional and are not implemented:
+- Sender-constrained access tokens (RFC 9700 section 2.2.1): optional
+  validation of [DPoP-bound access tokens](#dpop-bound-access-tokens). Without
+  it, access tokens are bearer tokens; keep their lifetime short at the
+  provider.
+- Client authentication (RFC 9700 section 2.5): a confidential client can use
+  the recommended asymmetric method, `private_key_jwt`; see
+  [Client authentication with a signed assertion](#client-authentication-with-a-signed-assertion).
+  `client_secret_basic` remains available.
 
-- Sender-constrained access tokens
-  ([RFC 9449](https://www.rfc-editor.org/rfc/rfc9449) DPoP or
-  [RFC 8705](https://www.rfc-editor.org/rfc/rfc8705) mutual TLS). Access
-  tokens are bearer tokens; keep their lifetime short at the provider.
-- Asymmetric client authentication (`private_key_jwt` or mutual TLS). A
-  confidential client authenticates with `client_secret_basic`.
+One optional mechanism of RFC 9700 is not implemented: mutual TLS
+([RFC 8705](https://www.rfc-editor.org/rfc/rfc8705)), for client
+authentication and for certificate-bound access tokens. Casdoor 4.27.1 does
+not offer it, and this service runs behind a TLS-terminating proxy, where it
+would have to trust a forwarded client certificate. Use DPoP and
+`private_key_jwt` for the same recommendations. The registered client does not
+request DPoP-bound tokens for itself, as explained under
+[DPoP-bound access tokens](#dpop-bound-access-tokens).
 
 The remaining requirements of RFC 9700 apply to the authorization server:
 exact redirect URI matching, single-use authorization codes, enforcing PKCE
@@ -331,7 +470,10 @@ development only.
 
 Construct one `CallerService` per host with a data root, `Config`, and the
 resolved optional PostgreSQL URL. `execute` takes the raw access-token value
-(without `Bearer `), a typed `Operation`, and a cancellation token.
+(without `Bearer `), a typed `Operation`, and a cancellation token. Methods
+that take a token also accept `Credentials::dpop(token, &key)`, where `key` is
+the result of `CallerService::verify_dpop` for the request's DPoP proof,
+method and path.
 
 `execute` remains the synchronous compatibility API. Typed methods add streaming
 upload sessions, durable job submissions, job/schedule controls, conversion
@@ -344,8 +486,9 @@ PDF stream. Streams retain their workspace handle until dropped. Documents
 must appear in the selected workspace's accepted history; a known digest does
 not grant access to another user's objects. No filesystem path is returned.
 
-`auth_invalid`, `auth_forbidden`, and `auth_unavailable` distinguish credential,
-permission, and provider failures without exposing tokens or provider bodies.
+`auth_invalid`, `auth_dpop_invalid`, `auth_forbidden`, and `auth_unavailable`
+distinguish credential, DPoP proof, permission, and provider failures without
+exposing tokens or provider bodies.
 `service_busy` reports exhausted acquisition capacity or active workspace
 handles. Acquisition admission uses the existing aggregate concurrency setting.
 The store cache holds at most 32 workspaces, evicting idle handles only. This is
@@ -407,13 +550,16 @@ Core auth, service, and workspace tests run with the documented
 and disposable TLS providers. PostgreSQL tests additionally require
 `PDF2MD_TEST_POSTGRES_URL` pointing to PostgreSQL 18 or newer.
 
-Registered-client grants run against a synthetic TLS provider in
-`tests/oauth_client.rs` as part of the core suite.
+Registered-client grants and `private_key_jwt` client authentication run
+against a synthetic TLS provider in `tests/oauth_client.rs` as part of the core
+suite. DPoP proof validation, token binding, replay detection and the HTTP and
+MCP challenges are covered by `src/dpop.rs` and `tests/auth.rs`.
 
 Live Casdoor checks use a disposable provider with two synthetic users and
 registered test clients. They exercise all four supported grants through the
 registered client (Authorization Code over HTTP, the others through the library
-client), both validators, permissions, isolation, revocation,
+client), both validators, `private_key_jwt` client authentication,
+DPoP-bound tokens, permissions, isolation, revocation,
 expiry, and durable job recovery against the library and HTTP boundaries.
 These checks alone do not establish MCP client or Kubernetes deployment
 acceptance. Run `python3 scripts/test-casdoor.py`; see

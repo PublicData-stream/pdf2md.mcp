@@ -21,7 +21,9 @@ The service validates tokens and never issues, stores or refreshes them for
 HTTP callers. An optional registered OAuth client supports browser sign-in
 with Authorization Code and PKCE, and Device Authorization, Refresh Token and
 Client Credentials from the trusted CLI; the Implicit and Resource Owner
-Password Credentials grants are not supported. See
+Password Credentials grants are not supported. Optionally it accepts
+DPoP-bound access tokens and authenticates to the provider with
+`private_key_jwt`. See
 [authentication](docs/authentication.md) and the [HTTP API](docs/http-api.md). An opt-in MCP endpoint exposes eight read-only retrieval and search tools;
 see [MCP tools](docs/mcp.md). There is no OCR. Runtime container image tags
 and publication evidence are documented in the

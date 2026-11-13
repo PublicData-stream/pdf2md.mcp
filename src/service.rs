@@ -1,6 +1,6 @@
 //! Transport-independent, workspace-scoped caller boundary.
 use crate::{
-    auth::{AuthMode, Authenticator, Identity},
+    auth::{AuthMode, Authenticator, Credentials, Identity},
     config::{Config, Mode, Source, Step},
     conversion::{ConversionAttempt, ConversionManifest, ConversionOptions},
     error::{LoadError, Result, io_error},
@@ -263,6 +263,16 @@ impl CallerService {
     pub fn config(&self) -> &Config {
         &self.config
     }
+    /// Verify a request's DPoP proof; see [`Authenticator::verify_dpop`].
+    pub fn verify_dpop(
+        &self,
+        proof: &str,
+        method: &str,
+        path: &str,
+        access_token: &str,
+    ) -> Result<crate::dpop::ProvenKey> {
+        self.auth.verify_dpop(proof, method, path, access_token)
+    }
     /// The registered OAuth client, when `[auth.client]` is configured.
     pub fn oauth_client(&self) -> Option<Arc<crate::oauth::OAuthClient>> {
         self.oauth.clone()
@@ -324,13 +334,17 @@ impl CallerService {
         Ok(store)
     }
     /// Bearer values are revalidated for each caller operation, before resolving a workspace.
-    pub async fn authorize(
+    pub async fn authorize<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         write: bool,
         operate: bool,
     ) -> Result<AuthorizedWorkspace> {
-        let identity = self.auth.authorize(token, write, operate).await?;
+        let token: Credentials<'c> = token.into();
+        let identity = self
+            .auth
+            .authorize_credentials(token, write, operate)
+            .await?;
         let path = match identity {
             Identity::Shared => {
                 self.registry
@@ -347,72 +361,78 @@ impl CallerService {
             store: self.store(path).await?,
         })
     }
-    pub async fn history_page(
+    pub async fn history_page<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         source: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Observation>> {
+        let token: Credentials<'c> = token.into();
         self.authorize(token, false, false)
             .await?
             .store
             .history_page(source, limit, offset)
             .await
     }
-    pub async fn status_page(
+    pub async fn status_page<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Observation>> {
+        let token: Credentials<'c> = token.into();
         self.authorize(token, false, false)
             .await?
             .store
             .status_page(limit, offset)
             .await
     }
-    pub async fn jobs_page(
+    pub async fn jobs_page<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Job>> {
+        let token: Credentials<'c> = token.into();
         self.authorize(token, false, false)
             .await?
             .store
             .jobs_page(limit, offset)
             .await
     }
-    pub async fn conversion_history_page(
+    pub async fn conversion_history_page<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         document: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ConversionAttempt>> {
+        let token: Credentials<'c> = token.into();
         self.authorize(token, false, false)
             .await?
             .store
             .conversion_history_page(document, limit, offset)
             .await
     }
-    pub async fn history(
+    pub async fn history<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         source: Option<&str>,
     ) -> Result<Vec<Observation>> {
+        let token: Credentials<'c> = token.into();
         self.authorize(token, false, false)
             .await?
             .store
             .history(source)
             .await
     }
-    pub async fn conversion_history(
+    pub async fn conversion_history<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         document: Option<&str>,
     ) -> Result<Vec<ConversionAttempt>> {
+        let token: Credentials<'c> = token.into();
         let workspace = self.authorize(token, false, false).await?;
         Store::read_conversion_history(
             workspace.store.root(),
@@ -421,7 +441,12 @@ impl CallerService {
         )
         .await
     }
-    pub async fn read_pdf(&self, token: Option<&str>, document_id: &str) -> Result<PdfStream> {
+    pub async fn read_pdf<'c>(
+        &self,
+        token: impl Into<Credentials<'c>>,
+        document_id: &str,
+    ) -> Result<PdfStream> {
+        let token: Credentials<'c> = token.into();
         let workspace = self.authorize(token, false, false).await?;
         let permit = self
             .downloads
@@ -437,22 +462,24 @@ impl CallerService {
             _permit: permit,
         })
     }
-    pub async fn conversion_manifest(
+    pub async fn conversion_manifest<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         conversion_id: &str,
     ) -> Result<ConversionManifest> {
+        let token: Credentials<'c> = token.into();
         self.authorize(token, false, false)
             .await?
             .store
             .verified_conversion_manifest(conversion_id)
             .await
     }
-    pub async fn read_bundle(
+    pub async fn read_bundle<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         conversion_id: &str,
     ) -> Result<CallerBundle> {
+        let token: Credentials<'c> = token.into();
         let workspace = self.authorize(token, false, false).await?;
         let permit = self
             .downloads
@@ -468,12 +495,13 @@ impl CallerService {
             }),
         })
     }
-    pub async fn read_artifact(
+    pub async fn read_artifact<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         conversion_id: &str,
         path: &str,
     ) -> Result<BundleArtifactStream> {
+        let token: Credentials<'c> = token.into();
         let bundle = self.read_bundle(token, conversion_id).await?;
         let index = bundle
             .manifest()
@@ -483,7 +511,11 @@ impl CallerService {
             .ok_or_else(|| LoadError::new("conversion_not_found", "artifact unavailable"))?;
         bundle.read_artifact(index).await
     }
-    pub async fn prepare_upload(&self, token: Option<&str>) -> Result<UploadSession> {
+    pub async fn prepare_upload<'c>(
+        &self,
+        token: impl Into<Credentials<'c>>,
+    ) -> Result<UploadSession> {
+        let token: Credentials<'c> = token.into();
         let workspace = self.authorize(token, true, false).await?;
         let permit = self
             .acquisitions
@@ -565,24 +597,26 @@ impl CallerService {
             conversion_job,
         })
     }
-    pub async fn submit_acquisition(
+    pub async fn submit_acquisition<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         url: String,
         key: Option<&str>,
     ) -> Result<Job> {
+        let token: Credentials<'c> = token.into();
         let workspace = self.authorize(token, true, false).await?;
         let source = Source::one_off(url.clone(), Mode::Https);
         crate::policy::NetworkPolicy::for_source(&source)?;
         self.enqueue(&workspace.store, JobCommand::AcquireHttps { url }, key)
             .await
     }
-    pub async fn submit_source(
+    pub async fn submit_source<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         source_id: &str,
         key: Option<&str>,
     ) -> Result<Job> {
+        let token: Credentials<'c> = token.into();
         let workspace = self.authorize(token, true, true).await?;
         let definition = self
             .definitions
@@ -598,14 +632,15 @@ impl CallerService {
         )
         .await
     }
-    pub async fn submit_conversion(
+    pub async fn submit_conversion<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         document_id: &str,
         pages: Option<&str>,
         force: bool,
         key: Option<&str>,
     ) -> Result<Job> {
+        let token: Credentials<'c> = token.into();
         let workspace = self.authorize(token, true, false).await?;
         let options = pages
             .map(ConversionOptions::parse_pages)
@@ -720,26 +755,29 @@ impl CallerService {
         }
         Ok(total)
     }
-    pub async fn jobs(&self, token: Option<&str>) -> Result<Vec<Job>> {
+    pub async fn jobs<'c>(&self, token: impl Into<Credentials<'c>>) -> Result<Vec<Job>> {
+        let token: Credentials<'c> = token.into();
         self.authorize(token, false, false)
             .await?
             .store
             .jobs()
             .await
     }
-    pub async fn get_job(&self, token: Option<&str>, id: &str) -> Result<Job> {
+    pub async fn get_job<'c>(&self, token: impl Into<Credentials<'c>>, id: &str) -> Result<Job> {
+        let token: Credentials<'c> = token.into();
         self.authorize(token, false, false)
             .await?
             .store
             .job(id)
             .await
     }
-    pub async fn cancel_job(&self, token: Option<&str>, id: &str) -> Result<Job> {
+    pub async fn cancel_job<'c>(&self, token: impl Into<Credentials<'c>>, id: &str) -> Result<Job> {
+        let token: Credentials<'c> = token.into();
         let workspace = self.authorize(token, true, false).await?;
         let store = &workspace.store;
         let current = store.job(id).await?;
         if matches!(current.command, JobCommand::FetchSource { .. }) {
-            self.auth.authorize(token, true, true).await?;
+            self.auth.authorize_credentials(token, true, true).await?;
         }
         if let Some(running) = self
             .running
@@ -754,7 +792,13 @@ impl CallerService {
         self.wake.notify_one();
         Ok(job)
     }
-    pub async fn retry_job(&self, token: Option<&str>, id: &str, key: Option<&str>) -> Result<Job> {
+    pub async fn retry_job<'c>(
+        &self,
+        token: impl Into<Credentials<'c>>,
+        id: &str,
+        key: Option<&str>,
+    ) -> Result<Job> {
+        let token: Credentials<'c> = token.into();
         let workspace = self.authorize(token, true, false).await?;
         let job = workspace.store.job(id).await?;
         if !matches!(job.status.as_str(), "failed" | "cancelled" | "interrupted") {
@@ -765,7 +809,7 @@ impl CallerService {
         }
         let command = match job.command {
             JobCommand::FetchSource { source_id, .. } => {
-                self.auth.authorize(token, true, true).await?;
+                self.auth.authorize_credentials(token, true, true).await?;
                 let definition = self
                     .definitions
                     .get(&source_id)
@@ -789,7 +833,11 @@ impl CallerService {
         self.enqueue_internal(&workspace.store, command, key, Some(id))
             .await
     }
-    pub async fn sources(&self, token: Option<&str>) -> Result<Vec<PublishedSource>> {
+    pub async fn sources<'c>(
+        &self,
+        token: impl Into<Credentials<'c>>,
+    ) -> Result<Vec<PublishedSource>> {
+        let token: Credentials<'c> = token.into();
         self.authorize(token, false, false).await?;
         let mut definitions: Vec<_> = self
             .definitions
@@ -803,19 +851,21 @@ impl CallerService {
         definitions.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(definitions)
     }
-    pub async fn schedules(&self, token: Option<&str>) -> Result<Vec<Schedule>> {
+    pub async fn schedules<'c>(&self, token: impl Into<Credentials<'c>>) -> Result<Vec<Schedule>> {
+        let token: Credentials<'c> = token.into();
         self.authorize(token, false, false)
             .await?
             .store
             .schedules()
             .await
     }
-    pub async fn set_schedule(
+    pub async fn set_schedule<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         source_id: &str,
         enabled: bool,
     ) -> Result<Schedule> {
+        let token: Credentials<'c> = token.into();
         let workspace = self.authorize(token, true, true).await?;
         let definition = self
             .definitions
@@ -842,12 +892,13 @@ impl CallerService {
             .ok_or_else(source_unavailable)
     }
     /// Compatibility calls retain their original synchronous acquisition behavior.
-    pub async fn execute(
+    pub async fn execute<'c>(
         &self,
-        token: Option<&str>,
+        token: impl Into<Credentials<'c>>,
         operation: Operation,
         cancel: &CancellationToken,
     ) -> Result<Response> {
+        let token: Credentials<'c> = token.into();
         let write = matches!(operation, Operation::AcquireHttps { .. });
         let workspace = self.authorize(token, write, false).await?;
         if cancel.is_cancelled() {

@@ -224,6 +224,7 @@ impl Provider {
                 operate_scope: "pdf2md:operate".into(),
                 allowed_endpoint_origins: vec![],
                 ca_file: Some(self.ca.clone()),
+                dpop: None,
             }),
             client: Some(OAuthClientConfig {
                 client_id: "pdf2md-web".into(),

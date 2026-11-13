@@ -4,6 +4,7 @@
 //! registered client lives in [`crate::oauth`]; this module never issues tokens.
 use crate::{
     client_auth::{ClientAssertionConfig, ClientAuth},
+    dpop::{DpopConfig, ProvenKey, Verifier},
     error::{LoadError, Result},
 };
 use futures_util::StreamExt;
@@ -134,6 +135,9 @@ pub struct OidcConfig {
     #[serde(default)]
     pub allowed_endpoint_origins: Vec<String>,
     pub ca_file: Option<PathBuf>,
+    /// Accept DPoP-bound access tokens (RFC 9449).
+    #[serde(default)]
+    pub dpop: Option<DpopConfig>,
 }
 
 /// Runtime secret reference. The value is never included in Debug or errors.
@@ -285,10 +289,47 @@ impl AuthConfig {
                 assertion.validate()?;
             }
         }
+        if let Some(dpop) = &oidc.dpop {
+            dpop.validate()?;
+            // Casdoor reports the key binding only through introspection; its
+            // JWTs carry no `cnf` claim, so local validation could never
+            // confirm a binding.
+            if oidc.token_profile == TokenProfile::Casdoor
+                && oidc.validation == TokenValidation::Jwt
+            {
+                return Err(config_error());
+            }
+        }
         if let Some(client) = &self.client {
             client.validate(oidc)?;
         }
         Ok(())
+    }
+}
+
+/// Access-token credentials as one request presented them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Credentials<'a> {
+    token: Option<&'a str>,
+    dpop: Option<&'a ProvenKey>,
+}
+impl<'a> Credentials<'a> {
+    /// A token presented with the Bearer scheme, or no token.
+    pub fn bearer(token: Option<&'a str>) -> Self {
+        Self { token, dpop: None }
+    }
+    /// A token presented with the DPoP scheme, together with the key that
+    /// signed the request's verified proof.
+    pub fn dpop(token: &'a str, key: &'a ProvenKey) -> Self {
+        Self {
+            token: Some(token),
+            dpop: Some(key),
+        }
+    }
+}
+impl<'a> From<Option<&'a str>> for Credentials<'a> {
+    fn from(token: Option<&'a str>) -> Self {
+        Self::bearer(token)
     }
 }
 
@@ -310,6 +351,7 @@ struct Provider {
     client: reqwest::Client,
     /// Introspection client authentication; unused for JWT validation.
     auth: ClientAuth,
+    dpop: Option<Verifier>,
     metadata: Mutex<Option<Metadata>>,
     keys: Mutex<KeyCache>,
 }
@@ -341,10 +383,12 @@ impl Authenticator {
             } else {
                 ClientAuth::Public
             };
+            let dpop = oidc.dpop.as_ref().map(Verifier::new).transpose()?;
             Some(Provider {
                 config: oidc,
                 client,
                 auth,
+                dpop,
                 metadata: Mutex::new(None),
                 keys: Mutex::new(KeyCache::default()),
             })
@@ -357,18 +401,50 @@ impl Authenticator {
         })
     }
 
+    /// Verify the DPoP proof sent with a request (RFC 9449 section 4.3):
+    /// its signature, HTTP method, target URI, age and access-token hash.
+    /// `path` is the request path without query. The returned key is then
+    /// passed to [`Credentials::dpop`], and authorization checks that the
+    /// access token is bound to it and that the proof was not used before.
+    pub fn verify_dpop(
+        &self,
+        proof: &str,
+        method: &str,
+        path: &str,
+        access_token: &str,
+    ) -> Result<ProvenKey> {
+        self.provider
+            .as_ref()
+            .and_then(|provider| provider.dpop.as_ref())
+            .ok_or_else(invalid)?
+            .verify(proof, method, path, access_token)
+    }
+
     /// `token` contains only the access-token value, without a Bearer prefix.
     pub async fn authenticate(&self, token: Option<&str>, write: bool) -> Result<Identity> {
         self.authorize(token, write, false).await
     }
 
-    /// Validate current read/write permissions and optional operator-source grant.
+    /// Validate current read/write permissions and optional operator-source
+    /// grant for a token presented with the Bearer scheme.
     pub async fn authorize(
         &self,
         token: Option<&str>,
         write: bool,
         operate: bool,
     ) -> Result<Identity> {
+        self.authorize_credentials(Credentials::bearer(token), write, operate)
+            .await
+    }
+
+    /// Validate permissions for credentials presented with either scheme.
+    pub async fn authorize_credentials(
+        &self,
+        credentials: Credentials<'_>,
+        write: bool,
+        operate: bool,
+    ) -> Result<Identity> {
+        let token = credentials.token;
         match self.mode {
             AuthMode::NoneRo if write || operate => Err(forbidden()),
             AuthMode::NoneRo | AuthMode::NoneRw => Ok(Identity::Shared),
@@ -387,6 +463,7 @@ impl Authenticator {
                     TokenValidation::Introspection => provider.introspect(token).await?,
                     TokenValidation::Jwt => provider.jwt(token).await?,
                 };
+                provider.confirm_key(&claims, credentials.dpop)?;
                 let scopes: Vec<_> = claims
                     .scope
                     .as_deref()
@@ -425,9 +502,15 @@ struct Claims {
     jti: Option<String>,
     client_id: Option<String>,
     azp: Option<String>,
+    /// RFC 7800 confirmation; `jkt` binds the token to a DPoP key.
+    cnf: Option<Confirmation>,
     /// Casdoor's token-class claim.
     #[serde(rename = "tokenType")]
     casdoor_token_type: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct Confirmation {
+    jkt: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -579,6 +662,22 @@ impl Provider {
         }
         Ok(())
     }
+    /// Enforce the sender constraint (RFC 9449 section 7). A DPoP-bound token
+    /// is accepted only with the DPoP scheme and a fresh proof from the bound
+    /// key, and never as a Bearer token. An unbound token is accepted only as
+    /// a Bearer token, unless binding is required.
+    fn confirm_key(&self, claims: &Claims, proven: Option<&ProvenKey>) -> Result<()> {
+        let bound = claims.cnf.as_ref().and_then(|cnf| cnf.jkt.as_deref());
+        match (proven, bound, &self.dpop) {
+            (Some(proven), Some(bound), Some(verifier)) if proven.thumbprint() == bound => {
+                verifier.record(proven)
+            }
+            (None, None, _) if !self.config.dpop.as_ref().is_some_and(|dpop| dpop.required) => {
+                Ok(())
+            }
+            _ => Err(invalid()),
+        }
+    }
     async fn introspect(&self, token: &str) -> Result<Claims> {
         if self
             .config
@@ -638,9 +737,16 @@ impl Provider {
             .map_err(|_| unavailable())?;
         let claims: Claims = decode_response(response).await?;
         // An RFC 7662 type hint does not prove token class. Require a Bearer
-        // type, or an explicit issuer-documented prefix when type is omitted.
+        // type, a DPoP type that names its key, or an explicit
+        // issuer-documented prefix when type is omitted.
+        let bound = claims
+            .cnf
+            .as_ref()
+            .is_some_and(|cnf| cnf.jkt.as_ref().is_some_and(|jkt| !jkt.is_empty()));
         let access_type = match claims.token_type.as_deref() {
-            Some(kind) => kind.eq_ignore_ascii_case("bearer"),
+            Some(kind) => {
+                kind.eq_ignore_ascii_case("bearer") || (kind.eq_ignore_ascii_case("dpop") && bound)
+            }
             None => self.config.access_token_prefix.is_some(),
         };
         if !claims.active

@@ -4,6 +4,7 @@ pub mod client_auth;
 pub mod config;
 pub mod conversion;
 pub mod direct;
+pub mod dpop;
 pub mod error;
 pub mod http;
 pub mod jobs;

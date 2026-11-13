@@ -4,6 +4,7 @@ use std::{borrow::Cow, path::PathBuf, sync::Arc};
 use crate::{
     auth::{AuthConfig, AuthMode},
     error::{LoadError, Result},
+    http::caller::{self, Presented, Scheme},
     service::CallerService,
 };
 use axum::{
@@ -193,13 +194,13 @@ async fn metadata(State(state): State<HttpState>) -> Response {
         .oidc
         .as_ref()
         .expect("validated OAuth configuration");
-    (
-        [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
-        Json(
-            json!({"resource":config.mcp.resource_url, "authorization_servers":[oidc.issuer], "scopes_supported":[oidc.read_scope], "bearer_methods_supported":["header"]}),
-        ),
-    )
-        .into_response()
+    let mut document = json!({"resource":config.mcp.resource_url, "authorization_servers":[oidc.issuer], "scopes_supported":[oidc.read_scope], "bearer_methods_supported":["header"]});
+    // RFC 9728 section 2: advertise DPoP support and whether it is mandatory.
+    if let Some(dpop) = &oidc.dpop {
+        document["dpop_signing_alg_values_supported"] = json!(crate::dpop::SIGNING_ALGORITHMS);
+        document["dpop_bound_access_tokens_required"] = json!(dpop.required);
+    }
+    ([(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")], Json(document)).into_response()
 }
 async fn metadata_preflight() -> Response {
     (
@@ -213,7 +214,7 @@ async fn metadata_preflight() -> Response {
     )
         .into_response()
 }
-async fn guard(State(state): State<HttpState>, request: Request, next: Next) -> Response {
+async fn guard(State(state): State<HttpState>, mut request: Request, next: Next) -> Response {
     let headers = request.headers();
     let origins = headers.get_all(header::ORIGIN);
     if origins.iter().count() > 1
@@ -231,22 +232,40 @@ async fn guard(State(state): State<HttpState>, request: Request, next: Next) -> 
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    // RFC 6750 section 3.1: name an error only when credentials were sent.
-    let presented = headers.contains_key(header::AUTHORIZATION);
-    let token = match bearer(headers, state.service.config().auth.mode) {
-        Ok(v) => v,
-        Err(()) => return challenge(&state, StatusCode::UNAUTHORIZED, presented),
+    // RFC 6750 section 3.1: name an error only for the scheme that was used.
+    let scheme = caller::scheme(headers);
+    let reject = |error: LoadError| match error.code.as_str() {
+        "auth_invalid" => challenge(&state, StatusCode::UNAUTHORIZED, scheme, false),
+        "auth_dpop_invalid" => challenge(&state, StatusCode::UNAUTHORIZED, scheme, true),
+        "auth_forbidden" => challenge(&state, StatusCode::FORBIDDEN, scheme, false),
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    if let Err(error) = state.service.authorize(token, false, false).await {
-        return match error.code.as_str() {
-            "auth_invalid" => challenge(&state, StatusCode::UNAUTHORIZED, presented),
-            "auth_forbidden" => challenge(&state, StatusCode::FORBIDDEN, presented),
-            _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
+    let presented = match Presented::read(
+        &state.service,
+        request.method(),
+        request.uri().path(),
+        headers,
+    ) {
+        Ok(presented) => presented,
+        Err(error) => return reject(error),
+    };
+    if let Err(error) = state
+        .service
+        .authorize(presented.credentials(), false, false)
+        .await
+    {
+        return reject(error);
     }
+    // Tool calls reuse the verified credentials: a DPoP proof is single use.
+    request.extensions_mut().insert(presented);
     next.run(request).await
 }
-fn challenge(state: &HttpState, status: StatusCode, presented: bool) -> Response {
+fn challenge(
+    state: &HttpState,
+    status: StatusCode,
+    presented: Option<Scheme>,
+    proof: bool,
+) -> Response {
     let mut response = status.into_response();
     let resource = state
         .service
@@ -274,39 +293,13 @@ fn challenge(state: &HttpState, status: StatusCode, presented: bool) -> Response
         .as_ref()
         .expect("validated OAuth configuration")
         .read_scope;
-    let reason = if status == StatusCode::FORBIDDEN {
-        ", error=\"insufficient_scope\""
-    } else if presented {
-        ", error=\"invalid_token\""
-    } else {
-        ""
-    };
-    if let Ok(value) =
-        format!("Bearer resource_metadata=\"{metadata}\", scope=\"{scope}\"{reason}").parse()
-    {
+    let parameters = format!("resource_metadata=\"{metadata}\", scope=\"{scope}\"");
+    for value in caller::challenges(&state.service, status, presented, proof, &parameters) {
         response
             .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, value);
+            .append(header::WWW_AUTHENTICATE, value);
     }
     response
-}
-fn bearer(
-    headers: &axum::http::HeaderMap,
-    mode: AuthMode,
-) -> std::result::Result<Option<&str>, ()> {
-    if mode != AuthMode::Oauth2 {
-        return Ok(None);
-    }
-    let mut values = headers.get_all(header::AUTHORIZATION).iter();
-    let value = values.next().ok_or(())?.to_str().map_err(|_| ())?;
-    if values.next().is_some() {
-        return Err(());
-    }
-    let mut parts = value.split_ascii_whitespace();
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(s), Some(v), None) if s.eq_ignore_ascii_case("bearer") => Ok(Some(v)),
-        _ => Err(()),
-    }
 }
 
 impl ServerHandler for Endpoint {
@@ -335,12 +328,14 @@ impl ServerHandler for Endpoint {
             .extensions
             .get::<axum::http::request::Parts>()
             .ok_or_else(|| ErrorData::internal_error("request context unavailable", None))?;
-        let token = bearer(&parts.headers, self.service.config().auth.mode)
-            .map_err(|_| ErrorData::internal_error("request credentials unavailable", None))?;
+        let presented = parts
+            .extensions
+            .get::<Presented>()
+            .ok_or_else(|| ErrorData::internal_error("request credentials unavailable", None))?;
         let args = Value::Object(request.arguments.unwrap_or_default());
         match self
             .service
-            .call_tool(token, &request.name, args, &context.ct)
+            .call_tool(presented.credentials(), &request.name, args, &context.ct)
             .await
         {
             Ok(output) => {

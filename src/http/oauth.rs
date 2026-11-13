@@ -343,6 +343,12 @@ fn error_text(code: &str) -> (&'static str, Option<&'static str>) {
                 "The authorization response did not come from the configured provider, so it was rejected.",
             ),
         ),
+        "oauth_pkce_unsupported" => (
+            "Provider not supported",
+            Some(
+                "The identity provider does not advertise PKCE with S256, so sign-in was not started. Ask the operator to enable it.",
+            ),
+        ),
         "oauth_access_denied" => (
             "Access denied",
             Some("Authorization was denied by you or the provider."),

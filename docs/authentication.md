@@ -220,7 +220,10 @@ registered.
 
 Browser sign-in:
 
-- `/oauth/login` redirects to the provider with a random `state` and an S256
+- `/oauth/login` first checks that the provider supports PKCE with S256 (see
+  [Standards conformance](#standards-conformance)) and answers 502
+  `oauth_pkce_unsupported` otherwise. It then redirects to the provider with a
+  random `state` and an S256
   PKCE challenge; the verifier stays in server memory for ten minutes. At most 8,192 sign-ins are pending at once; a newer sign-in replaces
   the oldest one when the table is full. The `state` is also bound to the
   browser with an `HttpOnly`, `SameSite=Lax` cookie, `Secure` for HTTPS.
@@ -246,9 +249,9 @@ Provider errors become fixed codes without provider descriptions:
 `oauth_authorization_pending`, `oauth_slow_down`, `oauth_access_denied`,
 `oauth_expired_token`, `oauth_invalid_grant`, `oauth_client_rejected`,
 `oauth_invalid_scope`, `oauth_invalid_target` or `oauth_error`. Sign-in errors
-use `oauth_state_mismatch`, `oauth_issuer_mismatch` and
-`oauth_grant_disabled`. Network and malformed-response failures use
-`auth_unavailable`.
+use `oauth_state_mismatch`, `oauth_issuer_mismatch`,
+`oauth_pkce_unsupported` and `oauth_grant_disabled`. Network and
+malformed-response failures use `auth_unavailable`.
 
 The CLI reads the same configuration and prints the token response as JSON on
 standard output: `access_token`, `token_type`, `expires_in`, `scope` and, when
@@ -270,6 +273,59 @@ Credentials, and add that client ID to `additional_audiences` when the
 provider does not bind its tokens to the resource. Obtained tokens are ordinary
 bearer credentials: they are validated on every request exactly like tokens
 from any other client.
+
+### Standards conformance
+
+The registered client and the token validator follow
+[RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) (PKCE) and the client and
+resource-server requirements of
+[RFC 9700](https://www.rfc-editor.org/rfc/rfc9700) (OAuth 2.0 Security Best
+Current Practice):
+
+- PKCE: every authorization request carries a fresh `code_verifier` of 32
+  random bytes, base64url-encoded to 43 characters, and its `S256` challenge.
+  The `plain` method is never sent and there is no fallback to it. The verifier
+  is kept in server memory, bound to the single-use `state`, and sent only to
+  the token endpoint. `OAuthClient::exchange_code` rejects a verifier that is
+  not 43 to 128 unreserved characters.
+- PKCE support detection: sign-in is refused with `oauth_pkce_unsupported`
+  when the provider's metadata lists `code_challenge_methods_supported`
+  without `S256`. When the provider does not publish that field, a public
+  client is refused as well, because PKCE is its only protection for the
+  authorization code; a confidential client may sign in, since it
+  authenticates the code exchange and binds the response to the browser with
+  `state`. Casdoor publishes `S256`.
+- Cross-site request forgery and code injection: the single-use `state` is
+  bound to the browser with a cookie, and the code is bound to the request
+  with PKCE.
+- Mix-up: the client talks to one configured issuer, reads its endpoints from
+  metadata whose `issuer` must match, and checks the RFC 9207 `iss` parameter.
+- Redirects: the redirect URI is fixed by configuration, and no route
+  redirects to a caller-supplied URL.
+- Grants: Implicit and Resource Owner Password Credentials are not
+  implemented.
+- Token handling: access tokens are accepted only in the `Authorization`
+  header, never in a query string or form body, and are not stored or logged.
+  Each token must name this service in `aud` and carry the scope the route
+  requires. Sign-in pages load no third-party content and send
+  `Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
+
+Two recommendations of RFC 9700 are optional and are not implemented:
+
+- Sender-constrained access tokens
+  ([RFC 9449](https://www.rfc-editor.org/rfc/rfc9449) DPoP or
+  [RFC 8705](https://www.rfc-editor.org/rfc/rfc8705) mutual TLS). Access
+  tokens are bearer tokens; keep their lifetime short at the provider.
+- Asymmetric client authentication (`private_key_jwt` or mutual TLS). A
+  confidential client authenticates with `client_secret_basic`.
+
+The remaining requirements of RFC 9700 apply to the authorization server:
+exact redirect URI matching, single-use authorization codes, enforcing PKCE
+once a challenge was sent, and refresh token rotation or sender constraint
+for public clients. Configure them at the provider. `additional_audiences`
+widens the accepted audience on the operator's assertion; see
+[Audiences](#audiences). Loopback HTTP for `redirect_base_url` is for
+development only.
 
 ## Library contract
 

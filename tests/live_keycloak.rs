@@ -1,4 +1,4 @@
-//! Opt-in real-provider acceptance. Run through scripts/test-casdoor.py.
+//! Opt-in real-provider acceptance. Run through scripts/test-keycloak.py.
 use pdf2md_mcp::{
     auth::{AuthConfig, Authenticator, Identity},
     config::Config,
@@ -19,9 +19,7 @@ fn auth_config(fixture: &Value, validation: &str, client: Option<Value>) -> Auth
         "mode": "oauth2",
         "oidc": {
             "issuer": fixture["issuer"], "audience": fixture["audience"],
-            "validation": validation, "token_profile": "casdoor",
-            // Casdoor binds Client Credentials tokens to the client ID.
-            "additional_audiences": [fixture["machine_client_id"]],
+            "validation": validation, "token_profile": "keycloak",
             "client_id": fixture["client_id"],
             "client_secret": {"file": fixture["secret_file"]},
             "ca_file": fixture["ca_file"]
@@ -68,11 +66,12 @@ async fn seed(root: &Path, issuer: &str, subject: &str, bytes: &[u8]) -> String 
 }
 
 #[tokio::test]
-#[ignore = "requires disposable real Casdoor; run scripts/test-casdoor.py"]
-async fn real_casdoor_tokens_enforce_scopes_isolation_revocation_and_expiry() {
-    let fixture_path = std::env::var("PDF2MD_LIVE_CASDOOR_FIXTURE").expect("live fixture required");
+#[ignore = "requires disposable real Keycloak; run scripts/test-keycloak.py"]
+async fn real_keycloak_tokens_enforce_scopes_isolation_revocation_and_expiry() {
+    let fixture_path =
+        std::env::var("PDF2MD_LIVE_KEYCLOAK_FIXTURE").expect("live fixture required");
     let fixture: Value = serde_json::from_slice(&std::fs::read(fixture_path).unwrap()).unwrap();
-    let phase = std::env::var("PDF2MD_LIVE_CASDOOR_PHASE").unwrap_or_default();
+    let phase = std::env::var("PDF2MD_LIVE_KEYCLOAK_PHASE").unwrap_or_default();
     let introspection = Authenticator::new(config(&fixture, "introspection").auth)
         .await
         .unwrap();
@@ -309,15 +308,15 @@ async fn response_json(response: reqwest::Response) -> Value {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable real Casdoor; run scripts/test-casdoor.py"]
+#[ignore = "requires disposable real Keycloak; run scripts/test-keycloak.py"]
 async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
     use reqwest::StatusCode;
     let fixture_path =
-        std::path::PathBuf::from(std::env::var("PDF2MD_LIVE_CASDOOR_FIXTURE").unwrap());
+        std::path::PathBuf::from(std::env::var("PDF2MD_LIVE_KEYCLOAK_FIXTURE").unwrap());
     let fixture: Value = serde_json::from_slice(&std::fs::read(&fixture_path).unwrap()).unwrap();
     let root = fixture_path.parent().unwrap().join("http-workspaces");
     let metadata = fixture_path.parent().unwrap().join("http-test-state.json");
-    let phase = std::env::var("PDF2MD_LIVE_CASDOOR_PHASE").unwrap_or_default();
+    let phase = std::env::var("PDF2MD_LIVE_KEYCLOAK_PHASE").unwrap_or_default();
     if phase == "expired" {
         let server = HttpServer::start(&root, &fixture, "jwt").await;
         assert_eq!(
@@ -548,52 +547,141 @@ async fn real_http_provider_tokens_isolate_and_resume_accepted_jobs() {
     server.stop().await;
 }
 
-/// Emulate Casdoor's sign-in page for an authorization URL produced by pdf2md.
-async fn casdoor_sign_in(fixture: &Value, location: &str, user: &str) -> String {
+/// Test-only automation of Keycloak's sign-in and consent pages: a cookie
+/// jar, redirects within the provider, and HTML form submission.
+struct ProviderBrowser {
+    client: reqwest::Client,
+    origin: url::Origin,
+    cookies: std::collections::BTreeMap<String, String>,
+}
+enum Step {
+    Page(url::Url, String),
+    /// A redirect that leaves the provider, for example to the client.
+    Left(url::Url),
+}
+impl ProviderBrowser {
+    fn new(fixture: &Value) -> Self {
+        let ca = std::fs::read(fixture["ca_file"].as_str().unwrap()).unwrap();
+        Self {
+            client: reqwest::Client::builder()
+                .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .build()
+                .unwrap(),
+            origin: url::Url::parse(fixture["issuer"].as_str().unwrap())
+                .unwrap()
+                .origin(),
+            cookies: Default::default(),
+        }
+    }
+    async fn browse(&mut self, mut url: url::Url, mut form: Option<Vec<(String, String)>>) -> Step {
+        for _ in 0..10 {
+            assert_eq!(url.origin(), self.origin, "left the provider unexpectedly");
+            let cookie = self
+                .cookies
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let request = match form.take() {
+                Some(fields) => self.client.post(url.clone()).form(&fields),
+                None => self.client.get(url.clone()),
+            };
+            let response = request.header("cookie", cookie).send().await.unwrap();
+            for value in response.headers().get_all("set-cookie") {
+                let pair = value.to_str().unwrap().split(';').next().unwrap();
+                if let Some((name, value)) = pair.split_once('=') {
+                    self.cookies.insert(name.trim().into(), value.into());
+                }
+            }
+            if response.status().is_redirection() {
+                let location = response.headers()["location"].to_str().unwrap();
+                url = url.join(location).unwrap();
+                if url.origin() != self.origin {
+                    return Step::Left(url);
+                }
+                continue;
+            }
+            assert_eq!(response.status(), reqwest::StatusCode::OK, "provider page");
+            return Step::Page(url, response.text().await.unwrap());
+        }
+        panic!("provider redirected too often");
+    }
+    /// Submit the sign-in form, and the consent form when the provider asks.
+    async fn sign_in(&mut self, mut step: Step, fixture: &Value, user: &str) -> Step {
+        let password = fixture["passwords"][user].as_str().unwrap();
+        for fields in [
+            vec![("username", user), ("password", password)],
+            vec![("accept", "Yes")],
+        ] {
+            let Step::Page(url, page) = &step else {
+                return step;
+            };
+            let (action, mut hidden) = html_form(page);
+            hidden.extend(fields.iter().map(|(k, v)| ((*k).into(), (*v).into())));
+            let action = url.join(&action).unwrap();
+            step = self.browse(action, Some(hidden)).await;
+        }
+        step
+    }
+}
+/// The action and hidden inputs of the first form of a provider page.
+fn html_form(page: &str) -> (String, Vec<(String, String)>) {
+    fn attribute(tag: &str, name: &str) -> Option<String> {
+        let start = tag.find(&format!(" {name}=\""))? + name.len() + 3;
+        let value = &tag[start..];
+        Some(value[..value.find('"')?].replace("&amp;", "&"))
+    }
+    let form = &page[page.find("<form").expect("provider form")..];
+    let action = attribute(&form[..form.find('>').unwrap()], "action").expect("form action");
+    let mut hidden = Vec::new();
+    for tag in form.split("<input").skip(1) {
+        let tag = &tag[..tag.find('>').unwrap()];
+        if attribute(tag, "type").as_deref() == Some("hidden")
+            && let Some(name) = attribute(tag, "name")
+        {
+            hidden.push((name, attribute(tag, "value").unwrap_or_default()));
+        }
+    }
+    (action, hidden)
+}
+/// Sign in at Keycloak for an authorization URL produced by pdf2md and return
+/// the authorization code from the redirect to the client.
+async fn keycloak_sign_in(fixture: &Value, location: &str, user: &str) -> String {
     let location = url::Url::parse(location).unwrap();
-    let query: std::collections::HashMap<String, String> =
-        location.query_pairs().into_owned().collect();
     assert!(
         location
             .as_str()
             .starts_with(fixture["issuer"].as_str().unwrap())
     );
-    assert_eq!(query["response_type"], "code");
-    let kind = "code";
-    let mut params = vec![
-        ("clientId", query["client_id"].clone()),
-        ("responseType", query["response_type"].clone()),
-        ("redirectUri", query["redirect_uri"].clone()),
-        ("type", kind.to_owned()),
-        ("scope", query["scope"].clone()),
-        ("state", query["state"].clone()),
-        ("nonce", "live-test".to_owned()),
-    ];
-    for name in ["code_challenge", "code_challenge_method", "resource"] {
-        if let Some(value) = query.get(name) {
-            params.push((name, value.clone()));
-        }
-    }
-    let response: Value = provider_client(fixture)
-        .post(
-            url::Url::parse_with_params(
-                &format!("{}/api/login", fixture["issuer"].as_str().unwrap()),
-                &params,
-            )
-            .unwrap(),
-        )
-        .json(&serde_json::json!({
-            "application": query["client_id"], "organization": fixture["organization"],
-            "username": user, "password": fixture["passwords"][user], "autoSignin": true, "type": kind,
-        }))
-        .send()
-        .await
+    let state = location
+        .query_pairs()
+        .find(|(k, _)| k == "state")
         .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(response["status"], "ok", "synthetic sign-in failed");
-    response["data"].as_str().unwrap().to_owned()
+        .1
+        .into_owned();
+    let mut browser = ProviderBrowser::new(fixture);
+    let step = browser.browse(location, None).await;
+    let Step::Left(redirect) = browser.sign_in(step, fixture, user).await else {
+        panic!("synthetic sign-in failed");
+    };
+    let query: std::collections::HashMap<String, String> =
+        redirect.query_pairs().into_owned().collect();
+    assert_eq!(query["state"], state);
+    assert_eq!(query["iss"], fixture["issuer"].as_str().unwrap());
+    query["code"].clone()
+}
+/// Approve a device code as a user through Keycloak's verification pages.
+async fn keycloak_approve_device(fixture: &Value, verification_uri: &str, user: &str) {
+    let mut browser = ProviderBrowser::new(fixture);
+    let step = browser
+        .browse(url::Url::parse(verification_uri).unwrap(), None)
+        .await;
+    let Step::Page(url, _) = browser.sign_in(step, fixture, user).await else {
+        panic!("device approval left the provider");
+    };
+    assert!(url.path().ends_with("/device/status"), "device approval");
 }
 fn provider_client(fixture: &Value) -> reqwest::Client {
     let ca = std::fs::read(fixture["ca_file"].as_str().unwrap()).unwrap();
@@ -620,13 +708,14 @@ async fn subject(fixture: &Value, bearer: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable real Casdoor; run scripts/test-casdoor.py"]
-async fn real_casdoor_grants_through_the_registered_client() {
+#[ignore = "requires disposable real Keycloak; run scripts/test-keycloak.py"]
+async fn real_keycloak_grants_through_the_registered_client() {
     use pdf2md_mcp::oauth::OAuthClient;
     use reqwest::StatusCode;
-    let fixture_path = std::env::var("PDF2MD_LIVE_CASDOOR_FIXTURE").expect("live fixture required");
+    let fixture_path =
+        std::env::var("PDF2MD_LIVE_KEYCLOAK_FIXTURE").expect("live fixture required");
     let fixture: Value = serde_json::from_slice(&std::fs::read(fixture_path).unwrap()).unwrap();
-    if !std::env::var("PDF2MD_LIVE_CASDOOR_PHASE")
+    if !std::env::var("PDF2MD_LIVE_KEYCLOAK_PHASE")
         .unwrap_or_default()
         .is_empty()
     {
@@ -637,7 +726,7 @@ async fn real_casdoor_grants_through_the_registered_client() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let client = serde_json::json!({
-        "client_id": fixture["client_id"], "client_secret": {"file": fixture["secret_file"]},
+        "client_id": fixture["web_client_id"], "client_secret": {"file": fixture["secret_file"]},
         "grant_types": ["authorization_code", "device_code", "refresh_token"],
         "scopes": ["pdf2md:read", "pdf2md:write"], "redirect_base_url": base,
     });
@@ -687,7 +776,7 @@ async fn real_casdoor_grants_through_the_registered_client() {
         .unwrap()
         .1
         .into_owned();
-    let code = casdoor_sign_in(&fixture, &location, "alice").await;
+    let code = keycloak_sign_in(&fixture, &location, "alice").await;
     let page = api
         .get(
             url::Url::parse_with_params(
@@ -762,20 +851,17 @@ async fn real_casdoor_grants_through_the_registered_client() {
             .code,
         "oauth_authorization_pending"
     );
-    let approved: Value = provider_client(&fixture)
-        .post(format!("{}/api/login", fixture["issuer"].as_str().unwrap()))
-        .bearer_auth(token(&fixture, "bob"))
-        .json(&serde_json::json!({
-            "application": fixture["client_id"], "organization": fixture["organization"],
-            "type": "device", "userCode": device.user_code,
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(approved["status"], "ok");
+    keycloak_approve_device(
+        &fixture,
+        device
+            .verification_uri_complete
+            .as_deref()
+            .expect("complete verification URI"),
+        "bob",
+    )
+    .await;
+    // Keycloak answers `slow_down` to a poll within the advertised interval.
+    tokio::time::sleep(std::time::Duration::from_secs(device.interval)).await;
     let device_access = registered
         .poll_device(&device.device_code)
         .await
@@ -787,10 +873,10 @@ async fn real_casdoor_grants_through_the_registered_client() {
         subject(&fixture, token(&fixture, "bob")).await
     );
 
-    // Refresh Token through the trusted client. Casdoor rotates refresh
-    // tokens by default.
+    // Refresh Token through the trusted client. The test realm revokes a
+    // refresh token once it has been used.
     let request = registered.authorization_request().await.unwrap();
-    let code = casdoor_sign_in(&fixture, request.url.as_str(), "alice").await;
+    let code = keycloak_sign_in(&fixture, request.url.as_str(), "alice").await;
     let code_refresh = registered
         .exchange_code(&code, &request.code_verifier)
         .await
@@ -850,8 +936,7 @@ fn assertion_auth_config(
         "mode": "oauth2",
         "oidc": {
             "issuer": fixture["issuer"], "audience": fixture["audience"],
-            "validation": validation, "token_profile": "casdoor",
-            "additional_audiences": [fixture["machine_client_id"], fixture["assertion_client_id"]],
+            "validation": validation, "token_profile": "keycloak",
             "client_id": fixture["assertion_client_id"],
             "client_assertion": assertion(fixture),
             "ca_file": fixture["ca_file"],
@@ -861,25 +946,24 @@ fn assertion_auth_config(
     }))
     .unwrap()
 }
-/// Casdoor 4.27.1 accepts an assertion whose issuer is a registered redirect
-/// URI of the application.
+/// RFC 7523 assertion: issuer and subject are the client ID.
 fn assertion(fixture: &Value) -> Value {
     serde_json::json!({
         "key": {"file": fixture["assertion_key_file"]},
         "algorithm": "RS256",
-        "issuer": fixture["assertion_issuer"],
     })
 }
 
 #[tokio::test]
-#[ignore = "requires disposable real Casdoor; run scripts/test-casdoor.py"]
-async fn real_casdoor_accepts_signed_client_assertions_and_binds_tokens_to_dpop_keys() {
+#[ignore = "requires disposable real Keycloak; run scripts/test-keycloak.py"]
+async fn real_keycloak_accepts_signed_client_assertions_and_binds_tokens_to_dpop_keys() {
     use dpop_proof::ProofKey;
-    use pdf2md_mcp::oauth::OAuthClient;
+    use pdf2md_mcp::{auth::Credentials, oauth::OAuthClient};
     use reqwest::StatusCode;
-    let fixture_path = std::env::var("PDF2MD_LIVE_CASDOOR_FIXTURE").expect("live fixture required");
+    let fixture_path =
+        std::env::var("PDF2MD_LIVE_KEYCLOAK_FIXTURE").expect("live fixture required");
     let fixture: Value = serde_json::from_slice(&std::fs::read(fixture_path).unwrap()).unwrap();
-    if !std::env::var("PDF2MD_LIVE_CASDOOR_PHASE")
+    if !std::env::var("PDF2MD_LIVE_KEYCLOAK_PHASE")
         .unwrap_or_default()
         .is_empty()
     {
@@ -963,12 +1047,9 @@ async fn real_casdoor_accepts_signed_client_assertions_and_binds_tokens_to_dpop_
     );
 
     // DPoP: the provider binds a token to the key that signed the token
-    // request's proof (RFC 9449 section 5).
+    // request's proof (RFC 9449 section 5). Introspection reports the binding.
     let key = ProofKey::es256();
-    let endpoint = format!(
-        "{}/api/login/oauth/access_token",
-        fixture["issuer"].as_str().unwrap()
-    );
+    let endpoint = fixture["token_endpoint"].as_str().unwrap().to_owned();
     let mut claims = ProofKey::claims("POST", &endpoint, "");
     claims.as_object_mut().unwrap().remove("ath");
     let secret = std::fs::read_to_string(fixture["secret_file"].as_str().unwrap()).unwrap();
@@ -1015,6 +1096,45 @@ async fn real_casdoor_accepts_signed_client_assertions_and_binds_tokens_to_dpop_
     assert_eq!(
         present("DPoP", Some(key.proof("GET", &history_url, bound))).await,
         StatusCode::OK
+    );
+    // Keycloak also writes the binding into the JWT (`cnf.jkt`), so local
+    // validation confirms it without the provider.
+    let local = Authenticator::new(assertion_auth_config(
+        &fixture,
+        "jwt",
+        Some(serde_json::json!({"public_url": base})),
+        None,
+    ))
+    .await
+    .unwrap();
+    let proven = local
+        .verify_dpop(
+            &key.proof("GET", &history_url, bound),
+            "GET",
+            "/v1/history",
+            bound,
+        )
+        .unwrap();
+    local
+        .authorize_credentials(Credentials::dpop(bound, &proven), true, false)
+        .await
+        .unwrap();
+    let stolen = ProofKey::es256();
+    let stolen = local
+        .verify_dpop(
+            &stolen.proof("GET", &history_url, bound),
+            "GET",
+            "/v1/history",
+            bound,
+        )
+        .unwrap();
+    assert_eq!(
+        local
+            .authorize_credentials(Credentials::dpop(bound, &stolen), false, false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
     );
     cancel.cancel();
     server.abort();

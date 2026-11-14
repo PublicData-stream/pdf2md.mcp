@@ -11,7 +11,7 @@ SHA = r"[0-9a-f]{40}"
 IMAGE = r"[^\s]+@sha256:[0-9a-f]{64}"
 REQUIRED = {"source", "core", "images", "e2e", "native-e2e", "kubernetes"}
 EXTENDED = {"extended-browser", "extended-oidc"}
-IMAGE_ENV = {"postgres": "PDF2MD_POSTGRES_IMAGE", "casdoor": "PDF2MD_CASDOOR_IMAGE",
+IMAGE_ENV = {"postgres": "PDF2MD_POSTGRES_IMAGE", "keycloak": "PDF2MD_KEYCLOAK_IMAGE",
              "buildkit": "PDF2MD_BUILDKIT_IMAGE", "minikube": "PDF2MD_MINIKUBE_BASE_IMAGE"}
 
 

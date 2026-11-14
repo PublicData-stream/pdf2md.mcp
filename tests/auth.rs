@@ -182,14 +182,19 @@ fn token(issuer: &str, kid: &str, update: impl FnOnce(&mut Value)) -> String {
     )
     .unwrap()
 }
-/// Casdoor-format access token: `typ` `JWT`, signed `tokenType`, and `azp`.
-fn casdoor_token(issuer: &str, kid: &str, update: impl FnOnce(&mut Value)) -> String {
+/// Keycloak claims: `typ` names the token class and `azp` the client.
+fn keycloak_claims(issuer: &str) -> Value {
     let mut claims = claims(issuer);
     let object = claims.as_object_mut().unwrap();
     object.remove("client_id");
     object.remove("token_type");
     object.insert("azp".into(), json!("pdf2md-test"));
-    object.insert("tokenType".into(), json!("access-token"));
+    object.insert("typ".into(), json!("Bearer"));
+    claims
+}
+/// Keycloak-format access token: header `typ` `JWT`, `typ` claim, `azp`.
+fn keycloak_token(issuer: &str, kid: &str, update: impl FnOnce(&mut Value)) -> String {
+    let mut claims = keycloak_claims(issuer);
     update(&mut claims);
     let mut header = Header::new(Algorithm::RS256);
     header.typ = Some("JWT".into());
@@ -1240,13 +1245,13 @@ async fn durable_jobs_are_private_and_global_capacity_covers_multiple_identities
 }
 
 #[tokio::test]
-async fn casdoor_jwt_profile_requires_signed_access_token_class_and_azp() {
+async fn keycloak_jwt_profile_requires_the_access_token_class_and_azp() {
     let mut fixture = Fixture::new(TokenValidation::Jwt).await;
-    fixture.config.oidc.as_mut().unwrap().token_profile = TokenProfile::Casdoor;
+    fixture.config.oidc.as_mut().unwrap().token_profile = TokenProfile::Keycloak;
     let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
     let issuer = fixture.issuer.clone();
     assert_eq!(
-        auth.authenticate(Some(&casdoor_token(&issuer, "first", |_| {})), true)
+        auth.authenticate(Some(&keycloak_token(&issuer, "first", |_| {})), true)
             .await
             .unwrap(),
         Identity::User {
@@ -1255,20 +1260,24 @@ async fn casdoor_jwt_profile_requires_signed_access_token_class_and_azp() {
         }
     );
     for token in [
-        // Casdoor refresh and ID tokens share the signing key and format.
-        casdoor_token(&issuer, "first", |c| {
-            c["tokenType"] = json!("refresh-token")
+        // Keycloak refresh and ID tokens share the issuer and header type.
+        keycloak_token(&issuer, "first", |c| c["typ"] = json!("Refresh")),
+        keycloak_token(&issuer, "first", |c| c["typ"] = json!("ID")),
+        keycloak_token(&issuer, "first", |c| c["typ"] = json!("bearer")),
+        keycloak_token(&issuer, "first", |c| {
+            c.as_object_mut().unwrap().remove("typ");
         }),
-        casdoor_token(&issuer, "first", |c| c["tokenType"] = json!("id-token")),
-        casdoor_token(&issuer, "first", |c| {
-            c.as_object_mut().unwrap().remove("tokenType");
-        }),
-        casdoor_token(&issuer, "first", |c| {
+        // A DPoP class without a key confirmation cannot be bound.
+        keycloak_token(&issuer, "first", |c| c["typ"] = json!("DPoP")),
+        keycloak_token(&issuer, "first", |c| {
             c.as_object_mut().unwrap().remove("azp");
         }),
-        casdoor_token(&issuer, "first", |c| c["aud"] = json!(["pdf2md-test"])),
-        // The RFC 9068 header type is not part of the Casdoor profile.
-        token(&issuer, "first", |c| c["tokenType"] = json!("access-token")),
+        keycloak_token(&issuer, "first", |c| c["aud"] = json!(["pdf2md-test"])),
+        // The RFC 9068 header type is not part of the Keycloak profile.
+        token(&issuer, "first", |c| {
+            c["typ"] = json!("Bearer");
+            c["azp"] = json!("pdf2md-test");
+        }),
     ] {
         assert_eq!(
             auth.authenticate(Some(&token), false)
@@ -1278,12 +1287,62 @@ async fn casdoor_jwt_profile_requires_signed_access_token_class_and_azp() {
             "auth_invalid"
         );
     }
-    // The default RFC 9068 profile rejects Casdoor's generic JWT type.
+    // The default RFC 9068 profile rejects Keycloak's generic JWT type.
     fixture.config.oidc.as_mut().unwrap().token_profile = TokenProfile::Rfc9068;
     let strict = Authenticator::new(fixture.config.clone()).await.unwrap();
     assert_eq!(
         strict
-            .authenticate(Some(&casdoor_token(&issuer, "first", |_| {})), false)
+            .authenticate(Some(&keycloak_token(&issuer, "first", |_| {})), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+}
+
+#[tokio::test]
+async fn keycloak_jwt_profile_confirms_dpop_bound_tokens_locally() {
+    use pdf2md_mcp::auth::Credentials;
+    let mut fixture = Fixture::new(TokenValidation::Jwt).await;
+    fixture.config.oidc.as_mut().unwrap().token_profile = TokenProfile::Keycloak;
+    let auth = Authenticator::new(with_dpop(&fixture, "https://pdf.example.com", false))
+        .await
+        .unwrap();
+    let key = ProofKey::es256();
+    // Keycloak marks a key-bound token with the DPoP class and `cnf.jkt`.
+    let bound = keycloak_token(&fixture.issuer, "first", |c| {
+        c["typ"] = json!("DPoP");
+        c["cnf"] = json!({"jkt":key.thumbprint()});
+    });
+    let proven = auth
+        .verify_dpop(
+            &key.proof("GET", DPOP_URL, &bound),
+            "GET",
+            "/v1/history",
+            &bound,
+        )
+        .unwrap();
+    auth.authorize_credentials(Credentials::dpop(&bound, &proven), true, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        auth.authenticate(Some(&bound), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    let other = ProofKey::es256();
+    let stolen = auth
+        .verify_dpop(
+            &other.proof("GET", DPOP_URL, &bound),
+            "GET",
+            "/v1/history",
+            &bound,
+        )
+        .unwrap();
+    assert_eq!(
+        auth.authorize_credentials(Credentials::dpop(&bound, &stolen), false, false)
             .await
             .unwrap_err()
             .code,
@@ -1296,10 +1355,10 @@ async fn additional_audiences_accept_client_bound_grants_in_both_validators() {
     let mut fixture = Fixture::new(TokenValidation::Jwt).await;
     let issuer = fixture.issuer.clone();
     let oidc = fixture.config.oidc.as_mut().unwrap();
-    oidc.token_profile = TokenProfile::Casdoor;
-    let machine = casdoor_token(&issuer, "first", |c| {
+    oidc.token_profile = TokenProfile::Keycloak;
+    let machine = keycloak_token(&issuer, "first", |c| {
         c["aud"] = json!(["pdf2md-machine"]);
-        c["sub"] = json!("admin/pdf2md-machine");
+        c["sub"] = json!("service-account-pdf2md-machine");
     });
     let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
     assert!(auth.authenticate(Some(&machine), false).await.is_err());
@@ -1309,10 +1368,10 @@ async fn additional_audiences_accept_client_bound_grants_in_both_validators() {
         auth.authenticate(Some(&machine), false).await.unwrap(),
         Identity::User {
             issuer: issuer.clone(),
-            subject: "admin/pdf2md-machine".into()
+            subject: "service-account-pdf2md-machine".into()
         }
     );
-    let other = casdoor_token(&issuer, "first", |c| c["aud"] = json!(["other-client"]));
+    let other = keycloak_token(&issuer, "first", |c| c["aud"] = json!(["other-client"]));
     assert!(auth.authenticate(Some(&other), false).await.is_err());
 
     let mut introspection = Fixture::new(TokenValidation::Introspection).await;
@@ -1340,45 +1399,74 @@ async fn additional_audiences_accept_client_bound_grants_in_both_validators() {
 }
 
 #[tokio::test]
-async fn casdoor_introspection_rejects_refresh_tokens_before_and_after_provider_lookup() {
+async fn certificate_bound_tokens_are_refused_in_both_validators() {
+    // RFC 8705 binds a token to the client's TLS certificate. This service
+    // cannot see that certificate, so such a token is never a bearer token.
+    let mut fixture = Fixture::new(TokenValidation::Jwt).await;
+    fixture.config.oidc.as_mut().unwrap().token_profile = TokenProfile::Keycloak;
+    let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
+    let bound = keycloak_token(&fixture.issuer, "first", |c| {
+        c["cnf"] = json!({"x5t#S256":"bwcK0esc3ACC3DB2Y5_lESsXE8o9ltc05O89jdN-dg2"})
+    });
+    assert_eq!(
+        auth.authenticate(Some(&bound), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+    let remote = Fixture::new(TokenValidation::Introspection).await;
+    let auth = Authenticator::new(remote.config.clone()).await.unwrap();
+    remote.introspection.lock().unwrap()["cnf"] =
+        json!({"x5t#S256":"bwcK0esc3ACC3DB2Y5_lESsXE8o9ltc05O89jdN-dg2"});
+    assert_eq!(
+        auth.authenticate(Some("opaque"), false)
+            .await
+            .unwrap_err()
+            .code,
+        "auth_invalid"
+    );
+}
+
+#[tokio::test]
+async fn keycloak_introspection_requires_the_access_token_class() {
     let mut fixture = Fixture::new(TokenValidation::Introspection).await;
-    fixture.config.oidc.as_mut().unwrap().token_profile = TokenProfile::Casdoor;
+    fixture.config.oidc.as_mut().unwrap().token_profile = TokenProfile::Keycloak;
     let auth = Authenticator::new(fixture.config.clone()).await.unwrap();
     let issuer = fixture.issuer.clone();
-    auth.authenticate(Some(&casdoor_token(&issuer, "first", |_| {})), true)
-        .await
-        .unwrap();
-    let requests = fixture.intro_count.load(Ordering::SeqCst);
-    // Casdoor's introspection reports refresh tokens as active Bearer tokens.
-    for token in [
-        casdoor_token(&issuer, "first", |c| {
-            c["tokenType"] = json!("refresh-token")
-        }),
-        casdoor_token(&issuer, "first", |c| c["tokenType"] = json!("id-token")),
-        casdoor_token(&issuer, "first", |c| {
-            c.as_object_mut().unwrap().remove("jti");
-        }),
-        "opaque-not-a-jwt".into(),
-        "a.%%%.c".into(),
-    ] {
+    let set = |update: &dyn Fn(&mut Value)| {
+        let mut value = keycloak_claims(&issuer);
+        value["active"] = json!(true);
+        value["token_type"] = json!("Bearer");
+        update(&mut value);
+        *fixture.introspection.lock().unwrap() = value;
+    };
+    set(&|_| {});
+    auth.authenticate(Some("opaque"), true).await.unwrap();
+    // Keycloak reports refresh and ID tokens as active to the client they
+    // were issued to; their class is only in `typ` and `token_type`.
+    let classes: [fn(&mut Value); 4] = [
+        |c| c["typ"] = json!("Refresh"),
+        |c| {
+            c["typ"] = json!("ID");
+            c["token_type"] = json!("ID");
+        },
+        |c| {
+            c.as_object_mut().unwrap().remove("typ");
+        },
+        // A DPoP class without a key confirmation cannot be bound.
+        |c| c["typ"] = json!("DPoP"),
+    ];
+    for update in classes {
+        set(&update);
         assert_eq!(
-            auth.authenticate(Some(&token), false)
+            auth.authenticate(Some("opaque"), false)
                 .await
                 .unwrap_err()
                 .code,
             "auth_invalid"
         );
     }
-    assert_eq!(fixture.intro_count.load(Ordering::SeqCst), requests);
-    // The introspected record must describe the same token.
-    let other = casdoor_token(&issuer, "first", |c| c["jti"] = json!("another-token"));
-    assert_eq!(
-        auth.authenticate(Some(&other), false)
-            .await
-            .unwrap_err()
-            .code,
-        "auth_invalid"
-    );
     for (prefix, claim) in [(Some("vendor_at_"), "scope"), (None, "scp")] {
         let oidc = fixture.config.oidc.as_mut().unwrap();
         oidc.access_token_prefix = prefix.map(Into::into);
@@ -1638,9 +1726,9 @@ fn dpop_configuration_needs_a_public_url_and_a_validator_that_reports_the_bindin
     let dpop = json!({"public_url":"https://pdf.example.com"});
     assert!(config("rfc9068", "jwt", dpop.clone()).is_ok());
     assert!(config("rfc9068", "introspection", dpop.clone()).is_ok());
-    assert!(config("casdoor", "introspection", dpop.clone()).is_ok());
-    // Casdoor JWTs carry no key confirmation, so local validation is refused.
-    assert!(config("casdoor", "jwt", dpop).is_err());
+    // Keycloak reports the binding both in its JWTs and through introspection.
+    assert!(config("keycloak", "introspection", dpop.clone()).is_ok());
+    assert!(config("keycloak", "jwt", dpop).is_ok());
     assert!(
         config(
             "rfc9068",

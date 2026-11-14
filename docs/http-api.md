@@ -122,7 +122,7 @@ or per-user disk quotas.
 
 Run `python3 scripts/test-http.py IMAGE --minikube` for disposable Docker and
 anonymous RW Kubernetes workflows, including persistence across restart. Run
-`python3 scripts/test-casdoor.py` for real Casdoor grants through the registered
+`python3 scripts/test-keycloak.py` for real Keycloak grants through the registered
 client and for introspection/JWT HTTP and library token, scope, isolation,
 revocation, expiry, and accepted-job recovery checks.
 `python3 scripts/test-http-oidc.py IMAGE` exercises real OIDC inside a disposable

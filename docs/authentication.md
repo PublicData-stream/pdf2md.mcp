@@ -46,18 +46,18 @@ An omitted `[auth]` section selects `none_ro`. For anonymous writes:
 mode = "none_rw"
 ```
 
-For [Casdoor](https://casdoor.ai/docs/how-to-connect/oauth/) with token
-introspection:
+For [Keycloak](https://www.keycloak.org/securing-apps/oidc-layers) with token
+introspection, where the issuer is the realm URL:
 
 ```toml
 [auth]
 mode = "oauth2"
 
 [auth.oidc]
-issuer = "https://auth.example.com"
+issuer = "https://auth.example.com/realms/pdf2md"
 audience = "https://pdf.example.com/"
 validation = "introspection"
-token_profile = "casdoor"
+token_profile = "keycloak"
 client_id = "pdf2md-introspection"
 client_secret = { env = "PDF2MD_OIDC_CLIENT_SECRET" }
 read_scope = "pdf2md:read"
@@ -94,19 +94,19 @@ provider's other tokens. The validator never falls back between profiles.
 | `token_profile` | JWT validation | Introspection |
 | --- | --- | --- |
 | `rfc9068` (default) | [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html): header `typ` `at+jwt` and a `client_id` claim | `token_type` `Bearer`, or an explicit `access_token_prefix` when the provider omits it |
-| `casdoor` | Header `typ` `JWT`, signed `tokenType` claim `access-token`, and an `azp` claim | The token must be a JWT whose `tokenType` is `access-token`, and the introspected `jti` must match it |
+| `keycloak` | Header `typ` `JWT`, a `typ` claim of `Bearer` (or `DPoP` with `cnf.jkt`), and an `azp` claim | `token_type` `Bearer` (or `DPoP` with `cnf.jkt`) and the same `typ` claim |
 
-Casdoor signs access, refresh and ID tokens with the same key, and its
-introspection endpoint reports refresh tokens as active `Bearer` tokens. The
-`casdoor` profile therefore requires the access-token class carried by the
-token itself. Introspection looks up the exact token string, so the provider
-authenticates that claim; it is checked before the provider is called. The
-`casdoor` profile requires the default `jwt_scope_claim = "scope"` and rejects
-`access_token_prefix`. Configure Casdoor's
-[token format](https://casdoor.ai/docs/token/overview/) as `JWT-Standard` or
-`JWT-Empty` to keep user attributes out of access tokens; the validator uses
-only `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`, `azp`, `scope` and
-`tokenType`.
+Keycloak signs access, refresh and ID tokens with the same realm key and the
+same header type, and its introspection endpoint reports refresh and ID tokens
+as active to the client they were issued to. The token class is carried in the
+`typ` claim, which the `keycloak` profile requires in both validators: `Bearer`
+for a bearer token, or `DPoP` for a token that also names its key in
+`cnf.jkt`. The `keycloak` profile requires the default
+`jwt_scope_claim = "scope"` and rejects `access_token_prefix`. Assign only the
+client scopes the service needs, without the default `profile`, `email` and
+`roles` scopes, to keep user attributes out of access tokens; the validator
+uses only `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`, `azp`, `typ`, `cnf`
+and `scope`.
 
 For other providers, `access_token_prefix` restricts introspection to an
 issuer-documented access-token prefix when the provider omits the optional
@@ -119,12 +119,15 @@ OIDC ID token is never a substitute for an access token.
 
 ### Audiences
 
-Access tokens must name `audience` in `aud`. Register it as the
-[RFC 8707](https://www.rfc-editor.org/rfc/rfc8707.html) resource of user-facing
-clients; Casdoor then issues Authorization Code, Device Authorization and
-Refresh Token grants for that resource. Casdoor 4.27.1 ignores the resource
-indicator for the Client Credentials grant and sets `aud` to the requesting
-client ID. To accept those tokens, list dedicated client IDs in
+Access tokens must name `audience` in `aud`. In Keycloak, add it with an
+[audience mapper](https://www.keycloak.org/docs/latest/server_admin/#_audience)
+(**Included Custom Audience**) in a client scope that every client of this
+service receives by default; the mapper applies to every grant, including
+Client Credentials. The registered client also sends `audience` as the
+[RFC 8707](https://www.rfc-editor.org/rfc/rfc8707.html) `resource` parameter,
+which Keycloak accepts without acting on it unless a resource-indicator feature
+is enabled. For a provider that cannot bind a grant to the resource and sets
+`aud` to the requesting client ID instead, list dedicated client IDs in
 `additional_audiences` (at most 16):
 
 ```toml
@@ -149,14 +152,22 @@ Client Registration. Give each MCP client or other API client its own provider
 application, as a public client using Authorization Code with PKCE where it
 cannot keep a secret. Clients then obtain, store and refresh their tokens
 directly with the provider, which can grant consent to and revoke each client
-separately. Use a separate confidential application for introspection. In
-Casdoor, create an application with the **Agent**
-category and define the custom scopes `pdf2md:read`, `pdf2md:write` and
-`pdf2md:operate` ([custom scopes](https://casdoor.ai/docs/application/scopes/)).
-Enable only the grant types you use. Keep subject configuration stable: a
-changed provider subject creates a different private workspace. Casdoor user
-subjects are user IDs; Client Credentials tokens use the application's
-`owner/name` as subject, so each machine client receives its own workspace.
+separately. Use a separate confidential application for introspection.
+
+In Keycloak, create a realm for the service and define the
+[client scopes](https://www.keycloak.org/docs/latest/server_admin/#_client_scopes)
+`pdf2md:read`, `pdf2md:write` and `pdf2md:operate` with **Include in token
+scope** enabled, as optional client scopes of each client. Add a default client
+scope with audience mappers for the resource URI and for the introspection
+client: Keycloak answers introspection only for a client named in the token's
+`aud`, and reports any other token as inactive. Enable only the grant types
+(**Standard flow**, **OAuth 2.0 Device Authorization Grant**, **Service
+accounts roles**) you use, and leave **Direct access grants** (Resource Owner
+Password Credentials) and **Implicit flow** off. Keep subject configuration
+stable: a changed provider subject creates a different private workspace.
+Keycloak subjects are user IDs; Client Credentials tokens use the ID of the
+client's service-account user, so each machine client receives its own
+workspace.
 
 ### Provider connections
 
@@ -206,19 +217,13 @@ random and the assertion expires after 60 seconds. It is sent as
 request body. Rotate the key by registering the new public key at the provider
 before changing the configuration.
 
-Casdoor 4.27.1 differs from RFC 7523 in three ways:
-
-- It accepts an assertion only when `iss` is one of the application's redirect
-  URIs. Set `issuer` to a registered redirect URI.
-- It verifies RSA (`RS256`) and ECDSA (`ES256`, `ES384`) assertions with the
-  certificate selected as the application's client certificate. `PS256` and
-  `EdDSA` assertions are rejected.
-- Its JWKS lists every stored certificate of type `x509`. With
-  `validation = "jwt"` this service trusts every key in that JWKS, so the
-  holder of a client key listed there could sign tokens that pass local
-  validation. Keep the client certificate out of the JWKS, as the
-  [live harness](../examples/casdoor/README.md#signed-client-assertions-and-dpop)
-  does, or use `validation = "introspection"`.
+In Keycloak, select the **Signed JWT** client authenticator and register the
+public key, either as a certificate or through a JWKS URL of the client
+([confidential client credentials](https://www.keycloak.org/docs/latest/server_admin/#_client-credentials)).
+Keycloak expects the client ID as issuer, so leave `issuer` unset. The
+[live harness](../examples/keycloak/README.md#signed-client-assertions-and-dpop)
+checks that the client key never appears in the realm's JWKS, which a JWT
+validator trusts.
 
 ### DPoP-bound access tokens
 
@@ -277,16 +282,18 @@ The scheme the request used carries the error: `invalid_token`,
 The binding reaches this service in the token's `cnf.jkt` claim with
 `validation = "jwt"`, or in the introspection response
 ([RFC 9449 section 6](https://www.rfc-editor.org/rfc/rfc9449#section-6)).
-Casdoor 4.27.1 binds tokens when the token request carries a proof, but its
-JWTs carry no `cnf` claim; only its introspection response reports the
-binding. `token_profile = "casdoor"` therefore requires
-`validation = "introspection"` for DPoP, and configuration rejects the JWT
-validator in that combination.
+Keycloak binds a token when the token request carries a proof, and reports the
+binding both ways: the JWT carries `cnf.jkt` and the `typ` claim `DPoP`, and
+introspection returns the same claims with `token_type` `DPoP`. Both
+validators therefore work with `token_profile = "keycloak"`. To refuse unbound
+tokens for a client at the provider as well, enable **Require DPoP bound
+tokens** for that client.
 
 The registered client in `[auth.client]` does not request DPoP-bound tokens:
 it hands the access token to the person who signed in or to the CLI caller,
 who would not hold the proof key. Mutual-TLS-bound tokens
-([RFC 8705](https://www.rfc-editor.org/rfc/rfc8705)) are not supported; see
+([RFC 8705](https://www.rfc-editor.org/rfc/rfc8705)) are not supported and are
+refused; see
 [Standards conformance](#standards-conformance).
 
 ## Obtaining access tokens
@@ -357,7 +364,7 @@ Browser sign-in:
   browser with an `HttpOnly`, `SameSite=Lax` cookie, `Secure` for HTTPS.
 - `/oauth/callback` requires the matching cookie and single-use `state`, then
   checks the [RFC 9207](https://www.rfc-editor.org/rfc/rfc9207) `iss`
-  parameter. It is mandatory when the provider advertises it, as Casdoor does.
+  parameter. It is mandatory when the provider advertises it, as Keycloak does.
   The code is redeemed with its verifier, and a result page shows the access
   token. ID tokens and refresh tokens are never displayed; sign in again when
   the access token expires.
@@ -387,8 +394,9 @@ issued, `refresh_token`. Treat that output as a credential and keep it out of
 logs. Device authorization prints the verification URI and code on
 standard error and polls until approval, denial or expiry, slowing down when
 asked. Refresh reads the token from a named environment variable so it does
-not appear in process arguments. Casdoor rotates refresh tokens by default;
-store the new value:
+not appear in process arguments. Refresh responses can carry a new refresh
+token; store the new value. Keycloak rejects a used refresh token only when the
+realm revokes refresh tokens (**Revoke Refresh Token**):
 
 ```sh
 pdf2md-mcp --config pdf2md.toml oauth device
@@ -424,7 +432,7 @@ Current Practice):
   client is refused as well, because PKCE is its only protection for the
   authorization code; a confidential client may sign in, since it
   authenticates the code exchange, with a secret or a signed assertion, and
-  binds the response to the browser with `state`. Casdoor publishes `S256`.
+  binds the response to the browser with `state`. Keycloak publishes `S256`.
 - Cross-site request forgery and code injection: the single-use `state` is
   bound to the browser with a cookie, and the code is bound to the request
   with PKCE.
@@ -451,11 +459,15 @@ Current Practice):
 
 One optional mechanism of RFC 9700 is not implemented: mutual TLS
 ([RFC 8705](https://www.rfc-editor.org/rfc/rfc8705)), for client
-authentication and for certificate-bound access tokens. Casdoor 4.27.1 does
-not offer it, and this service runs behind a TLS-terminating proxy, where it
-would have to trust a forwarded client certificate. Use DPoP and
-`private_key_jwt` for the same recommendations. The registered client does not
-request DPoP-bound tokens for itself, as explained under
+authentication and for certificate-bound access tokens. Keycloak offers both
+(`tls_client_auth` and `cnf.x5t#S256`), but validating a certificate-bound
+token requires the client certificate of the request to this service, which
+runs behind a TLS-terminating proxy and would have to trust a forwarded
+certificate. An access token bound to a certificate (`cnf` with `x5t#S256`)
+is therefore refused by both validators instead of being accepted as a bearer
+token. Use DPoP and `private_key_jwt` for the same recommendations. The
+registered client does not request DPoP-bound tokens for itself, as explained
+under
 [DPoP-bound access tokens](#dpop-bound-access-tokens).
 
 The remaining requirements of RFC 9700 apply to the authorization server:
@@ -555,15 +567,15 @@ against a synthetic TLS provider in `tests/oauth_client.rs` as part of the core
 suite. DPoP proof validation, token binding, replay detection and the HTTP and
 MCP challenges are covered by `src/dpop.rs` and `tests/auth.rs`.
 
-Live Casdoor checks use a disposable provider with two synthetic users and
+Live Keycloak checks use a disposable provider with two synthetic users and
 registered test clients. They exercise all four supported grants through the
 registered client (Authorization Code over HTTP, the others through the library
 client), both validators, `private_key_jwt` client authentication,
 DPoP-bound tokens, permissions, isolation, revocation,
 expiry, and durable job recovery against the library and HTTP boundaries.
 These checks alone do not establish MCP client or Kubernetes deployment
-acceptance. Run `python3 scripts/test-casdoor.py`; see
-[the live harness guide](../examples/casdoor/README.md) for requirements and
+acceptance. Run `python3 scripts/test-keycloak.py`; see
+[the live harness guide](../examples/keycloak/README.md) for requirements and
 provider configuration.
 
 ## MCP authorization

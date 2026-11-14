@@ -212,7 +212,7 @@ impl Provider {
                 issuer: self.issuer.clone(),
                 audience: AUDIENCE.into(),
                 validation: TokenValidation::Jwt,
-                token_profile: TokenProfile::Casdoor,
+                token_profile: TokenProfile::Keycloak,
                 additional_audiences: vec![],
                 access_token_prefix: None,
                 jwt_scope_claim: "scope".into(),
@@ -947,7 +947,7 @@ mode = "oauth2"
 issuer = "https://id.example"
 audience = "https://pdf.example/"
 validation = "jwt"
-token_profile = "casdoor"
+token_profile = "keycloak"
 [auth.client]
 client_id = "pdf2md"
 scopes = ["pdf2md:read"]

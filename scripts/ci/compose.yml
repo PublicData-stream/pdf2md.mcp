@@ -8,4 +8,4 @@ services:
   buildkit:
     image: moby/buildkit:v0.35.0@sha256:aa632b921ef07411d2cb77292cd34213d4f7b384001d6fceef1e1f25bf9752bb
   minikube:
-    image: gcr.io/k8s-minikube/kicbase:v0.0.51@sha256:4a1c825b61479e6c898851ea66f13c620aaeab6002746e95067fc2c4b38a0b24
+    image: gcr.io/k8s-minikube/kicbase:v1.23.1@sha256:85d003542e58c52e32e7fd757f30eef6c190167196642791feab2ef9714c8f85

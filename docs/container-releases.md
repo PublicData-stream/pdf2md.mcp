@@ -32,10 +32,16 @@ Stable and beta publication is triggered by publishing the corresponding
 GitHub Release. Build-candidate publication is triggered only when a matching
 tag is newly created. An existing eligible tag, including a historical tag,
 can be retried with **Actions → Publish runtime images → Run workflow** from
-`main`, supplying its exact name in `release_tag`. To retry
-`0.1.0-build.a87a3361` after the SBOM workflow repair reaches `main`, start a fresh
-manual dispatch from the repaired `main`; rerunning the old publication run
-uses its old workflow revision. Keep the existing annotated tag and reuse its
+`main`, supplying its exact name in `release_tag`. After a publication workflow
+repair reaches `main`, start a fresh manual dispatch from the repaired `main`;
+rerunning an old publication run uses its old workflow revision. For example,
+retry `0.1.0-build.350ff642` after the partial-rerun validation repair with:
+
+```sh
+gh workflow run publish-images.yml --ref main -f release_tag=0.1.0-build.350ff642
+```
+
+Keep the existing annotated tag and reuse its
 retained, tested image artifacts. Matching canonical image digests are reused;
 conflicting digests remain an error.
 
@@ -50,6 +56,15 @@ successful image-build jobs in that same run. The artifacts are retained for
 run fails closed. Re-run CI for the original commit and then retry publication;
 the publication workflow never substitutes a rebuild for unavailable tested
 images.
+
+Partial CI reruns may retain successful image jobs from an earlier attempt.
+GitHub can return these carried-forward executions under different job IDs and
+attempt numbers. When multiple successful job records match an artifact's
+creation window, the gate accepts them only when they share a positive runner
+ID and identical start and completion timestamps. Different runners, different
+windows, or missing runner identity remain ambiguous and fail closed. This
+correlates GitHub execution metadata; it is not a direct artifact-to-job
+identifier or independent provenance proof.
 
 Publication is serialized, but GitHub Actions allows one running and one
 pending execution in a concurrency group. A newer request can replace a

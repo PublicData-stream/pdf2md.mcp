@@ -83,6 +83,64 @@ class CiTests(unittest.TestCase):
                                                "arm64": {"id": 102, "name": "image-arm64"}})
         self.assertIn("filter=all", " ".join(self.calls))
 
+    def test_accepts_carried_forward_jobs_with_new_ids_and_attempts(self):
+        self.producers = []
+        for arch, runner_id in (("amd64", 1001), ("arm64", 1002)):
+            original = {**producer(arch), "id": runner_id, "runner_id": runner_id,
+                        "runner_group_id": 0}
+            carried = {**original, "id": runner_id + 100, "run_attempt": 2,
+                       "runner_group_id": None}
+            self.producers.extend((original, carried))
+        actual = self.identity()
+        self.assertEqual(actual["artifacts"], {"amd64": {"id": 101, "name": "image-amd64"},
+                                               "arm64": {"id": 102, "name": "image-arm64"}})
+
+    def test_rejects_distinct_matching_producer_executions(self):
+        original = {**producer("amd64"), "id": 1, "runner_id": 1001}
+        for field, value in (("runner_id", 1002), ("started_at", "2026-01-01T00:01:00Z"),
+                             ("completed_at", "2026-01-01T00:09:00Z")):
+            with self.subTest(field=field):
+                other = {**original, "id": 2, "run_attempt": 2, field: value}
+                self.producers = [original, other, producer("arm64")]
+                with self.assertRaisesRegex(ValueError, "ambiguous image producer executions"):
+                    self.identity()
+
+    def test_rejects_duplicate_producers_without_verified_runner_identity(self):
+        original = {**producer("amd64"), "runner_id": 1001}
+        for runner_id in (None, 0, -1, True, "1001", [], {}):
+            with self.subTest(runner_id=runner_id):
+                self.producers = [original, {**original, "runner_id": runner_id}, producer("arm64")]
+                with self.assertRaisesRegex(ValueError, "ambiguous image producer executions"):
+                    self.identity()
+        missing = producer("amd64")
+        self.producers = [missing, missing.copy(), producer("arm64")]
+        with self.assertRaisesRegex(ValueError, "ambiguous image producer executions"):
+            self.identity()
+
+    def test_preserves_single_producer_without_runner_metadata(self):
+        self.assertEqual(self.identity()["run_id"], 10)
+
+    def test_excludes_jobs_without_successful_exact_source_execution_window(self):
+        for field, value in (("head_sha", "d" * 40), ("status", "in_progress"),
+                             ("conclusion", "failure"), ("started_at", None),
+                             ("completed_at", None), ("started_at", "2026-01-01T00:06:00Z"),
+                             ("completed_at", "2026-01-01T00:04:00Z")):
+            with self.subTest(field=field):
+                self.producers = [{**producer("amd64"), field: value}, producer("arm64")]
+                with self.assertRaisesRegex(ValueError, "no successful exact-source image job"):
+                    self.identity()
+
+    def test_reports_expiry_and_origin_failures_separately(self):
+        for field, value, message in (("expired", True, "expired"),
+                                     ("expired", None, "expiry is unverifiable"),
+                                     ("id", True, "invalid exact-source origin"),
+                                     ("workflow_run", None, "invalid exact-source origin"),
+                                     ("workflow_run", {"id": 9}, "invalid exact-source origin")):
+            with self.subTest(field=field, value=value):
+                self.artifacts = [{**artifact("amd64"), field: value}, artifact("arm64")]
+                with self.assertRaisesRegex(ValueError, message):
+                    self.identity()
+
     def test_newest_failed_run_cannot_fall_back_to_older_success(self):
         self.runs.append(run_row(11))
         self.current = run_row(11)
@@ -135,7 +193,7 @@ class CiTests(unittest.TestCase):
                           [producer("amd64"), producer("amd64"), producer("arm64")]):
             with self.subTest(producers=producers):
                 self.producers = producers
-                with self.assertRaisesRegex(ValueError, "successful exact-source image job"):
+                with self.assertRaisesRegex(ValueError, "no successful exact-source image job|ambiguous image producer executions"):
                     self.identity()
 
     def test_rejects_ci_attempt_race(self):

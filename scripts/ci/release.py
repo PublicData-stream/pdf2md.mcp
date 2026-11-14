@@ -201,15 +201,27 @@ def ci_identity(revision):
         if len(matches) != 1:
             raise ValueError("required runtime artifact is missing or ambiguous; rerun exact-commit CI")
         artifact = matches[0]
+        if artifact.get("expired") is not False:
+            raise ValueError(f"runtime artifact image-{arch} is expired or expiry is unverifiable")
+        origin = artifact.get("workflow_run", {})
+        if (not positive(artifact.get("id")) or not isinstance(origin, dict)
+                or origin.get("id") != run_id or origin.get("head_sha") != revision
+                or origin.get("head_branch") != "main"):
+            raise ValueError(f"runtime artifact image-{arch} has invalid exact-source origin metadata")
         producer = [job for job in all_jobs if job.get("name") == f"Build container images ({arch})"
                     and job.get("head_sha") == revision and job.get("status") == "completed"
                     and job.get("conclusion") == "success" and job.get("started_at")
                     and job.get("completed_at") and job["started_at"] <= artifact.get("created_at", "") <= job["completed_at"]]
-        origin = artifact.get("workflow_run", {})
-        if (artifact.get("expired") is not False or not positive(artifact.get("id"))
-                or origin.get("id") != run_id or origin.get("head_sha") != revision
-                or origin.get("head_branch") != "main" or len(producer) != 1):
-            raise ValueError("runtime artifact is expired or not bound to a successful exact-source image job")
+        if not producer:
+            raise ValueError(f"runtime artifact image-{arch} has no successful exact-source image job")
+        # Partial reruns can carry the same execution forward with new job IDs
+        # and attempt numbers. Correlate those rows by runner and execution
+        # window; distinct or unverifiable executions remain ambiguous.
+        if len(producer) > 1:
+            if (any(not positive(job.get("runner_id")) for job in producer)
+                    or len({(job["runner_id"], job["started_at"], job["completed_at"])
+                            for job in producer}) != 1):
+                raise ValueError(f"runtime artifact image-{arch} has ambiguous image producer executions")
         selected_artifacts[arch] = {"id": artifact["id"], "name": artifact["name"]}
     final = api(f"repos/{REPOSITORY}/actions/runs/{run_id}")
     if (any(final.get(key) != current.get(key) for key in keys)

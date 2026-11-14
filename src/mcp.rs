@@ -38,6 +38,9 @@ pub struct McpConfig {
     pub enabled: bool,
     pub resource_url: Option<String>,
     pub allowed_origins: Vec<String>,
+    /// Additional `Host` values accepted by `/mcp`, beyond loopback names and
+    /// the authority of `resource_url`.
+    pub allowed_hosts: Vec<String>,
     pub max_read_bytes: u64,
     pub list_default_limit: usize,
     pub list_max_limit: usize,
@@ -54,6 +57,7 @@ impl Default for McpConfig {
             enabled: false,
             resource_url: None,
             allowed_origins: vec![],
+            allowed_hosts: vec![],
             max_read_bytes: 8 * 1024 * 1024,
             list_default_limit: 100,
             list_max_limit: 500,
@@ -119,6 +123,11 @@ impl McpConfig {
                 return Err(invalid());
             }
         }
+        for host in &self.allowed_hosts {
+            if HostRule::parse(host).is_none() {
+                return Err(invalid());
+            }
+        }
         if auth.mode == AuthMode::Oauth2 {
             let (Some(oidc), Some(resource)) = (&auth.oidc, &self.resource_url) else {
                 return Err(invalid());
@@ -131,6 +140,115 @@ impl McpConfig {
         }
         Ok(())
     }
+    /// `Host` values accepted by `/mcp`: loopback names, the authority of
+    /// `resource_url`, and `allowed_hosts`. Requests naming any other host
+    /// are refused, which blocks DNS rebinding against the endpoint.
+    fn host_rules(&self) -> Vec<HostRule> {
+        let mut rules: Vec<HostRule> = ["localhost", "127.0.0.1", "[::1]"]
+            .into_iter()
+            .filter_map(HostRule::parse)
+            .collect();
+        if let Some(url) = self
+            .resource_url
+            .as_deref()
+            .and_then(|s| url::Url::parse(s).ok())
+            && let Some(host) = url.host_str()
+        {
+            rules.push(HostRule {
+                host: normalize_host(host),
+                port: url.port(),
+            });
+        }
+        rules.extend(self.allowed_hosts.iter().filter_map(|s| HostRule::parse(s)));
+        rules.dedup();
+        rules
+    }
+}
+
+/// A host name or IP literal, with an optional port. Without a port, any port
+/// matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostRule {
+    host: String,
+    port: Option<u16>,
+}
+impl HostRule {
+    fn parse(value: &str) -> Option<Self> {
+        if value.is_empty() || value.contains(['@', '*', '/', '?', '#']) {
+            return None;
+        }
+        let authority = axum::http::uri::Authority::try_from(value).ok()?;
+        let host = authority.host();
+        let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
+        // IPv6 literals need brackets; other names must be valid URL hosts.
+        match bare {
+            Some(ip) => {
+                ip.parse::<std::net::Ipv6Addr>().ok()?;
+            }
+            None => {
+                if host.contains(':') {
+                    return None;
+                }
+                url::Host::parse(host).ok()?;
+            }
+        }
+        let rule = Self::from_authority(&authority)?;
+        rule.port.is_none_or(|p| p != 0).then_some(rule)
+    }
+    /// Rejects authorities whose port does not fit in `u16`; the parser
+    /// otherwise drops such a port silently.
+    fn from_authority(authority: &axum::http::uri::Authority) -> Option<Self> {
+        let port = authority.port_u16();
+        let expected = match port {
+            Some(port) => format!("{}:{port}", authority.host()),
+            None => authority.host().to_owned(),
+        };
+        authority
+            .as_str()
+            .eq_ignore_ascii_case(&expected)
+            .then(|| Self {
+                host: normalize_host(authority.host()),
+                port,
+            })
+    }
+    fn matches(&self, request: &Self) -> bool {
+        self.host == request.host && self.port.is_none_or(|p| request.port == Some(p))
+    }
+    /// The same rule in the form the MCP SDK's own Host check accepts.
+    fn to_authority(&self) -> String {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        match self.port {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        }
+    }
+}
+fn normalize_host(host: &str) -> String {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+/// Reads the request authority from `Host`, or from the URI for HTTP/2.
+fn request_host(request: &Request) -> std::result::Result<HostRule, StatusCode> {
+    let mut values = request.headers().get_all(header::HOST).iter();
+    let authority = match (values.next(), values.next()) {
+        (Some(_), Some(_)) => return Err(StatusCode::BAD_REQUEST),
+        (Some(value), None) => value
+            .to_str()
+            .ok()
+            .and_then(|v| axum::http::uri::Authority::try_from(v).ok())
+            .ok_or(StatusCode::BAD_REQUEST)?,
+        (None, _) => request
+            .uri()
+            .authority()
+            .cloned()
+            .ok_or(StatusCode::BAD_REQUEST)?,
+    };
+    HostRule::from_authority(&authority).ok_or(StatusCode::BAD_REQUEST)
 }
 
 #[derive(Clone)]
@@ -140,12 +258,14 @@ struct Endpoint {
 #[derive(Clone)]
 struct HttpState {
     service: Arc<CallerService>,
+    hosts: Arc<[HostRule]>,
 }
 
 pub(crate) fn router(service: Arc<CallerService>, cancel: CancellationToken) -> Router {
     let handler = Endpoint {
         service: service.clone(),
     };
+    let hosts: Arc<[HostRule]> = service.config().mcp.host_rules().into();
     let sdk: StreamableHttpService<Endpoint, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(handler.clone()),
         Default::default(),
@@ -153,10 +273,12 @@ pub(crate) fn router(service: Arc<CallerService>, cancel: CancellationToken) -> 
             .with_legacy_session_mode(false)
             .with_json_response(true)
             .with_max_request_body_bytes(64 * 1024)
+            .with_allowed_hosts(hosts.iter().map(HostRule::to_authority))
             .with_cancellation_token(cancel),
     );
     let state = HttpState {
         service: service.clone(),
+        hosts,
     };
     let mut router = Router::new()
         .nest_service("/mcp", sdk)
@@ -215,6 +337,13 @@ async fn metadata_preflight() -> Response {
         .into_response()
 }
 async fn guard(State(state): State<HttpState>, mut request: Request, next: Next) -> Response {
+    // Check Host before any credential work (MCP Streamable HTTP security
+    // guidance on DNS rebinding).
+    match request_host(&request) {
+        Ok(host) if state.hosts.iter().any(|rule| rule.matches(&host)) => {}
+        Ok(_) => return StatusCode::FORBIDDEN.into_response(),
+        Err(status) => return status.into_response(),
+    }
     let headers = request.headers();
     let origins = headers.get_all(header::ORIGIN);
     if origins.iter().count() > 1

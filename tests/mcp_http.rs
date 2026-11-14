@@ -400,3 +400,93 @@ async fn disabled_endpoint_returns_not_found() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn host_allowlist_admits_loopback_resource_and_listed_hosts() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let mut config = Config::default();
+    config.mcp.enabled = true;
+    config.mcp.resource_url = Some("https://pdf.example.com/mcp".into());
+    config.mcp.allowed_hosts = vec!["internal.example.net:8080".into(), "[fd00::5]".into()];
+    config.auth.mode = pdf2md_mcp::auth::AuthMode::NoneRo;
+    config.validate().unwrap();
+    let service = Arc::new(CallerService::new(dir.path(), config, None).await.unwrap());
+    let cancel = CancellationToken::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let shutdown = cancel.clone();
+    let shutdown_handle = cancel.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, http::router(service, cancel))
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .unwrap()
+    });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let list = |host: Option<&str>| {
+        let mut request = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#);
+        if let Some(host) = host {
+            request = request.header("host", host);
+        }
+        async move { request.send().await.unwrap().status().as_u16() }
+    };
+    // The loopback address the listener is bound to stays reachable.
+    assert_eq!(list(None).await, 200);
+    for host in [
+        "localhost:9",
+        "pdf.example.com",
+        "PDF.Example.com:443",
+        "internal.example.net:8080",
+        "[fd00::5]:8443",
+    ] {
+        assert_eq!(list(Some(host)).await, 200, "{host} is allowed");
+    }
+    for host in [
+        "evil.example.com",
+        "internal.example.net:9090",
+        "internal.example.net",
+        "pdf.example.com.evil.example.com",
+    ] {
+        assert_eq!(list(Some(host)).await, 403, "{host} is refused");
+    }
+    for host in ["bad host", "pdf.example.com:99999", "user@pdf.example.com"] {
+        assert_eq!(list(Some(host)).await, 400, "{host} is malformed");
+    }
+    shutdown_handle.cancel();
+    server.await.unwrap();
+}
+
+#[test]
+fn mcp_config_rejects_malformed_allowed_hosts() {
+    let mut config = Config::default();
+    config.mcp.enabled = true;
+    for host in [
+        "example.com",
+        "example.com:8080",
+        "10.0.0.5",
+        "[::1]:8443",
+        "xn--bcher-kva.example",
+    ] {
+        config.mcp.allowed_hosts = vec![host.into()];
+        assert!(config.validate().is_ok(), "{host} is accepted");
+    }
+    for host in [
+        "",
+        "*.example.com",
+        "user@example.com",
+        "::1",
+        "example.com:0",
+        "example.com:99999",
+        "example.com/mcp",
+        "https://example.com",
+        "exa mple.com",
+    ] {
+        config.mcp.allowed_hosts = vec![host.into()];
+        assert!(config.validate().is_err(), "{host:?} is rejected");
+    }
+}

@@ -14,6 +14,31 @@ conversions. There is no stdio transport or separate MCP resources interface.
 Protocol revisions `2026-07-28` and `2025-11-25` are supported. Clients should
 use a compatible MCP SDK rather than construct protocol metadata themselves.
 
+## Allowed hosts
+
+The endpoint checks the request `Host` (or the HTTP/2 `:authority`) before
+authentication, as the MCP Streamable HTTP transport recommends against DNS
+rebinding. It accepts `localhost`, `127.0.0.1`, `[::1]`, and the host of
+`resource_url` when one is configured. A deployment reached under any other
+name, such as an internal service name or an ingress host without
+`resource_url`, lists it in `allowed_hosts`:
+
+```toml
+[mcp]
+enabled = true
+allowed_hosts = ["pdf.example.com", "pdf2md.internal:8080", "[fd00::5]"]
+```
+
+Entries are a host name or IP literal (IPv6 in brackets), optionally with a
+port. An entry without a port accepts any port; an entry with a port accepts
+only that port. The `resource_url` host follows the same rule, using its
+explicit port if it has one. Host names compare case-insensitively. Wildcards,
+user information, paths, and schemes are rejected at startup, and there is no
+setting that accepts every host. Other `Host` values receive `403 Forbidden`;
+a missing, repeated, or malformed `Host` receives `400 Bad Request`. If a
+reverse proxy rewrites `Host`, list the value it forwards. The REST API and the
+protected-resource metadata route are not affected.
+
 ## Authentication
 
 MCP uses the configured caller mode and `pdf2md:read` scope (or the configured
@@ -209,7 +234,8 @@ patterns return explicit errors.
 
 ## Configuration and retained bundles
 
-Optional `[mcp]` settings include `max_read_bytes`, `list_default_limit`,
+Optional `[mcp]` settings include `allowed_hosts` (see
+[Allowed hosts](#allowed-hosts)), `max_read_bytes`, `list_default_limit`,
 `list_max_limit`, `search_default_limit`, `search_max_limit`, `search_max_bytes`,
 `search_timeout_secs`, `search_concurrency`, and `rg_path`. Defaults are the
 limits described above. Configuration is validated at service startup. Read/search byte budgets cannot

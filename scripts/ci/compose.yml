@@ -2,7 +2,7 @@
 # Harnesses start their own isolated resources and never `compose up` this file.
 services:
   postgres:
-    image: postgres:18-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+    image: postgres:19-trixie@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60
   keycloak:
     image: keycloak/keycloak:26.8.2@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0
   buildkit:
